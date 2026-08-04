@@ -1880,13 +1880,40 @@ fn row_to_unit(row: &rusqlite::Row) -> rusqlite::Result<CodeUnit> {
     })
 }
 
+fn parse_rfc3339_or_flag(
+    raw: &str,
+    table: &str,
+    row_id: Option<i64>,
+    field: &str,
+) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|err| {
+            let id_text = row_id
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let preview: String = raw.chars().take(96).collect();
+            eprintln!(
+                "[cortex][repair-needed] {}.{} id={} has invalid RFC3339 timestamp ({}). raw='{}'. Using fallback 1970-01-01T00:00:00Z; timestamp accuracy is compromised until this row is repaired.",
+                table,
+                field,
+                id_text,
+                err,
+                preview
+            );
+            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .expect("UNIX epoch must be representable")
+        })
+}
+
 fn row_to_pattern(row: &rusqlite::Row) -> rusqlite::Result<Pattern> {
+    let id: i64 = row.get(0)?;
     let uses: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
     let tags: Vec<String> = serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default();
-    let approved_at = chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-        .unwrap().with_timezone(&chrono::Utc);
+    let approved_at_raw: String = row.get(6)?;
+    let approved_at = parse_rfc3339_or_flag(&approved_at_raw, "patterns", Some(id), "approved_at");
     Ok(Pattern {
-        id: Some(row.get(0)?), name: row.get(1)?, intent: row.get(2)?,
+        id: Some(id), name: row.get(1)?, intent: row.get(2)?,
         body: row.get(3)?, uses, tags, approved_at,
         use_count: row.get(7)?,
         reverted_count: row.get(8)?,
@@ -1895,21 +1922,23 @@ fn row_to_pattern(row: &rusqlite::Row) -> rusqlite::Result<Pattern> {
 }
 
 fn row_to_anti_pattern(row: &rusqlite::Row) -> rusqlite::Result<AntiPattern> {
+    let id: i64 = row.get(0)?;
     let tags: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
-    let added_at = chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(5)?)
-        .unwrap().with_timezone(&chrono::Utc);
+    let added_at_raw: String = row.get(5)?;
+    let added_at = parse_rfc3339_or_flag(&added_at_raw, "anti_patterns", Some(id), "added_at");
     Ok(AntiPattern {
-        id: Some(row.get(0)?), description: row.get(1)?,
+        id: Some(id), description: row.get(1)?,
         wrong: row.get(2)?, correct: row.get(3)?, tags, added_at,
     })
 }
 
 fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
+    let id: i64 = row.get(0)?;
     let tags: Vec<String> = serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default();
-    let added_at = chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-        .unwrap().with_timezone(&chrono::Utc);
+    let added_at_raw: String = row.get(4)?;
+    let added_at = parse_rfc3339_or_flag(&added_at_raw, "annotations", Some(id), "added_at");
     Ok(Annotation {
-        id: Some(row.get(0)?), topic: row.get(1)?,
+        id: Some(id), topic: row.get(1)?,
         body: row.get(2)?, tags, added_at,
     })
 }

@@ -656,7 +656,10 @@ enum AnnotateCmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let db_path = cli.db.unwrap_or_else(|| PathBuf::from(".cortex/memory.db"));
+    let db_path = match &cli.db {
+        Some(path) => path.clone(),
+        None => resolve_default_db_path(),
+    };
     let format = cli.format;
 
     match cli.command {
@@ -718,6 +721,51 @@ fn main() -> Result<()> {
         Command::Scoreboard { window_days }     => run_scoreboard(&db_path, window_days, format),
         Command::HooksInit { root, shared, force } => run_hooks_init(root, shared, force),
     }
+}
+
+fn resolve_default_db_path() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if let Some(found) = discover_cortex_dir(&cwd) {
+        return found.join("memory.db");
+    }
+    PathBuf::from(".cortex/memory.db")
+}
+
+fn discover_cortex_dir(start: &Path) -> Option<PathBuf> {
+    let mut fallback: Option<PathBuf> = None;
+
+    // First pass: prefer `.cortex` in current or parent directories.
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join(".cortex");
+        if candidate.is_dir() {
+            if is_workspace_cortex_dir(&candidate) {
+                return Some(candidate);
+            }
+            if fallback.is_none() {
+                fallback = Some(candidate);
+            }
+        }
+    }
+
+    // Second pass: also check `cortex/.cortex` under current and parent directories.
+    for ancestor in start.ancestors() {
+        let candidate = ancestor.join("cortex").join(".cortex");
+        if candidate.is_dir() {
+            if is_workspace_cortex_dir(&candidate) {
+                return Some(candidate);
+            }
+            if fallback.is_none() {
+                fallback = Some(candidate);
+            }
+        }
+    }
+
+    fallback
+}
+
+fn is_workspace_cortex_dir(dir: &Path) -> bool {
+    dir.join("cortex.ps1").is_file()
+    || dir.join("index-sources.json").is_file()
 }
 
 fn run_scoreboard(db_path: &Path, window_days: u32, format: OutputFormat) -> Result<()> {
