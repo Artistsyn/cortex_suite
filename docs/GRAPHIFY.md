@@ -130,13 +130,43 @@ one day. On the reference workspace a description advertised "10,529 nodes,
 **Do not use it for API facts.** Node labels are structural, not authoritative
 signatures. If you want to know what a method takes, ask quartz-ctx.
 
-## Does cortex depend on it?
+## How cortex uses it — `.graphify-output/` is a hard contract
 
-No. cortex's own `query_graph` and `simulate_change` run off its internal
-type-reference graph and work without graphify installed.
+cortex does **not require** graphify: `query_graph` and `simulate_change` run off
+its own internal type-reference graph and work with graphify absent.
 
-cortex *can* snapshot `graph.json` at session closeout for drift detection. That
-is the one integration point, and it degrades quietly: if graphify is not
-installed, no snapshots exist and drift analysis simply reports nothing. If you
-do use it, rebuild the graph periodically — consecutive identical snapshots
-produce an all-zero drift signal that looks like "no drift" but means "no data".
+But if you do install it, **the path is not configurable.** cortex looks for the
+graph at exactly:
+
+```
+<repo-root>/.graphify-output/graph.json
+<repo-root>/.graphify-output/snapshots/
+```
+
+That path is hardcoded (`closeout.rs`, `consolidator2.rs`, `main.rs`). Build the
+graph anywhere else and cortex silently finds nothing — no error, drift analysis
+just reports zero forever.
+
+What cortex does with it:
+
+1. **At session closeout** it snapshots `graph.json` into
+   `.graphify-output/snapshots/graph_<timestamp>.json`.
+2. **If the graph is stale** it rebuilds first, invoking graphify itself with
+   `--output .graphify-output` — so cortex's own rebuild is correct even if your
+   habit is not.
+3. **If the rebuild fails** it *skips* the snapshot and says why, rather than
+   emitting a drift measurement against a stale file.
+4. **The consolidation pipeline** compares consecutive snapshots to detect
+   architectural drift.
+
+Two consequences worth knowing:
+
+- **Never rebuild without `--output`.** The build reports exit 0, writes to
+  `~/.graphify-rs/<project>-<hash>/`, and leaves `.graphify-output/graph.json`
+  exactly as stale as before — so cortex's staleness check fires on every
+  closeout and never clears. (Observed: a rebuild without the flag left a 15-day
+  old file in place and reported success.)
+- **A graph that is never rebuilt produces no drift signal.** Consecutive
+  snapshots are identical, and the pipeline reports all-zero drift — which reads
+  as "nothing changed" but means "no data". If you see drift permanently at zero,
+  rebuild the graph before concluding anything.

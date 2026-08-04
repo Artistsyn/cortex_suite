@@ -189,7 +189,13 @@ pub fn run_closeout(
                     // No rebuild, no snapshot. A drift measurement against this
                     // file would be fiction.
                     result.notes.push(format!(
-                        "graph snapshot SKIPPED — {reason}, and rebuild failed: {}.                          Run: graphify-rs build --path . --code-only --update",
+                        // The suggested command MUST carry --output. Without it
+                        // graphify writes to ~/.graphify-rs/<project>-<hash>/ and
+                        // .graphify-output/graph.json stays stale, so following
+                        // this advice literally would leave the user in exactly
+                        // the state the message is asking them to fix.
+                        "graph snapshot SKIPPED — {reason}, and rebuild failed: {}. \
+                         Run: graphify-rs build --path . --code-only --update --output .graphify-output",
                         crate::closeout::one_line(&e.to_string())
                     ));
                 }
