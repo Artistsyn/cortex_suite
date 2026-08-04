@@ -47,6 +47,21 @@ decides what gets expanded. It cuts a session boot from ~34k tokens to ~10k with
 nothing dropped, and it is the only thing that records which knowledge actually
 proved useful.
 
+## Optional third server
+
+[graphify](docs/GRAPHIFY.md) answers repo-wide architecture questions — module
+clusters, hubs, cycles, dependency paths — across every language in the tree, not
+just the crates you index.
+
+```bash
+cargo install graphify-rs
+graphify-rs build --path . --code-only --format json
+```
+
+Neither cortex nor quartz-ctx requires it. Note that a graph is a **snapshot**:
+unlike quartz-ctx it does not re-read source, so rebuild it after significant
+changes or it answers confidently and wrongly.
+
 ## Limits
 
 Rust only — a TypeScript or Python project yields zero items, silently. You list
@@ -55,8 +70,9 @@ each crate's `src` yourself; there is no workspace auto-discovery yet.
 ## Layout
 
 ```
-cortex/        memory + project intelligence server
-quartz-ctx/    API extraction server
-templates/     configs and instruction files to copy into your workspace
-scripts/       setup.ps1, setup.sh
+cortex/            memory + project intelligence server
+quartz-ctx/        API extraction server
+templates/         configs and instruction files to copy into your workspace
+scripts/           setup.ps1, setup.sh
+docs/GRAPHIFY.md   optional third server
 ```

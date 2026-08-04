@@ -320,7 +320,25 @@ quartz-ctx selfcheck --source my_crate/src --json
 
 ---
 
-## 6. Known limits
+## 6. Optional: graphify
+
+A third server for cross-crate architecture questions — module clusters, hubs,
+cycles, dependency paths — across the whole repository rather than the crates you
+list in `index-sources.json`.
+
+```bash
+cargo install graphify-rs
+graphify-rs build --path . --code-only --format json
+```
+
+Then add it to both MCP configs. Neither cortex nor quartz-ctx requires it.
+
+**→ [docs/GRAPHIFY.md](docs/GRAPHIFY.md)** for the config snippets, the tools
+worth knowing, and its pitfalls — chiefly that a graph is a **snapshot**: unlike
+quartz-ctx it does not re-read source, so a stale graph answers confidently and
+wrongly until you rebuild.
+
+## 7. Known limits
 
 - **Rust only.** A TypeScript or Python project yields **zero items, silently**.
   Multi-language extraction is designed but not built.
@@ -334,7 +352,7 @@ quartz-ctx selfcheck --source my_crate/src --json
 
 ---
 
-## 7. What is in this repo
+## 8. What is in this repo
 
 ```
 cortex_suite/
@@ -343,7 +361,8 @@ cortex_suite/
 ├── cortex/               memory + project intelligence server (Rust)
 ├── quartz-ctx/           API extraction server (Rust)
 ├── templates/            configs and instruction files to copy
-└── scripts/              setup.ps1 (Windows), setup.sh (macOS/Linux)
+├── scripts/              setup.ps1 (Windows), setup.sh (macOS/Linux)
+└── docs/GRAPHIFY.md      optional third server: repo-wide structural graph
 ```
 
 Both servers are plain Rust binaries with no runtime dependencies. Everything is
