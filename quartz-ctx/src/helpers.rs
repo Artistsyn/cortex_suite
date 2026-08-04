@@ -78,6 +78,7 @@ mod tests {
             origin: String::new(),
             visibility: Visibility::Public,
             span: None,
+            calls: Vec::new(),
         }
     }
 

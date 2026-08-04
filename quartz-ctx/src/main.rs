@@ -1,6 +1,9 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
+mod calls;
+mod discover;
 mod helpers;
+mod lang;
 mod mcp;
 mod model;
 mod parser;
@@ -142,6 +145,21 @@ struct ServeArgs {
     /// Turn it on when pointing quartz-ctx at a project rather than a library.
     #[arg(long)]
     include_private: bool,
+
+    /// Find every crate under this directory and serve them all.
+    ///
+    /// A directory counts as a crate when it holds both `Cargo.toml` and `src/`,
+    /// which covers a real Cargo workspace and a folder of standalone crates
+    /// alike. Each crate's package name becomes its origin tag, and build output
+    /// is skipped, so a vendored copy under `target/` is never picked up.
+    ///
+    /// Combines with --source and --sources-from; roots already listed are not
+    /// added twice.
+    ///
+    /// Example:
+    ///   quartz-ctx serve --discover . --name MyWorkspace
+    #[arg(long)]
+    discover: Option<PathBuf>,
 }
 
 /// One entry of a sources manifest (cortex's `index-sources.json` shape).
@@ -353,6 +371,21 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         }
     }
 
+    if let Some(root) = &args.discover {
+        let found = discover::discover_crates(root);
+        eprintln!(
+            "quartz-ctx serve: {} crate(s) discovered under {}",
+            found.len(),
+            root.display()
+        );
+        for c in found {
+            if requested.iter().any(|(p, _, _)| paths_equal(p, &c.src)) {
+                continue;
+            }
+            requested.push((c.src, Some(c.scope), args.include_private));
+        }
+    }
+
     if requested.is_empty() {
         requested.push((PathBuf::from("src"), None, args.include_private));
     }
@@ -378,20 +411,34 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             None => default_context_dir_name(src),
         };
         if sources.iter().any(|(_, t, _)| *t == tag) {
-            // Slug collision (e.g. quartz/src and synful_quartz/quartz/src both
-            // resolve to "quartz") — disambiguate with the grandparent directory.
-            if let Some(alt) = src
+            // Two roots want the same tag — e.g. quartz/src and
+            // synful_quartz/quartz/src both resolve to "quartz", or two branches
+            // each containing an `avatar_ik` crate.
+            //
+            // QUALIFY with the parent directory rather than REPLACING the tag
+            // with it. Replacing produced `pug-branch` for pug_branch/avatar_ik,
+            // then `pug-branch-11` for the next collision — names that identify
+            // the branch but not the crate, which is backwards. Keep the crate
+            // name and prefix its parent: `pug_branch_avatar_ik`.
+            //
+            // Sanitised, not slugified: these tags become cortex scopes and are
+            // prefixed onto module paths, so they must stay identifier-safe.
+            if let Some(parent) = src
                 .components()
                 .rev()
                 .filter(|c| c.as_os_str() != "src")
                 .nth(1)
-                .map(|c| slugify(&c.as_os_str().to_string_lossy()))
+                .map(|c| identifier_safe(&c.as_os_str().to_string_lossy()))
                 .filter(|s| !s.is_empty())
             {
-                tag = alt;
+                tag = format!("{parent}_{tag}");
             }
-            if sources.iter().any(|(_, t, _)| *t == tag) {
-                tag = format!("{tag}-{}", sources.len());
+            // Still colliding: fall back to a numeric suffix rather than looping.
+            let mut n = 2;
+            let base = tag.clone();
+            while sources.iter().any(|(_, t, _)| *t == tag) {
+                tag = format!("{base}_{n}");
+                n += 1;
             }
         }
         sources.push((src.clone(), tag, *include_private));
@@ -552,6 +599,20 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
             .to_lowercase()
     }
     norm(a) == norm(b)
+}
+
+/// Identifier-safe form of a name: lowercase, non-alphanumerics to underscore.
+/// Used for origin tags, which become cortex scopes and are prefixed onto module
+/// paths — so unlike  this preserves `_` rather than turning it into `-`.
+fn identifier_safe(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
 }
 
 fn slugify(value: &str) -> String {

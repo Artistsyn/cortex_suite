@@ -236,6 +236,24 @@ pub struct ApiGraphItem {
     /// Where the item is declared, so answers can cite `file:line`.
     #[serde(default)]
     pub span: Option<ApiGraphSpan>,
+    /// Calls made from this item's bodies. See `ApiGraphCall`.
+    #[serde(default)]
+    pub calls: Vec<ApiGraphCall>,
+}
+
+/// One call site from quartz-ctx.
+///
+/// `kind` is load-bearing: `path` means the callee names its owner
+/// (`Canvas::new`), `method` means only the method name is known because
+/// resolving the receiver's type needs inference the extractor does not do.
+/// Treating the two the same would invent ownership.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiGraphCall {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    #[serde(default)]
+    pub span: Option<ApiGraphSpan>,
 }
 
 /// A `file:line` source location from quartz-ctx.

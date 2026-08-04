@@ -11,6 +11,10 @@
     "roots in VS Code and one in Claude Code for weeks, so the same tool answered",
     "differently depending on the editor, with no error anywhere.",
     "",
+    "ALTERNATIVE to listing roots: replace the quartz-ctx --sources-from arg with",
+    "--discover . and it will find every crate under the workspace itself —",
+    "a Cargo workspace's members and a folder of standalone crates alike.",
+    "",
     "Never write live counts (nodes, items, communities) into a description string.",
     "They are correct for one day and misleading afterwards - ask the tool instead."
   ],

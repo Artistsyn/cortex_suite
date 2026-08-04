@@ -34,6 +34,47 @@ pub struct ApiItem {
     /// Where this item is declared. `None` only when the span was unavailable.
     #[serde(default)]
     pub span: Option<SourceSpan>,
+    /// Calls made from this item's own bodies (its methods, or a free function's
+    /// body). Deduped, so a call made in a loop counts once.
+    #[serde(default)]
+    pub calls: Vec<CallEdge>,
+}
+
+/// One call site found inside an item's body.
+///
+/// Callee resolution is deliberately partial. A path call (`Canvas::new(..)`)
+/// names its owner outright; a method call (`.add_plugin(..)`) does not, because
+/// knowing the receiver's type needs inference this extractor does not do.
+/// Recording which kind it is lets the consumer resolve what it can and be
+/// honest about the rest, rather than guessing an owner and being confidently
+/// wrong.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallEdge {
+    /// Enclosing function, qualified where known: `Canvas::run`, or `main`.
+    pub from: String,
+    /// `Canvas::new` for a path call; the bare method name for a method call.
+    pub to: String,
+    pub kind: CallKind,
+    /// Where the call appears, so the edge is citable.
+    #[serde(default)]
+    pub span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CallKind {
+    /// `Type::assoc(..)` or `free_fn(..)` — the path names the callee.
+    Path,
+    /// `receiver.method(..)` — only the method name is known here.
+    Method,
+}
+
+impl CallKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Method => "method",
+        }
+    }
 }
 
 /// Declared visibility of an item, in descending order of reach.

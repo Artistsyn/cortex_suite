@@ -37,7 +37,12 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
         // descend into build output or vendored dependencies at all.
         .filter_entry(|e| !is_excluded_dir(e))
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            let p = e.path();
+            p.extension().map_or(false, |ext| ext == "rs")
+                || crate::lang::Language::from_path(p).is_some()
+        })
     {
         let path = entry.path();
         let content = match std::fs::read_to_string(path) {
@@ -47,6 +52,27 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
                 continue;
             }
         };
+
+        // Non-Rust files go through tree-sitter. Their items are AST-only —
+        // no type resolution — which is a weaker signal than the `syn` path and
+        // is labelled as such, but vastly better than the previous behaviour of
+        // returning nothing at all and looking like an empty project.
+        if let Some(lang) = crate::lang::Language::from_path(path) {
+            let module_path = derive_module_path(dir, path);
+            let rel_path = path
+                .strip_prefix(dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            all_items.extend(crate::lang::parse_file(
+                &content,
+                lang,
+                &module_path,
+                &rel_path,
+                opts.include_private,
+            ));
+            continue;
+        }
 
         match syn::parse_file(&content) {
             Ok(file) => {
@@ -93,6 +119,11 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
             // cfg-gated duplicate definitions.
             if !owner.methods.iter().any(|m| m.name == method.name) {
                 owner.methods.push(method);
+            }
+        }
+        for call in pending.calls {
+            if !owner.calls.iter().any(|c| c.from == call.from && c.to == call.to) {
+                owner.calls.push(call);
             }
         }
         if let Some(tr) = pending.trait_name {
@@ -172,7 +203,11 @@ pub fn count_source_files(dir: &Path) -> usize {
         .filter_entry(|e| !is_excluded_dir(e))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
+        .filter(|e| {
+            let p = e.path();
+            p.extension().and_then(|x| x.to_str()) == Some("rs")
+                || crate::lang::Language::from_path(p).is_some()
+        })
         .count()
 }
 
@@ -321,6 +356,9 @@ struct PendingImpl {
     self_ty: String,
     trait_name: Option<String>,
     methods: Vec<ApiMethod>,
+    /// Calls made from this impl's method bodies, attached to the owning type
+    /// alongside the methods themselves.
+    calls: Vec<CallEdge>,
     /// Module path the `impl` block itself was found in — used to pick the
     /// right owner when several indexed types share a name.
     module_path: Vec<String>,
@@ -357,6 +395,11 @@ impl ApiVisitor {
                 for method in pending.methods {
                     if !owner.methods.iter().any(|m| m.name == method.name) {
                         owner.methods.push(method);
+                    }
+                }
+                for call in pending.calls {
+                    if !owner.calls.iter().any(|c| c.from == call.from && c.to == call.to) {
+                        owner.calls.push(call);
                     }
                 }
                 if let Some(tr) = pending.trait_name {
@@ -419,6 +462,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             origin: String::new(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
+            calls: Vec::new(),
         });
 
         syn::visit::visit_item_struct(self, node);
@@ -482,6 +526,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             origin: String::new(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
+            calls: Vec::new(),
         });
 
         syn::visit::visit_item_enum(self, node);
@@ -507,6 +552,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             origin: String::new(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.sig.ident, &self.rel_path),
+            calls: crate::calls::calls_in_block(
+                &node.block,
+                &node.sig.ident.to_string(),
+                &self.rel_path,
+            ),
         });
     }
 
@@ -554,6 +604,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             origin: String::new(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
+            calls: Vec::new(),
         });
 
         syn::visit::visit_item_trait(self, node);
@@ -576,6 +627,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             return;
         }
 
+        let mut impl_calls: Vec<CallEdge> = Vec::new();
         let methods: Vec<ApiMethod> = node
             .items
             .iter()
@@ -584,6 +636,14 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                     if !self.keep(&m.vis) {
                         return None;
                     }
+                    // Qualify the caller with its type, so an edge reads
+                    // `Canvas::run -> add_plugin` rather than a bare `run`.
+                    let qualified = format!("{}::{}", self_ty_name, m.sig.ident);
+                    impl_calls.extend(crate::calls::calls_in_block(
+                        &m.block,
+                        &qualified,
+                        &self.rel_path,
+                    ));
                     Some(ApiMethod {
                         name: m.sig.ident.to_string(),
                         doc: extract_docs(&m.attrs),
@@ -608,6 +668,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             self_ty: self_ty_name,
             trait_name,
             methods,
+            calls: impl_calls,
             module_path: self.module_path.clone(),
         });
 
@@ -639,6 +700,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             origin: String::new(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
+            calls: Vec::new(),
         });
     }
 
@@ -676,6 +738,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             origin: String::new(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
+            calls: Vec::new(),
         });
     }
 

@@ -239,7 +239,7 @@ fn render_types(structs: &[&ApiItem], engine_name: &str, usage: &crate::usage::U
         let prose = item.doc_prose();
         if !prose.is_empty() { l(&mut s, &format!("{}\n", prose)); }
 
-        l(&mut s, &format!("```rust\n{}\n```\n", item.signature));
+        l(&mut s, &format!("```{}\n{}\n```\n", fence_lang(item), item.signature));
         l(&mut s, &render_examples(item, usage));
 
         if !item.fields.is_empty() {
@@ -273,7 +273,7 @@ fn render_traits(traits: &[&ApiItem], engine_name: &str) -> String {
     for item in traits {
         l(&mut s, &format!("## `{}`\n", item.name));
         if !item.doc.is_empty() { l(&mut s, &format!("{}\n", item.doc)); }
-        l(&mut s, &format!("```rust\n{}\n```\n", item.signature));
+        l(&mut s, &format!("```{}\n{}\n```\n", fence_lang(item), item.signature));
 
         if !item.methods.is_empty() {
             l(&mut s, "\n**Required Methods**\n");
@@ -340,6 +340,20 @@ fn l(s: &mut String, line: &str) {
 }
 
 // ── Provenance, examples and coverage ────────────────────────────────────────
+
+/// Language tag for a fenced code block, taken from the item's own file.
+/// Labelling a Python class ```rust is a small lie that makes the sheet look
+/// machine-generated and breaks highlighting for every non-Rust project.
+fn fence_lang(item: &ApiItem) -> &'static str {
+    let file = item.span.as_ref().map(|s| s.file.as_str()).unwrap_or("");
+    match file.rsplit('.').next().unwrap_or("") {
+        "py" | "pyi" => "python",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "tsx",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        _ => "rust",
+    }
+}
 
 /// `defined at: path:line`, so a reader can open the declaration directly.
 fn render_span(item: &ApiItem) -> String {

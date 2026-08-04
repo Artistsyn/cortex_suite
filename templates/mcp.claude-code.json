@@ -18,6 +18,10 @@
     "tool depending on which editor you are in. Both should point at the same",
     "index-sources.json.",
     "",
+    "ALTERNATIVE to listing roots: replace the quartz-ctx --sources-from arg with",
+    "--discover . and it will find every crate under the workspace itself —",
+    "a Cargo workspace's members and a folder of standalone crates alike.",
+    "",
     "Windows: binaries are cortex/target/debug/cortex.exe and",
     "quartz-ctx/target/release/quartz-ctx.exe. macOS/Linux: drop the .exe."
   ],

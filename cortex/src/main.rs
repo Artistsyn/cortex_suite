@@ -2224,6 +2224,7 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     let (mut units, members) = compressor::compress_dir(&args.source, args.scope.as_deref())?;
     eprintln!("  source: {} items compressed, {} members", units.len(), members.len());
 
+    let mut graph_calls: Vec<(String, Vec<model::ApiGraphCall>)> = Vec::new();
     if let Some(graph_path) = &args.api_graph {
         let json = std::fs::read_to_string(graph_path)
             .with_context(|| format!("could not read api-graph: {}", graph_path.display()))?;
@@ -2231,6 +2232,19 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
         // Same scope as the source itself: quartz-ctx ids are unprefixed, so
         // ingesting a scoped source without it would collide with the primary
         // engine's ids and overwrite them.
+        // Keep each item's calls alongside the unit id they belong to, so they
+        // can be ingested once the graph nodes exist.
+        for gi in &graph_items {
+            if gi.calls.is_empty() { continue; }
+            let raw_module = gi.module_path.join("::");
+            let module_path = match args.scope.as_deref() {
+                Some(sc) if raw_module.is_empty() => sc.to_string(),
+                Some(sc) => format!("{}::{}", sc, raw_module),
+                None => raw_module,
+            };
+            let id = if module_path.is_empty() { gi.name.clone() } else { format!("{}::{}", module_path, gi.name) };
+            graph_calls.push((id, gi.calls.clone()));
+        }
         let graph_units = compressor::compress_api_graph(&graph_items, args.scope.as_deref());
         // Merge: api-graph items take precedence (they carry full method
         // signatures with types, per-method docs and field docs).
@@ -2271,6 +2285,38 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     let synced = graph::sync_nodes(store.conn())?;
     let all_units = store.all_units()?;
     let inferred = graph::infer_edges(store.conn(), &all_units)?;
+
+    // Call edges, if the api-graph carried any. Recorded after node sync so
+    // callees can be resolved against the units that were just indexed.
+    if !graph_calls.is_empty() {
+        // Clear this source's previous call rows so a reindex replaces rather
+        // than accumulates. Keyed on the unit ids being re-ingested, because an
+        // empty scope prefix in a LIKE would match — and delete — everything.
+        for (unit_id, _) in &graph_calls {
+            let module = unit_id.rsplit_once("::").map(|(m, _)| m).unwrap_or(unit_id);
+            store.conn().execute(
+                "DELETE FROM call_graph WHERE source = 'extracted' AND caller LIKE ?1",
+                rusqlite::params![format!("{module}::%")],
+            ).ok();
+            // Same for the derived graph edges, which carry source='calls' so
+            // infer_edges cannot delete them on the next source's pass.
+            store.conn().execute(
+                "DELETE FROM graph_edges WHERE source = 'calls' AND from_id LIKE ?1",
+                rusqlite::params![format!("{module}::%")],
+            ).ok();
+        }
+        let mut recorded = 0usize;
+        let mut edged = 0usize;
+        for (unit_id, calls) in &graph_calls {
+            let (r, e) = graph::ingest_calls(store.conn(), unit_id, calls, args.scope.as_deref(), &source_root)?;
+            recorded += r;
+            edged += e;
+        }
+        eprintln!(
+            "  calls: {} recorded, {} resolved to graph edges ({} left unresolved)",
+            recorded, edged, recorded.saturating_sub(edged)
+        );
+    }
 
     eprintln!("  total: {} units in index", units.len());
     eprintln!("  graph: {} nodes synced, {} edges inferred", synced, inferred);

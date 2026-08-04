@@ -734,6 +734,7 @@ mod tests {
             traits_impl: vec![],
             visibility: None,
             span: None,
+            calls: vec![],
         }
     }
 

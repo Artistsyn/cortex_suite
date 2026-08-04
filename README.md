@@ -21,8 +21,13 @@ output, so both are fed by one extractor and cannot disagree about what a type i
 ./scripts/setup.sh ~/code/my-project                    # macOS / Linux
 ```
 
-Needs only [Rust](https://rustup.rs). Then edit
-`.cortex/index-sources.json`, run one `index` command, restart your editor.
+Needs [Rust](https://rustup.rs) and a C toolchain (for the tree-sitter grammars —
+MSVC Build Tools on Windows, Xcode CLI tools on macOS, `build-essential` on
+Linux). Then edit `.cortex/index-sources.json`, run one `index` command, restart
+your editor.
+
+Don't want to list crates by hand? `quartz-ctx serve --discover .` finds every
+crate under a directory — workspace members and standalone crates alike.
 
 **→ Read [SETUP_HANDOFF.md](SETUP_HANDOFF.md) before you start.** It documents
 the pitfalls that cost us real debugging time — stale binaries, cache replay,
@@ -62,10 +67,26 @@ Neither cortex nor quartz-ctx requires it. Note that a graph is a **snapshot**:
 unlike quartz-ctx it does not re-read source, so rebuild it after significant
 changes or it answers confidently and wrongly.
 
+## Languages
+
+| Language | Extractor | Signal |
+|---|---|---|
+| Rust | `syn` | resolved — types, trait impls, cross-file `impl` blocks |
+| Python | tree-sitter | AST only — no type resolution |
+| TypeScript / JavaScript | tree-sitter | AST only — no type resolution |
+
+Rust is the strong path. The others are parsed from a concrete syntax tree, so
+there is no type resolution or cross-file linking — a genuinely weaker signal,
+and treated as one. What it buys is that a Python or TypeScript project no longer
+returns *zero items silently*, which is indistinguishable from "this project has
+no API".
+
 ## Limits
 
-Rust only — a TypeScript or Python project yields zero items, silently. You list
-each crate's `src` yourself; there is no workspace auto-discovery yet.
+AST-only languages resolve no types, so relationships between their items are
+thinner than Rust's. Call edges are recorded for every call site but only become
+graph edges when the callee is unambiguous — a method call carries no receiver
+type, so edging it would invent ownership.
 
 ## Layout
 

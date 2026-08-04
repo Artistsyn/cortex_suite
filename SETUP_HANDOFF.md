@@ -11,8 +11,9 @@ They are deliberately split that way. quartz-ctx holds no hand-written knowledge
 cortex no longer parses Rust itself. `reindex` runs quartz-ctx and ingests its
 output, so both are fed by one extractor and cannot disagree about what a type is.
 
-Works on **any Rust project**, on Windows, macOS and Linux, with Claude Code,
-VS Code + Copilot, or any MCP-capable host.
+Works on **Rust, Python, TypeScript and JavaScript** projects, on Windows, macOS
+and Linux, with Claude Code, VS Code + Copilot, or any MCP-capable host. Rust gets
+the strong path (`syn`, fully resolved); the rest are AST-only — see §7.
 
 ---
 
@@ -51,8 +52,21 @@ Then:
 4. **Verify:** ask the agent `get_api_context(hint: "...")`. If it returns your
    types, you are done.
 
-**Requirements:** Rust (https://rustup.rs) and nothing else. No Python, no Node,
-no network calls at runtime, no API keys. Everything is local.
+**Requirements:** [Rust](https://rustup.rs), plus a C toolchain for the
+tree-sitter grammars used by the non-Rust extractors:
+
+| Platform | What you need |
+|---|---|
+| Windows | Visual Studio Build Tools with the C++ workload |
+| macOS | `xcode-select --install` |
+| Linux | `build-essential` (or your distro's equivalent) |
+
+Nothing else. No Python, no Node, no network calls at runtime, no API keys.
+Everything is local.
+
+**Tip:** don't want to list crates by hand? `quartz-ctx serve --discover .`
+finds every crate under a directory — a Cargo workspace's members and a folder of
+standalone crates look identical to it.
 
 ---
 
@@ -343,15 +357,37 @@ worth knowing, and its pitfalls — chiefly that a graph is a **snapshot**: unli
 quartz-ctx it does not re-read source, so a stale graph answers confidently and
 wrongly until you rebuild.
 
-## 7. Known limits
+## 7. Languages, and what each is worth
 
-- **Rust only.** A TypeScript or Python project yields **zero items, silently**.
-  Multi-language extraction is designed but not built.
-- **No workspace auto-discovery.** List each crate's `src` in
-  `index-sources.json` yourself.
-- `call_graph` and `content_store` exist in the schema but are not populated, so
-  `explain_dependency_path` and `simulate_change` answer from type-reference
-  edges only.
+| Language | Extractor | Signal |
+|---|---|---|
+| Rust | `syn` | **resolved** — types, trait impls, cross-file `impl` blocks, full signatures |
+| Python | tree-sitter | AST only |
+| TypeScript / JavaScript | tree-sitter | AST only |
+
+The distinction is real and worth respecting. `syn` understands Rust; tree-sitter
+produces a concrete syntax tree with **no type resolution and no cross-file
+linking**. An AST-only item tells you a class exists, its methods, and where —
+not what any of it resolves to.
+
+That is still a large improvement on the previous behaviour, which was to return
+**zero items silently** for a non-Rust project — an answer indistinguishable from
+"this project has no API". Measured on a real FastAPI + React tree: 0 → 192 items.
+
+Visibility follows each language's own convention rather than Rust's: a leading
+underscore is internal in Python and JS/TS, `#field` is genuinely private in
+modern JS, and `private` / `protected` are honoured in TypeScript.
+
+### Known limits
+
+- **AST-only languages resolve no types**, so relationships between their items
+  are thinner than Rust's, and `include_private` matters more for them.
+- **Call edges are conservative.** Every call site is recorded in `call_graph`
+  with its `file:line`, but a call only becomes a graph edge when the callee
+  resolves unambiguously. A method call carries no receiver type, so edging it
+  would invent ownership — which is why ~5,500 recorded calls yield ~330 edges.
+- `content_store` exists in the schema but is not populated, so the
+  compact/expand handle contract is not yet active.
 - Indexing is full, not incremental. Fine at a few thousand items; a very large
   monorepo will be slower.
 
