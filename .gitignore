@@ -1,7 +1,19 @@
+# Build output
 /target
 **/target/
+
+# Local databases — yours, never distributed
 *.db
 *.db-shm
 *.db-wal
 .cortex/
-docs/
+
+# Generated API sheets (quartz-ctx `generate` writes here).
+# Scoped to the crates that produce them: a bare `docs/` also swallows this
+# repo's own documentation folder, silently — which is how docs/GRAPHIFY.md got
+# written, committed and pushed as nothing at all.
+cortex/docs/
+quartz-ctx/docs/
+
+# Graphify output — regenerate with `graphify-rs build`
+.graphify-output/

@@ -328,10 +328,15 @@ list in `index-sources.json`.
 
 ```bash
 cargo install graphify-rs
-graphify-rs build --path . --code-only --format json
+graphify-rs build --path . --code-only --format json --output .graphify-output
 ```
 
 Then add it to both MCP configs. Neither cortex nor quartz-ctx requires it.
+
+**`--output` is not optional.** By default graphify writes to a hashed global
+cache (`~/.graphify-rs/<project>-<hash>/`), not into your project — so an MCP
+config pointing at `.graphify-output/graph.json` would never find a file. Check
+`ls .graphify-output/graph.json` before wiring it up.
 
 **→ [docs/GRAPHIFY.md](docs/GRAPHIFY.md)** for the config snippets, the tools
 worth knowing, and its pitfalls — chiefly that a graph is a **snapshot**: unlike

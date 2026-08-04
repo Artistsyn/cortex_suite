@@ -55,7 +55,7 @@ just the crates you index.
 
 ```bash
 cargo install graphify-rs
-graphify-rs build --path . --code-only --format json
+graphify-rs build --path . --code-only --format json --output .graphify-output
 ```
 
 Neither cortex nor quartz-ctx requires it. Note that a graph is a **snapshot**:
