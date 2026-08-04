@@ -1,0 +1,27 @@
+[package]
+name = "cortex"
+version = "0.1.0"
+edition = "2021"
+description = "Persistent semantic memory layer for Copilot — compress, index, remember, serve"
+
+[[bin]]
+name = "cortex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow      = "1.0"
+chrono      = { version = "0.4", features = ["serde"] }
+clap        = { version = "4.0", features = ["derive"] }
+dirs        = "5.0"
+notify      = "6.0"
+proc-macro2 = "1.0"
+quote       = "1.0"
+rusqlite    = { version = "0.31", features = ["bundled"] }
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+toml        = "0.8"
+syn         = { version = "2.0", features = ["full", "extra-traits", "visit"] }
+walkdir     = "2.0"
+flate2      = "1.0"
+sha2        = "0.10"
+hex         = "0.4"

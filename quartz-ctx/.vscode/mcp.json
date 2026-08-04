@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "quartz-ctx": {
+      "type": "stdio",
+      "command": "quartz-ctx",
+      "args": ["serve", "--source", "src", "--name", "Quartz"]
+    }
+  }
+}

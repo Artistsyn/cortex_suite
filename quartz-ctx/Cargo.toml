@@ -1,0 +1,21 @@
+[package]
+name = "quartz-ctx"
+version = "0.1.0"
+edition = "2021"
+description = "Generates structured Copilot context from a Rust codebase's public API surface"
+
+[[bin]]
+name = "quartz-ctx"
+path = "src/main.rs"
+
+[dependencies]
+anyhow    = "1.0"
+clap      = { version = "4.0", features = ["derive"] }
+# span-locations gives parsed items real line numbers, so every extracted symbol
+# can carry a `file:line` an agent can cite and open.
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+quote     = "1.0"
+serde     = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+syn       = { version = "2.0", features = ["full", "extra-traits", "visit"] }
+walkdir   = "2.0"

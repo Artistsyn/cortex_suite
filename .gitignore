@@ -1,0 +1,7 @@
+/target
+**/target/
+*.db
+*.db-shm
+*.db-wal
+.cortex/
+docs/

@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "THE source manifest. Both cortex (indexing) and quartz-ctx (serving) read this",
+    "file, so the two cannot disagree about which roots exist. Copy to",
+    "<your-workspace>/.cortex/index-sources.json and edit the targets.",
+    "",
+    "  source          path to a crate's src dir, RELATIVE to the workspace root,",
+    "                  forward slashes. Windows backslashes also work but forward",
+    "                  slashes keep the file identical across machines.",
+    "  name            display label only.",
+    "  scope           module-path prefix for this crate's units, so two crates that",
+    "                  both define `Config` stay distinguishable. Use null for the ONE",
+    "                  primary project - its units stay unprefixed and win ties in",
+    "                  get_item. Scope becomes quartz-ctx's origin tag verbatim, so",
+    "                  use identifier-safe names (my_crate, not my-crate).",
+    "  include_private index non-pub items too. Set TRUE for applications and binaries,",
+    "                  FALSE (omit) for libraries. A library publishes its API through",
+    "                  pub; an app does not - measured on the reference workspace,",
+    "                  pub-only showed 19% of a GUI app and 33% of a CLI, against 55%",
+    "                  of an engine library."
+  ],
+  "targets": [
+    {
+      "source": "my_engine/src",
+      "name": "MyEngine",
+      "scope": null
+    },
+    {
+      "source": "my_app/src",
+      "name": "MyApp",
+      "scope": "my_app",
+      "include_private": true
+    }
+  ]
+}

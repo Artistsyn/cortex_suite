@@ -1,0 +1,45 @@
+{
+  "___READ_ME___": [
+    "Claude Code MCP config. Copy to <your-workspace>/.mcp.json and delete the ___ keys.",
+    "",
+    "Paths are relative to the WORKSPACE ROOT (where you launch Claude Code), not to",
+    "this file. Windows: use forward slashes - they work and survive JSON escaping.",
+    "",
+    "PITFALL 1 - the subcommand comes FIRST. args must begin with 'serve' before any",
+    "flag. Without it clap exits 2 and the server never completes an MCP handshake,",
+    "which the host reports only as a vague connection failure.",
+    "",
+    "PITFALL 2 - do not mix command families. Either point `command` at the .exe and",
+    "pass its own flags, or point it at powershell/bash and pass script flags. Mixing",
+    "them (exe + -File ...) produces a process that starts and immediately dies.",
+    "",
+    "PITFALL 3 - keep this file and .vscode/mcp.json in sync. They are separate files",
+    "read by different hosts; when they drift you get different answers from the same",
+    "tool depending on which editor you are in. Both should point at the same",
+    "index-sources.json.",
+    "",
+    "Windows: binaries are cortex/target/debug/cortex.exe and",
+    "quartz-ctx/target/release/quartz-ctx.exe. macOS/Linux: drop the .exe."
+  ],
+  "mcpServers": {
+    "cortex": {
+      "command": "cortex_suite/cortex/target/debug/cortex",
+      "args": [
+        "--db", ".cortex/memory.db",
+        "serve",
+        "--source", "my_engine/src",
+        "--repo", ".",
+        "--name", "MyWorkspace"
+      ]
+    },
+    "quartz-ctx": {
+      "command": "cortex_suite/quartz-ctx/target/release/quartz-ctx",
+      "args": [
+        "serve",
+        "--source", "my_engine/src",
+        "--sources-from", ".cortex/index-sources.json",
+        "--name", "MyEngine"
+      ]
+    }
+  }
+}

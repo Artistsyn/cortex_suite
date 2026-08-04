@@ -1,0 +1,43 @@
+{
+  "___READ_ME___": [
+    "VS Code / Copilot MCP config. Copy to <your-workspace>/.vscode/mcp.json and",
+    "delete the ___ keys.",
+    "",
+    "Note the shape differs from Claude Code's: VS Code uses `servers` (not",
+    "`mcpServers`) and each entry needs an explicit \"type\": \"stdio\".",
+    "",
+    "Keep the args IDENTICAL to .mcp.json. The two files are read by different hosts",
+    "and drift silently: on the reference workspace quartz-ctx was given three source",
+    "roots in VS Code and one in Claude Code for weeks, so the same tool answered",
+    "differently depending on the editor, with no error anywhere.",
+    "",
+    "Never write live counts (nodes, items, communities) into a description string.",
+    "They are correct for one day and misleading afterwards - ask the tool instead."
+  ],
+  "servers": {
+    "cortex": {
+      "type": "stdio",
+      "command": "cortex_suite/cortex/target/debug/cortex.exe",
+      "args": [
+        "--db", ".cortex/memory.db",
+        "serve",
+        "--source", "my_engine/src",
+        "--repo", ".",
+        "--name", "MyWorkspace"
+      ],
+      "description": "Project memory: patterns, anti-patterns, decisions, code index."
+    },
+    "quartz-ctx": {
+      "type": "stdio",
+      "command": "cortex_suite/quartz-ctx/target/release/quartz-ctx.exe",
+      "args": [
+        "serve",
+        "--source", "my_engine/src",
+        "--sources-from", ".cortex/index-sources.json",
+        "--name", "MyEngine"
+      ],
+      "description": "API ground truth, parsed live from source. Roots come from .cortex/index-sources.json so they cannot drift from what cortex indexes. Start coding tasks with get_api_context(hint)."
+    }
+  },
+  "inputs": []
+}

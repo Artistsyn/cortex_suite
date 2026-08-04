@@ -1,0 +1,291 @@
+use serde::{Deserialize, Serialize};
+
+/// A single public item extracted from the codebase.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiItem {
+    pub kind: ItemKind,
+    pub name: String,
+    /// Raw doc-comment text (concatenated `///` lines).
+    pub doc: String,
+    /// Human-readable signature string.
+    pub signature: String,
+    /// Module path relative to the parsed root, e.g. `["game_object", "sprite"]`.
+    pub module_path: Vec<String>,
+    /// Public methods attached via `impl` blocks.
+    pub methods: Vec<ApiMethod>,
+    /// Variants (enums only).
+    pub variants: Vec<ApiVariant>,
+    /// Named fields (structs only).
+    pub fields: Vec<ApiField>,
+    /// Raw generics string, empty if none.
+    pub generics: String,
+    /// Trait names this type implements (from `impl Trait for Type` blocks).
+    pub traits_impl: Vec<String>,
+    /// Which source root this item came from (e.g. "quartz", "synful-quartz",
+    /// "path-forge"). Empty for single-source runs. Set by the loader, not the parser.
+    #[serde(default)]
+    pub origin: String,
+    /// How visible this item is. A library exposes its API through `pub`, but an
+    /// application or binary crate mostly does not — indexing only `pub` returns
+    /// almost nothing useful for a typical app, so visibility is recorded rather
+    /// than used to silently drop items.
+    #[serde(default)]
+    pub visibility: Visibility,
+    /// Where this item is declared. `None` only when the span was unavailable.
+    #[serde(default)]
+    pub span: Option<SourceSpan>,
+}
+
+/// Declared visibility of an item, in descending order of reach.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Visibility {
+    /// `pub` — reachable outside the crate.
+    #[default]
+    Public,
+    /// `pub(crate)` — the crate-internal API surface.
+    Crate,
+    /// `pub(in path)` / `pub(super)` — restricted to part of the crate.
+    Restricted,
+    /// No modifier — private to its module.
+    Private,
+}
+
+impl Visibility {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Public => "pub",
+            Self::Crate => "pub(crate)",
+            Self::Restricted => "pub(restricted)",
+            Self::Private => "private",
+        }
+    }
+
+    /// True when this item should be kept under the given inclusion policy.
+    pub fn is_included(&self, include_private: bool) -> bool {
+        include_private || matches!(self, Self::Public)
+    }
+}
+
+/// A source location an agent can cite and open: `path:line`.
+/// `file` is relative to the scanned root and always uses forward slashes, so it
+/// reads identically on every platform.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub file: String,
+    pub line: usize,
+}
+
+impl std::fmt::Display for SourceSpan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.file, self.line)
+    }
+}
+
+/// Split a doc comment into prose and fenced code blocks.
+///
+/// Rustdoc examples live in ```` ``` ```` fences inside the doc text. Flattening
+/// the whole comment into one blob loses them as runnable syntax, so they are
+/// pulled out and surfaced separately. Rustdoc's hidden-line prefix (`# `) is
+/// stripped, matching how the code would actually be read.
+pub fn split_doc(doc: &str) -> (String, Vec<String>) {
+    let mut prose = Vec::new();
+    let mut blocks = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+
+    for line in doc.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            match current.take() {
+                Some(block) => blocks.push(block.join("\n")),
+                None => current = Some(Vec::new()),
+            }
+            continue;
+        }
+        match &mut current {
+            Some(block) => {
+                // `# ` marks a line rustdoc compiles but hides from readers.
+                let code = trimmed.strip_prefix("# ").unwrap_or(line);
+                if code.trim() != "#" {
+                    block.push(code.to_string());
+                }
+            }
+            None => prose.push(line),
+        }
+    }
+    // An unterminated fence still yields its content rather than dropping it.
+    if let Some(block) = current {
+        if !block.is_empty() {
+            blocks.push(block.join("\n"));
+        }
+    }
+
+    (prose.join("\n").trim().to_string(), blocks)
+}
+
+impl ApiItem {
+    /// Returns the first line of the doc comment, suitable for inline hints.
+    pub fn doc_summary(&self) -> &str {
+        self.doc.lines().next().map(str::trim).unwrap_or("")
+    }
+
+    /// Doc text with fenced code blocks removed.
+    pub fn doc_prose(&self) -> String {
+        split_doc(&self.doc).0
+    }
+
+    /// Fenced code blocks found in this item's doc comment.
+    pub fn doc_examples(&self) -> Vec<String> {
+        split_doc(&self.doc).1
+    }
+
+    /// Module path joined with `::`.
+    pub fn module_str(&self) -> String {
+        self.module_path.join("::")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ItemKind {
+    Struct,
+    Enum,
+    Trait,
+    Function,
+    TypeAlias,
+    Const,
+}
+
+impl ItemKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Struct    => "struct",
+            Self::Enum      => "enum",
+            Self::Trait     => "trait",
+            Self::Function  => "fn",
+            Self::TypeAlias => "type",
+            Self::Const     => "const",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiMethod {
+    pub name: String,
+    pub doc: String,
+    pub signature: String,
+    #[serde(default)]
+    pub visibility: Visibility,
+    #[serde(default)]
+    pub span: Option<SourceSpan>,
+}
+
+impl ApiMethod {
+    pub fn doc_summary(&self) -> &str {
+        self.doc.lines().next().map(str::trim).unwrap_or("")
+    }
+
+    pub fn doc_prose(&self) -> String {
+        split_doc(&self.doc).0
+    }
+
+    pub fn doc_examples(&self) -> Vec<String> {
+        split_doc(&self.doc).1
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiVariant {
+    pub name: String,
+    pub doc: String,
+    pub fields: Vec<ApiField>,
+}
+
+impl ApiVariant {
+    pub fn doc_summary(&self) -> &str {
+        self.doc.lines().next().map(str::trim).unwrap_or("")
+    }
+
+    /// Render variant fields as a compact inline string, e.g. `{ path: String, volume: f32 }`.
+    pub fn fields_inline(&self) -> String {
+        if self.fields.is_empty() {
+            return String::new();
+        }
+        let inner: Vec<String> = self.fields.iter()
+            .map(|f| {
+                if f.name.starts_with('_') {
+                    f.ty.clone()
+                } else {
+                    format!("{}: {}", f.name, f.ty)
+                }
+            })
+            .collect();
+        format!("{{ {} }}", inner.join(", "))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiField {
+    pub name: String,
+    pub ty: String,
+    pub doc: String,
+}
+
+// ── Extended Metadata for Advanced Tools ──────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeExample {
+    pub title: String,
+    pub description: String,
+    pub code: String,
+    pub context: String, // "common", "physics", "input", "advanced"
+    pub source: String,  // where this came from
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntiPattern {
+    pub name: String,
+    pub description: String,
+    pub wrong_code: String,
+    pub correct_code: String,
+    pub consequence: String,
+    pub affected_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraitInfo {
+    pub name: String,
+    pub types_implementing: Vec<String>,
+    pub required_methods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuilderInfo {
+    pub base_type: String,
+    pub builder_name: String,
+    pub method_sequence: Vec<BuilderMethod>,
+    pub finish_returns: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuilderMethod {
+    pub name: String,
+    pub params: Vec<(String, String)>, // (name, type)
+    pub returns: String,
+    pub doc: String,
+    pub order_dependency: Option<String>, // method that must come before
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeRequirement {
+    pub field: String,
+    pub prerequisites: Vec<String>,
+    pub incompatibilities: Vec<String>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceChar {
+    pub operation: String,
+    pub complexity: String,
+    pub cost_description: String,
+    pub optimization_tips: Vec<String>,
+}
