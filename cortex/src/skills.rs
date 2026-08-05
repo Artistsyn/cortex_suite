@@ -388,7 +388,7 @@ pub fn publish_skill(
     let dest_dir = skills_dir.join(&safe_name);
     std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join("SKILL.md");
-    std::fs::write(&dest, &published)?;
+    std::fs::write(&dest, with_frontmatter(&safe_name, &published))?;
     written.push(dest);
 
     // VS Code Copilot reads none of that. Its equivalent surface is a prompt
@@ -396,7 +396,7 @@ pub fn publish_skill(
     // Publishing to only one host is how a skill ends up live for half the team.
     if let Some(prompts_dir) = copilot_prompts_dir {
         std::fs::create_dir_all(prompts_dir)?;
-        let summary = first_prose_line(&published)
+        let summary = skill_description(&published)
             .unwrap_or_else(|| format!("Skill: {name}"));
         let prompt = format!(
             "---\nmode: agent\ndescription: \"{}\"\n---\n\n{}\n",
@@ -411,13 +411,84 @@ pub fn publish_skill(
     Ok(written)
 }
 
-/// First real sentence of a skill body, for a prompt-file description.
-/// Skips the heading, HTML comments, blank lines and section headers.
-fn first_prose_line(body: &str) -> Option<String> {
-    body.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("<!--"))
-        .map(|l| l.chars().take(160).collect())
+/// One-line description of a skill, for the frontmatter and the prompt file.
+///
+/// This is the single most load-bearing string in a published skill: it is what
+/// the host shows an agent when deciding whether to invoke. A skill published
+/// without one lists as `name: name`, which tells the agent nothing — the skill
+/// is discoverable and still never chosen.
+///
+/// Prefers the prose under a `## Purpose` heading, since that is where these
+/// drafts state their intent; falls back to the first prose line.
+fn skill_description(body: &str) -> Option<String> {
+    let lines: Vec<&str> = body.lines().map(str::trim).collect();
+
+    let is_prose = |l: &str| !l.is_empty() && !l.starts_with('#') && !l.starts_with("<!--");
+
+    // Markdown source is hard-wrapped, so the first LINE is usually half a
+    // sentence ("Find the defects that only appear on someone else's machine,
+    // before you hand"). Join the paragraph before truncating.
+    let paragraph_from = |start: usize| -> Option<String> {
+        let first = lines[start..].iter().position(|l| is_prose(l))? + start;
+        let text = lines[first..]
+            .iter()
+            .take_while(|l| is_prose(l))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(text)
+    };
+
+    let heading = |want: &str| {
+        lines.iter().position(|l| l.eq_ignore_ascii_case(want))
+    };
+
+    // `## Purpose` states intent directly. `## Use This Skill When` is a trigger
+    // list, so read its first bullet and phrase it as a condition.
+    if let Some(i) = heading("## Purpose") {
+        if let Some(t) = paragraph_from(i + 1) {
+            return Some(truncate_sentence(&t));
+        }
+    }
+    if let Some(i) = heading("## Use This Skill When") {
+        if let Some(t) = paragraph_from(i + 1) {
+            let first_bullet = t.split(" - ").next().unwrap_or(&t);
+            let cleaned = first_bullet.trim_start_matches("- ").trim();
+            return Some(truncate_sentence(&format!("Use when: {cleaned}")));
+        }
+    }
+
+    let t = paragraph_from(0)?;
+    let cleaned = t.trim_start_matches("- ").trim();
+    Some(truncate_sentence(cleaned))
+}
+
+/// Trim to a sentence boundary under 200 chars, so a description reads as a
+/// complete thought rather than stopping mid-clause.
+fn truncate_sentence(line: &str) -> String {
+    if line.chars().count() <= 200 {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(200).collect();
+    match head.rfind(". ") {
+        Some(i) => head[..=i].trim().to_string(),
+        None => match head.rfind(' ') {
+            Some(i) => format!("{}...", head[..i].trim()),
+            None => head,
+        },
+    }
+}
+
+/// Prepend `name`/`description` YAML frontmatter unless the body already has some.
+fn with_frontmatter(name: &str, body: &str) -> String {
+    if body.trim_start().starts_with("---") {
+        return body.to_string();
+    }
+    let desc = skill_description(body).unwrap_or_else(|| format!("Skill: {name}"));
+    format!(
+        "---\nname: {name}\ndescription: \"{}\"\n---\n\n{body}",
+        desc.replace('\n', " ").replace('"', "'")
+    )
 }
 
 pub fn set_skill_status(store: &Store, name: &str, status: &str) -> Result<usize> {
@@ -513,6 +584,51 @@ pub fn detect_gap_proposals(store: &Store, min_count: i64) -> Result<Vec<GapProp
 
 #[cfg(test)]
 mod tests {
+    /// The description is what an agent reads when deciding to invoke a skill.
+    /// `## Purpose` is where these drafts state intent, so prefer it.
+    #[test]
+    fn description_prefers_purpose_and_completes_a_thought() {
+        let body = "# quartz-forge-project-roundtrip\n\n## Purpose\n\n\
+                    Execute a reliable end-to-end roundtrip through MCP tools.\n";
+        assert_eq!(
+            super::skill_description(body).unwrap(),
+            "Execute a reliable end-to-end roundtrip through MCP tools."
+        );
+
+        // Hard-wrapped prose is joined, not cut at the line break.
+        let wrapped = "# t\n\n## Purpose\n\nFind the defects that only appear on\n\
+                       someone else's machine, before you hand it over.\n";
+        assert_eq!(
+            super::skill_description(wrapped).unwrap(),
+            "Find the defects that only appear on someone else's machine, before you hand it over."
+        );
+
+        // A trigger list reads as a condition, and never leaks a leading "-"
+        // into the YAML value.
+        let triggers = "# t\n\n## Use This Skill When\n\n\
+                        - A GUI control is reported invisible\n- Something else\n";
+        assert_eq!(
+            super::skill_description(triggers).unwrap(),
+            "Use when: A GUI control is reported invisible"
+        );
+
+        // No Purpose section -> first prose line.
+        assert_eq!(super::skill_description("# t\n\nJust do it.\n").unwrap(), "Just do it.");
+
+        // Nothing but headings -> None, and the caller supplies a fallback.
+        assert!(super::skill_description("# t\n\n## Section\n").is_none());
+
+        // Long text stops at a sentence boundary, not mid-clause.
+        let long = format!("# t\n\n{} And a trailing clause that runs past the limit.\n",
+                           "A".repeat(190));
+        let d = super::skill_description(&long).unwrap();
+        assert!(d.len() <= 201, "{d}");
+
+        // An existing frontmatter block is never doubled.
+        let fm = "---\nname: kept\ndescription: mine\n---\n\nbody\n";
+        assert_eq!(super::with_frontmatter("other", fm), fm);
+    }
+
     /// Approval must produce a file or an error - never a success message with
     /// nothing on disk, which is what `skill-approve` did for every skill
     /// approved before 2026-08-05.
@@ -562,6 +678,8 @@ mod tests {
         assert!(dest.exists());
         assert_eq!(dest, &skills.join("real").join("SKILL.md"));
         let out = std::fs::read_to_string(dest).unwrap();
+        assert!(out.starts_with("---\nname: real\ndescription: \"1. Do the thing.\"\n---"),
+                "SKILL.md needs frontmatter or the host lists it as `name: name`:\n{out}");
         assert!(out.contains("Do the thing."));
         assert!(out.contains("Agent-authored"), "provenance is kept");
         assert!(!out.contains("Review and approve:"), "decision scaffolding is dropped");
