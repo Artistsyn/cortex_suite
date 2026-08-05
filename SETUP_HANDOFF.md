@@ -356,7 +356,7 @@ names.
 | Type returns 0 methods | index predates the cross-file impl fix | rebuild and reindex |
 | A name returns the wrong type | several indexed types share it | pass `scope=`, or the full unit id |
 | Index has units from deleted sources | indexing never prunes | `cortex prune-index --keep <root> ... --apply` |
-| Empty index for an app | `pub`-only extraction | `include_private: true` (2.9) |
+| Empty index for an app | `pub`-only extraction | `include_private: true` (2.11) |
 | 0 items on a non-Rust project | Rust only, today | not yet supported |
 
 **Health checks:**
