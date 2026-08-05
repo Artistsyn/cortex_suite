@@ -257,10 +257,13 @@ enum Command {
     /// List skill candidates detected from session patterns.
     SkillStatus,
 
-    /// Approve a skill candidate draft (mark as approved in DB).
+    /// Approve a skill candidate: publish its draft to the skills directory.
     SkillApprove {
         /// Skill name (as shown by skill-status).
         name: String,
+        /// Publish even if the draft still contains [Edit: ...] placeholders.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Reject a skill candidate draft.
@@ -710,7 +713,7 @@ fn main() -> Result<()> {
         }
         Command::ReviewProposals { kind }       => run_review_proposals(kind.as_deref(), &db_path),
         Command::SkillStatus                    => run_skill_status(&db_path),
-        Command::SkillApprove { name }          => run_skill_approve(&name, &db_path),
+        Command::SkillApprove { name, force }   => run_skill_approve(&name, &db_path, force),
         Command::SkillReject { name }           => run_skill_reject(&name, &db_path),
         Command::ProposalApprove { id }         => run_proposal_decision(id, "approved", None, &db_path),
         Command::ProposalReject { id, reason }  => {
@@ -4121,14 +4124,38 @@ fn run_skill_status(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_skill_approve(name: &str, db_path: &Path) -> Result<()> {
+fn run_skill_approve(name: &str, db_path: &Path, force: bool) -> Result<()> {
     let store = Store::open(db_path)?;
-    let changed = skills::set_skill_status(&store, name, "approved")?;
-    if changed > 0 {
-        println!("[cortex] Skill '{name}' marked as approved.");
-    } else {
+    let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+
+    // Locate the draft. Approval publishes a file; without one there is nothing
+    // to approve, and flipping the status alone is how three skills came to be
+    // recorded as live while existing nowhere on disk.
+    let draft: Option<String> = store.conn().query_row(
+        "SELECT draft_path FROM skill_candidates WHERE name = ?1",
+        rusqlite::params![name],
+        |r| r.get(0),
+    ).ok().flatten();
+
+    let Some(draft) = draft else {
         println!("[cortex] No skill candidate named '{name}' found.");
-    }
+        return Ok(());
+    };
+
+    let draft_path = {
+        let p = Path::new(&draft);
+        if p.is_absolute() { p.to_path_buf() } else { repo_root.join(p) }
+    };
+
+    let prefs = load_prefs_from_repo(repo_root);
+    let skills_dir = repo_root.join(&prefs.skills.skills_dir);
+
+    let dest = skills::publish_skill(name, &draft_path, &skills_dir, force)?;
+
+    // Status is recorded only after the file exists.
+    skills::set_skill_status(&store, name, "approved")?;
+    println!("[cortex] Skill '{name}' approved and published:");
+    println!("         {}", dest.display());
     Ok(())
 }
 

@@ -6,7 +6,7 @@
 ///
 /// Also handles skill draft generation and health metrics.
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rusqlite::params;
@@ -327,6 +327,67 @@ pub fn list_skill_candidates(store: &Store) -> Result<Vec<SkillCandidateSummary>
 }
 
 /// Set a skill candidate status (candidate / drafted / approved / rejected).
+/// Copy an approved skill draft to the live skills directory.
+///
+/// `skill-approve` used to flip a status column and stop there, printing
+/// "marked as approved" — so every skill approved before 2026-08-05 was recorded
+/// as live and existed nowhere on disk. Approval that does not publish is
+/// approval that reports success and changes nothing.
+///
+/// Returns the path written. Refuses rather than publishing when:
+///   - there is no draft file (nothing to publish)
+///   - the draft still carries `[Edit: ...]` placeholders, unless `force`
+///
+/// The placeholder guard matters because skill detection fires on repeated tool
+/// sequences: a thin signal produces a draft whose body is template text, and
+/// publishing that costs tokens in every future session while teaching nothing.
+pub fn publish_skill(
+    name: &str,
+    draft_path: &Path,
+    skills_dir: &Path,
+    force: bool,
+) -> Result<PathBuf> {
+    if !draft_path.exists() {
+        anyhow::bail!(
+            "no draft file at {} - nothing to publish. Re-draft with propose_skill \
+             before approving.",
+            draft_path.display()
+        );
+    }
+
+    let body = std::fs::read_to_string(draft_path)?;
+
+    if !force {
+        if let Some(line) = body.lines().find(|l| l.contains("[Edit:")) {
+            anyhow::bail!(
+                "draft is still a template - {} contains a placeholder:\n    {}\n\
+                 Fill it in, or re-run with --force to publish as-is.",
+                draft_path.display(),
+                line.trim()
+            );
+        }
+    }
+
+    // Drop the review-workflow comments; they are scaffolding for a decision
+    // that has now been made. Provenance lines are kept.
+    let published: String = body
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !(t.starts_with("<!--")
+                && (t.contains("Review and approve:") || t.contains("Target:")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let safe_name = name.replace(['/', '\\', ' '], "-");
+    let dest_dir  = skills_dir.join(&safe_name);
+    std::fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join("SKILL.md");
+    std::fs::write(&dest, published)?;
+    Ok(dest)
+}
+
 pub fn set_skill_status(store: &Store, name: &str, status: &str) -> Result<usize> {
     let changed = store.conn().execute(
         "UPDATE skill_candidates SET status = ?1 WHERE name = ?2",
@@ -416,4 +477,61 @@ pub fn detect_gap_proposals(store: &Store, min_count: i64) -> Result<Vec<GapProp
     }
 
     Ok(proposals)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Approval must produce a file or an error - never a success message with
+    /// nothing on disk, which is what `skill-approve` did for every skill
+    /// approved before 2026-08-05.
+    #[test]
+    fn publish_writes_a_file_and_refuses_templates() {
+        let base = std::env::temp_dir().join("cortex_publish_skill_test");
+        let _ = std::fs::remove_dir_all(&base);
+        let drafts = base.join("proposals");
+        let skills = base.join("skills");
+        std::fs::create_dir_all(&drafts).unwrap();
+
+        // No draft -> refuse. Nothing to publish is not an approval.
+        let missing = drafts.join("skill_absent.md");
+        assert!(super::publish_skill("absent", &missing, &skills, false).is_err());
+
+        // Placeholder draft -> refuse, and name the offending line.
+        let tmpl = drafts.join("skill_thin.md");
+        std::fs::write(&tmpl, "# thin
+
+## Procedure
+
+- [Edit: describe when to use this]
+").unwrap();
+        let err = super::publish_skill("thin", &tmpl, &skills, false).unwrap_err().to_string();
+        assert!(err.contains("[Edit:"), "{err}");
+        assert!(!skills.join("thin").join("SKILL.md").exists(), "refusal must not write");
+
+        // ...unless forced.
+        assert!(super::publish_skill("thin", &tmpl, &skills, true).is_ok());
+
+        // A real draft publishes, minus the review scaffolding.
+        let real = drafts.join("skill_real.md");
+        std::fs::write(&real,
+            "# real
+<!-- Agent-authored via propose_skill | Drafted: 2026-08-05 -->
+             <!-- Review and approve: cortex skill-approve real -->
+             <!-- Target: agent_customization/skills/real/SKILL.md -->
+
+## Procedure
+
+1. Do the thing.
+").unwrap();
+        let dest = super::publish_skill("real", &real, &skills, false).unwrap();
+        assert!(dest.exists());
+        assert_eq!(dest, skills.join("real").join("SKILL.md"));
+        let out = std::fs::read_to_string(&dest).unwrap();
+        assert!(out.contains("Do the thing."));
+        assert!(out.contains("Agent-authored"), "provenance is kept");
+        assert!(!out.contains("Review and approve:"), "decision scaffolding is dropped");
+        assert!(!out.contains("Target:"), "decision scaffolding is dropped");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
