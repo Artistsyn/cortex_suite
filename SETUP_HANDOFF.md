@@ -187,7 +187,41 @@ corruption rather than errors:
 You will see `NativeCommandError` noise when a script pipes a native exe's
 output. If each step still reports `done`, that is cosmetic.
 
-### 2.7 Never write escape sequences through a shell heredoc
+### 2.7 PowerShell: `$ErrorActionPreference = 'Stop'` kills native commands
+
+This one bit our own setup script, and it is worth knowing before you write any
+automation around these tools.
+
+With `$ErrorActionPreference = 'Stop'`, **any** stderr output from a native
+executable is raised as a terminating `NativeCommandError`. `cargo` writes every
+`Compiling ...` line to stderr, so a completely successful build aborts the
+script on the first crate.
+
+```powershell
+# WRONG - dies on cargo's normal progress output
+$ErrorActionPreference = 'Stop'
+cargo build
+
+# RIGHT - relax the preference around the native call, judge it by exit code
+$prev = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+cargo build
+$ErrorActionPreference = $prev
+if ($LASTEXITCODE -ne 0) { throw "build failed" }
+```
+
+Exit code is the only trustworthy signal for a native process.
+
+### 2.8 PowerShell 5.1 is .NET Framework, not .NET Core
+
+`[System.IO.Path]::GetRelativePath` does not exist there. Neither do a number of
+other modern BCL conveniences. Windows PowerShell 5.1 runs on .NET Framework 4.x;
+`pwsh` 7+ runs on .NET Core. Code that works in `pwsh` can fail on the shell your
+colleagues actually have.
+
+Use `Uri.MakeRelativeUri` for relative paths — available on both.
+
+### 2.9 Never write escape sequences through a shell heredoc
 
 Writing `'\n'` inside a `bash <<EOF` heredoc produces a **real newline** in the
 file, not the two-character escape. In Rust that is
@@ -197,7 +231,7 @@ breaks a string literal.
 This has recurred across three different file types. Use your editor's edit tool,
 or build the escape as `chr(92) + 'n'` inside a script file.
 
-### 2.8 Point it at a repo root, not just `src`
+### 2.10 Point it at a repo root, not just `src`
 
 quartz-ctx excludes `target`, `node_modules`, `vendor`, `dist`, `.venv`,
 `__pycache__` and friends. Before those exclusions existed, scanning a project
@@ -207,7 +241,7 @@ generated bindings out of `target/`.
 You can now point it at either the repo root or its `src`; both give the same
 answer.
 
-### 2.9 Libraries vs applications — `include_private`
+### 2.11 Libraries vs applications — `include_private`
 
 A library publishes its API through `pub`. An **application does not**, so
 `pub`-only extraction returns a nearly empty index for one. Measured:
