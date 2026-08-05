@@ -401,7 +401,8 @@ fn tools_list() -> Value {
                             "description": "index (default): hint-matched notes in full, rest as \
                                             opening clause. full: every note complete."
                         }
-                    }
+                    },
+                    "required": ["hint"]
                 }
             },
             {
@@ -483,7 +484,8 @@ fn tools_list() -> Value {
                                             expanded to include their body preview, so the ones \
                                             relevant to the task arrive complete."
                         }
-                    }
+                    },
+                    "required": ["hint"]
                 }
             },
             {
@@ -509,7 +511,8 @@ fn tools_list() -> Value {
                                             enemy with gravity'. Anti-patterns matching this \
                                             are expanded to full remedy text."
                         }
-                    }
+                    },
+                    "required": ["hint"]
                 }
             },
             {

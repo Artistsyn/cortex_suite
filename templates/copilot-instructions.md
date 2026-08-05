@@ -15,11 +15,14 @@ Two MCP servers back this workspace. Use them before writing code.
 
 Skip only for renames, typos and comments.
 
-## Always pass a hint
+## The hint is required
 
-Every `hint`-taking tool lists all entries regardless — the hint decides what is
-**expanded**. Omitting it costs tokens *and* records no usage signal, which is
-what keeps pattern health measurable.
+`get_anti_patterns`, `list_patterns` and `get_preferences` refuse a call without
+a `hint`. It decides what gets expanded (a hinted call is ~42% the size of a full
+dump) and it is the only thing that records which knowledge proved useful.
+
+Reviewing everything is fine, just say so:
+`list_patterns(hint: "auditing all patterns", detail: "full")`.
 
 ## When you get stuck
 

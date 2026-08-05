@@ -1522,8 +1522,8 @@ impl Store {
                 path: row.get(1)?,
                 summary: row.get(2)?,
                 diff_hint: row.get(3)?,
-                observed_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                    .unwrap().with_timezone(&chrono::Utc),
+                observed_at: parse_rfc3339_or_flag(
+                    &row.get::<_, String>(4)?, "pending_observations", None, "observed_at"),
             })
         })?;
         let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1700,10 +1700,10 @@ impl Store {
                 correction: row.get(3)?,
                 tags: serde_json::from_str(&tags_json).unwrap_or_default(),
                 occurrence_count: row.get(5)?,
-                first_seen_at: chrono::DateTime::parse_from_rfc3339(&first)
-                    .unwrap().with_timezone(&chrono::Utc),
-                last_seen_at: chrono::DateTime::parse_from_rfc3339(&last)
-                    .unwrap().with_timezone(&chrono::Utc),
+                first_seen_at: parse_rfc3339_or_flag(
+                    &first, "self_corrections", None, "first_seen_at"),
+                last_seen_at: parse_rfc3339_or_flag(
+                    &last, "self_corrections", None, "last_seen_at"),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1728,10 +1728,10 @@ impl Store {
                     correction: row.get(3)?,
                     tags: serde_json::from_str(&tags_json).unwrap_or_default(),
                     occurrence_count: row.get(5)?,
-                    first_seen_at: chrono::DateTime::parse_from_rfc3339(&first)
-                        .unwrap().with_timezone(&chrono::Utc),
-                    last_seen_at: chrono::DateTime::parse_from_rfc3339(&last)
-                        .unwrap().with_timezone(&chrono::Utc),
+                    first_seen_at: parse_rfc3339_or_flag(
+                        &first, "self_corrections", None, "first_seen_at"),
+                    last_seen_at: parse_rfc3339_or_flag(
+                        &last, "self_corrections", None, "last_seen_at"),
                 })
             })?;
             rows.next().transpose()?
@@ -1854,10 +1854,8 @@ fn row_to_adr(row: &rusqlite::Row) -> rusqlite::Result<Adr> {
         consequences: row.get(8)?,
         concept_tags: serde_json::from_str(&tags_json).unwrap_or_default(),
         superseded_by: row.get(10)?,
-        created_at: chrono::DateTime::parse_from_rfc3339(&created)
-            .unwrap().with_timezone(&chrono::Utc),
-        updated_at: chrono::DateTime::parse_from_rfc3339(&updated)
-            .unwrap().with_timezone(&chrono::Utc),
+        created_at: parse_rfc3339_or_flag(&created, "adrs", None, "created_at"),
+        updated_at: parse_rfc3339_or_flag(&updated, "adrs", None, "updated_at"),
     })
 }
 
@@ -1865,8 +1863,8 @@ fn row_to_unit(row: &rusqlite::Row) -> rusqlite::Result<CodeUnit> {
     let tv_json: String = row.get(6)?;
     let term_vector: Vec<(String, f32)> = serde_json::from_str(&tv_json)
         .unwrap_or_default();
-    let indexed_at = chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(7)?)
-        .unwrap().with_timezone(&chrono::Utc);
+    let indexed_at = parse_rfc3339_or_flag(
+        &row.get::<_, String>(7)?, "code_units", None, "indexed_at");
 
     Ok(CodeUnit {
         id:          row.get(0)?,
@@ -1880,6 +1878,15 @@ fn row_to_unit(row: &rusqlite::Row) -> rusqlite::Result<CodeUnit> {
     })
 }
 
+/// Parse a stored timestamp, degrading instead of panicking.
+///
+/// Every timestamp read goes through here. The bare
+/// `parse_from_rfc3339(..).unwrap()` this replaced turned one malformed row into
+/// a process abort: a knowledge-capture path that wrote epoch integers instead of
+/// RFC 3339 strings crashed `get_context` outright, taking the whole MCP server
+/// with it and returning nothing for the rest of the session.
+///
+/// A bad row should cost one timestamp, not the server.
 fn parse_rfc3339_or_flag(
     raw: &str,
     table: &str,

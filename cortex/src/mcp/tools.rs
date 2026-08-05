@@ -632,6 +632,7 @@ fn tool_query_graph(args: &Value, store: &Store, session_id: &str) -> Result<Str
 }
 
 fn tool_get_preferences(args: &Value, prefs_summary: &str) -> Result<String, String> {
+    let _hint = require_hint(args, "get_preferences")?;
     if prefs_summary.trim().is_empty() {
         return Ok("No preferences configured.".to_string());
     }
@@ -781,6 +782,7 @@ fn tool_recall(
 // ── list_patterns ─────────────────────────────────────────────────────────────
 
 fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
+    let _hint = require_hint(args, "list_patterns")?;
     let patterns = store.all_patterns().map_err(|e| e.to_string())?;
     if patterns.is_empty() {
         return Ok("No approved patterns yet.".into());
@@ -863,24 +865,17 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
         ));
     }
 
-    // Make the cost of omitting the hint visible at the call site.
-    //
-    // Only hint-matched rows count as targeted retrievals, so a hintless call
-    // contributes nothing to survival telemetry. Measured 2026-08-04: of 119
-    // `list_patterns` calls, 3 passed a hint — so 3,036 pattern touches produced
-    // 32 usable signals, and only 37 of 160 patterns had ever been targeted.
-    // The instruction to pass a hint exists in CLAUDE.md twice and was followed
-    // 3% of the time; stating the consequence where the call happens is more
-    // likely to land than repeating the rule somewhere else.
+    // A hint is mandatory now, so it can no longer be absent — but it can still
+    // tokenise to nothing (all stop-words, or terms no pattern uses). Say which
+    // happened, because "nothing matched your hint" and "you gave no hint" are
+    // different problems with different fixes.
     if tokens.is_empty() {
         out.push_str(
-            "\nNote: no `hint` was passed, so this call recorded no usage signal. \
-             A hint expands the patterns relevant to your task AND marks them as \
-             actually retrieved, which is what feeds survival/credibility scoring. \
-             Without it, pattern health is measured on almost no data.\n",
+            "
+Note: your hint matched no pattern, so nothing was expanded and no              usage signal was recorded. Try naming the type, API or behaviour you              are working with rather than the intent alone.
+",
         );
     }
-
     Ok(out)
 }
 
@@ -925,6 +920,7 @@ fn hint_score(ap: &crate::model::AntiPattern, tokens: &[String]) -> usize {
 /// applies — and anything matching `hint` is expanded in place, so the entries
 /// relevant to the task at hand arrive complete without a second call.
 fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
+    let _hint = require_hint(args, "get_anti_patterns")?;
     let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
     if aps.is_empty() {
         return Ok("No anti-patterns recorded yet.".into());
@@ -1065,6 +1061,41 @@ fn pattern_detail_tier(args: &Value) -> &str {
         Some("full") => "full",
         _ => "summary",
     }
+}
+
+/// Require a task description before answering a knowledge query.
+///
+/// This is a MECHANISM, not a reminder, because reminders measurably do not
+/// work here. Measured across 823 real calls on this workspace:
+///
+///   get_context / semantic_search / recall  (parameter REQUIRED) -> 100%
+///   get_preferences / get_anti_patterns / list_patterns (optional) -> 2-5%
+///
+/// The instruction "always pass a hint" appeared twice in the project's own
+/// operating manual for months and produced 3% compliance on `list_patterns`.
+/// Compliance tracked the SCHEMA perfectly and the documentation not at all.
+///
+/// The hint is not decoration. It selects which entries get expanded (a hinted
+/// call is ~42% the size of `detail="full"` while containing what you actually
+/// need), and it is the only thing that marks an entry as *targeted*, which is
+/// what feeds survival and credibility scoring. A hintless call returned bulk
+/// text and taught the system nothing.
+///
+/// There is deliberately no escape hatch. An escape hatch is what 3% looks like.
+/// To review everything, say so: hint="auditing all patterns", detail="full".
+fn require_hint(args: &Value, tool: &str) -> Result<String, String> {
+    let hint = args.get("hint").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if hint.len() >= 3 {
+        return Ok(hint.to_string());
+    }
+    Err(format!(
+        "`{tool}` needs a `hint` describing what you are about to do.\n\n\
+         It selects which entries are expanded, and marks them as actually \
+         retrieved so pattern health is measured on real usage.\n\n\
+         Retry as: {tool}(hint: \"<what you are about to write or decide>\")\n\
+         Reviewing everything is fine, just say so: \
+         {tool}(hint: \"auditing all entries\", detail: \"full\")"
+    ))
 }
 
 /// Number of methods recorded on a compressed unit.
@@ -2002,10 +2033,10 @@ mod tests {
         std::fs::copy(live, &tmp).unwrap();
         let store = Store::open(&tmp).unwrap();
 
-        let ap_old = super::tool_get_anti_patterns(&json!({"detail":"full"}), &store, "m").unwrap();
-        let ap_new = super::tool_get_anti_patterns(&json!({}), &store, "m").unwrap();
-        let lp_old = super::tool_list_patterns(&json!({"detail":"standard"}), &store, "m").unwrap();
-        let lp_new = super::tool_list_patterns(&json!({}), &store, "m").unwrap();
+        let ap_old = super::tool_get_anti_patterns(&json!({"hint": "auditing", "detail":"full"}), &store, "m").unwrap();
+        let ap_new = super::tool_get_anti_patterns(&json!({"hint": "zzz-matches-nothing"}), &store, "m").unwrap();
+        let lp_old = super::tool_list_patterns(&json!({"hint": "auditing", "detail":"standard"}), &store, "m").unwrap();
+        let lp_new = super::tool_list_patterns(&json!({"hint": "zzz-matches-nothing"}), &store, "m").unwrap();
 
         let (o, n) = (ap_old.chars().count() + lp_old.chars().count(),
                       ap_new.chars().count() + lp_new.chars().count());
@@ -2041,7 +2072,7 @@ mod tests {
         let store = Store::open(&tmp).unwrap();
         let n = store.all_anti_patterns().unwrap().len();
 
-        let index = tool_get_anti_patterns(&json!({}), &store, "measure").unwrap();
+        let index = tool_get_anti_patterns(&json!({"hint": "zzz-matches-nothing"}), &store, "measure").unwrap();
         let full  = tool_get_anti_patterns(&json!({"detail": "full"}), &store, "measure").unwrap();
         let hinted = tool_get_anti_patterns(
             &json!({"hint": "spawn pooled object with gravity and momentum"}),
@@ -2069,7 +2100,9 @@ mod tests {
     #[test]
     fn no_anti_pattern_is_ever_hidden_by_the_index_tier() {
         let store = ap_store("ap_index");
-        let out = tool_get_anti_patterns(&json!({}), &store, "s1").unwrap();
+        // A hint is mandatory now; one that matches nothing yields the index tier.
+        let out = tool_get_anti_patterns(
+            &json!({"hint": "zzz-matches-nothing"}), &store, "s1").unwrap();
         assert!(out.contains("Pool objects accumulate gravity"));
         assert!(out.contains("Slint Flickable reports no preferred height"));
         // Count is whatever the store holds (Store::open seeds a baseline set);
@@ -2083,8 +2116,10 @@ mod tests {
     #[test]
     fn the_index_tier_is_smaller_than_the_full_dump() {
         let store = ap_store("ap_size");
-        let index = tool_get_anti_patterns(&json!({}), &store, "s1").unwrap();
-        let full  = tool_get_anti_patterns(&json!({"detail": "full"}), &store, "s1").unwrap();
+        let index = tool_get_anti_patterns(
+            &json!({"hint": "zzz-matches-nothing"}), &store, "s1").unwrap();
+        let full  = tool_get_anti_patterns(
+            &json!({"hint": "auditing all entries", "detail": "full"}), &store, "s1").unwrap();
         assert!(index.len() < full.len(),
             "index {} was not smaller than full {}", index.len(), full.len());
         assert!(full.contains("reset momentum on acquire"), "full tier must carry the remedy");
@@ -2148,5 +2183,47 @@ mod tests {
         assert_eq!(classify_risk(6, 2), RiskLevel::Medium);
         assert_eq!(classify_risk(8, 0), RiskLevel::High);
         assert_eq!(classify_risk(7, 4), RiskLevel::High);
+    }
+}
+
+#[cfg(test)]
+mod hint_requirement_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The compliance data that motivated this: across 823 real calls, every
+    /// tool whose parameter was REQUIRED ran at 100%, and every tool whose hint
+    /// was OPTIONAL ran at 2-5% — while the operating manual told agents to pass
+    /// one, twice. The schema decided behaviour; the documentation did not.
+    #[test]
+    fn a_missing_hint_is_refused_with_a_runnable_retry() {
+        let err = require_hint(&json!({}), "list_patterns").unwrap_err();
+        assert!(err.contains("needs a `hint`"), "{err}");
+        assert!(err.contains("list_patterns(hint:"), "must show the corrected call: {err}");
+        assert!(err.contains("auditing all entries"),
+                "must show how to legitimately review everything: {err}");
+    }
+
+    /// An empty or throwaway hint is the obvious way to satisfy a checker
+    /// without saying anything, so it is refused too.
+    #[test]
+    fn an_empty_or_trivial_hint_does_not_satisfy_the_requirement() {
+        for bad in ["", "   ", "x", "ab"] {
+            assert!(require_hint(&json!({"hint": bad}), "t").is_err(),
+                    "accepted a meaningless hint: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_real_hint_passes_through_trimmed() {
+        let got = require_hint(&json!({"hint": "  spawn a pooled enemy  "}), "t").unwrap();
+        assert_eq!(got, "spawn a pooled enemy");
+    }
+
+    /// Reviewing everything stays possible — it just has to be stated, so the
+    /// telemetry records what the review was for.
+    #[test]
+    fn an_explicit_audit_is_still_allowed() {
+        assert!(require_hint(&json!({"hint": "auditing all patterns"}), "t").is_ok());
     }
 }

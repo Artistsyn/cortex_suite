@@ -39,16 +39,24 @@ it is never stale.
 - What we *learned* → **cortex**
 - Both in one task → run both
 
-## 2) Always pass a `hint`
+## 2) The `hint` is required — say what you are doing
 
-`get_anti_patterns`, `list_patterns`, `get_preferences` and `get_api_context` all
-list every entry regardless — the hint decides what gets **expanded**. Two
-reasons it matters:
+`get_anti_patterns`, `list_patterns` and `get_preferences` will refuse a call
+without a `hint`. That is deliberate and it is not about tidiness:
 
-1. **Tokens.** Measured: ~34k → ~10k per session boot, with nothing dropped.
-2. **Learning.** Only hint-matched retrievals count as targeted, and only
-   targeted retrievals feed pattern survival scoring. A hintless call records no
-   usage signal at all.
+1. **Tokens.** The hint decides what gets expanded. A hinted call is roughly 42%
+   the size of `detail="full"` while containing the entries that actually apply.
+2. **Learning.** Only a hinted retrieval counts as *targeted*, and only targeted
+   retrievals feed pattern survival scoring. A hintless call taught the system
+   nothing about which knowledge was worth keeping.
+
+It is enforced rather than requested because requesting measurably failed:
+across 823 real calls, every tool with a **required** parameter ran at 100%
+compliance, and every tool where the hint was **optional** ran at 2–5% — while
+this very file asked for one, twice.
+
+Reviewing everything is still fine; just say so:
+`list_patterns(hint: "auditing all patterns", detail: "full")`.
 
 ## 3) Pre-code check (no trigger word needed)
 
