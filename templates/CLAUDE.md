@@ -119,6 +119,30 @@ API name, the behaviour, the domain, and the colloquial term people actually use
 Start an anti-pattern description with **what goes wrong**, not what the feature
 is.
 
+### What happens after closeout
+
+Closeout runs the consolidation pipeline itself when the last run is more than
+8h old (~4s), so clustering, skill detection, gap and survival proposals, trial
+promotion and drift analysis do not depend on anyone remembering a command.
+
+Nothing is committed to your instructions or preferences without a person.
+Automatic promotion moves a proposal from `trial` to `pending` — into the review
+queue, not past it.
+
+Anything awaiting a human appears under **AWAITING YOUR REVIEW** in the closeout
+report and in `get_session_health`, with the command that resolves it:
+
+```
+cortex skill-approve <name>     # publish a drafted skill
+cortex skill-reject <name>      # discard it
+cortex review-proposals         # pending proposals, then proposal-approve / proposal-reject <id>
+```
+
+The block is silent when the queue is empty. Read a drafted skill before
+approving it: a draft containing placeholder text (`[describe when...]`) is a
+detector firing on a thin signal, and publishing it teaches future sessions
+nothing.
+
 ## 6) Editing safety
 
 - Smallest safe patch; match surrounding style.

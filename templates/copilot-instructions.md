@@ -63,6 +63,12 @@ Write the description as **what goes wrong**, not what the feature is, and tag
 with the API name, the behaviour, the domain and the colloquial term — entries
 are found by concept, not exact spelling.
 
+Closeout folds the session into the consolidation pipeline automatically when the
+last run is over 8h old. Nothing reaches your instructions without a person:
+anything awaiting review is listed under **AWAITING YOUR REVIEW** in the closeout
+report and in `get_session_health`, with the command that resolves it
+(`cortex skill-approve <name>`, `cortex review-proposals`).
+
 ## Verify before claiming done
 
 Run the build or focused tests and report the actual result. A failed build

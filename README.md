@@ -47,10 +47,18 @@ config drift between editors, and the PowerShell 5.1 traps.
 
 ## The one habit that matters
 
-**Always pass a `hint`.** These tools list everything regardless — the hint
-decides what gets expanded. It cuts a session boot from ~34k tokens to ~10k with
-nothing dropped, and it is the only thing that records which knowledge actually
-proved useful.
+**Pass a `hint`.** `get_anti_patterns`, `list_patterns` and `get_preferences`
+require one. These tools list everything regardless — the hint decides what gets
+expanded. It cuts a session boot from ~34k tokens to ~10k with nothing dropped,
+and it is the only thing that records which knowledge actually proved useful.
+
+## What you have to review
+
+The consolidation pipeline runs itself at closeout when it has gone stale, but
+nothing it produces is committed without you. Drafted skills and pending
+proposals are listed under **AWAITING YOUR REVIEW** in the closeout report and in
+`get_session_health`, each with the command that resolves it. Read a draft before
+approving it — see [SETUP_HANDOFF.md](SETUP_HANDOFF.md#3-daily-use).
 
 ## Optional third server
 

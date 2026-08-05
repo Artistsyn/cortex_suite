@@ -263,7 +263,8 @@ at its API surface and an app at full structure simultaneously.
 
 ### The rule that matters most
 
-> **Always pass a `hint`.**
+> **`hint` is required.** `get_anti_patterns`, `list_patterns` and
+> `get_preferences` reject a call without one, and there is no escape hatch.
 
 `get_anti_patterns(hint=...)`, `list_patterns(hint=...)`,
 `get_api_context(hint=...)`, `get_preferences(hint=...)`.
@@ -274,9 +275,16 @@ Two reasons:
    matches the hint. On the reference DB that is ~34k tokens down to ~10k per
    session boot, with nothing dropped.
 2. **Learning.** Only hint-matched retrievals count as *targeted*, and only
-   targeted retrievals feed pattern survival scoring. Measured hint compliance was
-   **3%**, which is why only 10 of 160 patterns had any usage data. A hintless
-   `list_patterns` now tells you it recorded no signal.
+   targeted retrievals feed pattern survival scoring.
+
+It is required rather than merely documented because documenting it did not work.
+Across 823 calls, compliance on the optional hints was 2–5%; on parameters the
+schema marked `required` it was 100%. The instruction appeared twice in the
+operating manual and was ignored either way. Compliance tracked the schema and
+not the prose — so when a rule matters, put it in the schema.
+
+To review everything deliberately, say so: `list_patterns(hint: "auditing all
+patterns", detail: "full")`.
 
 ### Typical session
 
@@ -304,6 +312,41 @@ Then at the end of a verified task, the agent presents a summary and you reply
 > On Claude Code the agent **must** pass its markers as `markers_text` to
 > `closeout_session`. There is no chat store to scrape outside VS Code, so
 > omitting it commits nothing and reports success.
+
+### What the system asks of you, and when
+
+Closeout runs the consolidation pipeline itself when the last run is more than 8h
+old — roughly 4 seconds on a 109-session database. Clustering, skill detection,
+gap and survival proposals, drift analysis and trial promotion all happen there,
+so the loop does not depend on anyone remembering a command.
+
+**Nothing reaches your instruction files or preferences without a person.**
+Automatic promotion only moves a proposal from `trial` to `pending`: into the
+review queue, not past it.
+
+Anything waiting on you is printed under **AWAITING YOUR REVIEW** at the end of
+closeout and in `get_session_health`, with the command beside it:
+
+```bash
+cortex skill-status                      # drafted skills, with their draft paths
+```
+
+```bash
+cortex skill-approve <name>              # publish one to your skills dir
+```
+
+```bash
+cortex review-proposals                  # pending proposals; then proposal-approve / proposal-reject <id>
+```
+
+The block prints nothing when the queue is empty, so its absence means the queue
+is empty — not that the surface is missing.
+
+**Read a draft before approving it.** Skill detection fires on repeated tool
+sequences, and a thin signal produces a draft full of placeholder text like
+`[describe when to use this]`. Approving that publishes a skill that teaches
+future sessions nothing and costs tokens forever. Reject those; keep the drafts
+that contain a real procedure.
 
 ### Regenerating API sheets
 

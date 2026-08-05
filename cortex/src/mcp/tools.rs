@@ -1628,6 +1628,56 @@ fn tool_begin_protocol_session(
 }
 
 /// get_session_health — one-call session status report.
+/// Everything currently waiting on a HUMAN decision, rendered for the one
+/// surface a human reliably sees: the session-health report in the transcript.
+///
+/// Before this, drafted skills and pending proposals were visible only through
+/// `cortex skill-status` and `cortex health-report` — CLI commands you have to
+/// already know to run. Work that needs approval sat in `.cortex/proposals/`
+/// with nothing anywhere telling anyone it existed, which is indistinguishable
+/// from a system that produces nothing.
+///
+/// Deliberately quiet when the queue is empty: a banner that always prints is a
+/// banner nobody reads.
+fn review_queue_line(store: &Store) -> String {
+    let drafted: Vec<String> = store
+        .conn()
+        .prepare("SELECT name FROM skill_candidates WHERE status = 'drafted' ORDER BY name")
+        .and_then(|mut st| {
+            let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+
+    let proposals: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM proposals WHERE status IN ('pending','trial')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    if drafted.is_empty() && proposals == 0 {
+        return String::new();
+    }
+
+    let mut out = String::from("\n\nAWAITING YOUR REVIEW\n");
+    if !drafted.is_empty() {
+        out.push_str(&format!(
+            "  {} skill draft(s): {}\n    approve: cortex skill-approve <name>   reject: cortex skill-reject <name>\n",
+            drafted.len(),
+            drafted.join(", ")
+        ));
+    }
+    if proposals > 0 {
+        out.push_str(&format!(
+            "  {proposals} proposal(s) pending\n    review: cortex review-proposals\n"
+        ));
+    }
+    out
+}
+
 fn tool_get_session_health(
     store: &Store,
     session_id: &str,
@@ -1658,6 +1708,9 @@ fn tool_get_session_health(
     // improving, every session.
     report.push('\n');
     report.push_str(&crate::scoreboard::compact_line(store));
+
+    // Anything that needs a human decision, on the surface a human actually sees.
+    report.push_str(&review_queue_line(store));
     Ok(report)
 }
 
@@ -1856,7 +1909,52 @@ fn tool_closeout_session(
             name, occ, conf * 100.0, name));
     }
 
+    // Run the consolidation pipeline if it has gone stale.
+    //
+    // Everything downstream of this — skill detection, gap proposals, survival
+    // analysis, trial promotion, drift, meta-analysis — only ever ran when a
+    // human happened to type `cortex.ps1 consolidate-pipeline`. A learning loop
+    // whose only trigger is someone remembering to pull it is not a loop.
+    // Closeout is the natural point: the session that just produced the evidence
+    // is the session that should fold it in. Measured at ~4s on a 109-session DB.
+    //
+    // Failure here must never fail a closeout — the knowledge is already
+    // committed by this point, so a broken pipeline gets reported, not raised.
+    out.push_str(&run_pipeline_if_stale(store, repo_root));
+
+    // Whatever now needs a human decision, named with the command that does it.
+    out.push_str(&review_queue_line(store));
+
     Ok(out)
+}
+
+/// Fold this session into the learning loop, if the loop has gone stale.
+///
+/// Returns a line for the closeout report — empty when the pipeline was fresh,
+/// so a closeout that changes nothing says nothing.
+fn run_pipeline_if_stale(store: &Store, repo_root: &Path) -> String {
+    const STALENESS_HOURS: u32 = 8;
+
+    if !crate::consolidator2::is_stale(store, STALENESS_HOURS) {
+        return String::new();
+    }
+
+    let prefs_path = repo_root.join(".cortex").join("prefs.toml");
+    let prefs = match crate::prefs::load(&prefs_path) {
+        Ok(p) => p,
+        Err(e) => return format!("\n[consolidation skipped: cannot load prefs — {e}]\n"),
+    };
+
+    match crate::consolidator2::run(store, repo_root, &prefs) {
+        Ok(r) => format!(
+            "\nConsolidation pipeline ran (>{STALENESS_HOURS}h stale): \
+             {} clusters, {} skill candidates ({} drafts), {} gap proposals, \
+             {} trial promotions, {} meta proposals.\n",
+            r.clusters_found, r.skill_candidates_new, r.skill_drafts_written,
+            r.gap_proposals, r.trial_promotions, r.meta_proposals_staged,
+        ),
+        Err(e) => format!("\n[consolidation pipeline FAILED — knowledge was still committed: {e}]\n"),
+    }
 }
 
 // ── Phase 1: propose_skill ────────────────────────────────────────────────────
@@ -2022,6 +2120,83 @@ mod tests {
 
     /// The combined per-session boot cost, before and after.
     ///
+    /// Closeout must fold the session into the learning loop when the loop has
+    /// gone stale, and must stay silent when it has not. Before this the pipeline
+    /// only ran when a human typed the command, so "self-learning" had a manual
+    /// trigger as its only trigger.
+    #[test]
+    fn closeout_runs_pipeline_only_when_stale() {
+        let tmp = std::env::temp_dir().join("cortex_stale_gate_test.db");
+        let _ = std::fs::remove_file(&tmp);
+        let store = Store::open(&tmp).unwrap();
+        let root = std::env::temp_dir().join("cortex_stale_gate_root");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".cortex")).unwrap();
+
+        // Never run before -> stale -> the pipeline is attempted and reports.
+        assert!(!super::run_pipeline_if_stale(&store, &root).is_empty());
+
+        // Just ran -> fresh -> nothing said.
+        store.conn().execute(
+            "INSERT INTO annotations (topic, body, tags, added_at)
+             VALUES ('consolidation-last-run', ?1, '', ?1)",
+            rusqlite::params![chrono::Utc::now().to_rfc3339()],
+        ).unwrap();
+        assert_eq!(super::run_pipeline_if_stale(&store, &root), "");
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The review queue is the only place a human is told that something is
+    /// waiting on them. It has to be silent when there is nothing, and it has to
+    /// name the exact command when there is.
+    #[test]
+    fn review_queue_surfaces_only_real_approval_work() {
+        let tmp = std::env::temp_dir().join("cortex_review_queue_test.db");
+        let _ = std::fs::remove_file(&tmp);
+        let store = Store::open(&tmp).unwrap();
+
+        // Nothing pending -> nothing printed. A banner that always shows is noise.
+        assert_eq!(super::review_queue_line(&store), "");
+
+        // An APPROVED skill is not review work; a DRAFTED one is.
+        store.conn().execute(
+            "INSERT INTO skill_candidates (name, status) VALUES ('already-live', 'approved')",
+            [],
+        ).unwrap();
+        assert_eq!(super::review_queue_line(&store), "");
+
+        store.conn().execute(
+            "INSERT INTO skill_candidates (name, status) VALUES ('needs-a-human', 'drafted')",
+            [],
+        ).unwrap();
+        let out = super::review_queue_line(&store);
+        assert!(out.contains("AWAITING YOUR REVIEW"), "{out}");
+        assert!(out.contains("needs-a-human"), "{out}");
+        assert!(!out.contains("already-live"), "approved skills are not review work: {out}");
+        assert!(out.contains("cortex skill-approve"), "must name the command: {out}");
+
+        // Rejected proposals are settled; pending ones are not.
+        store.conn().execute(
+            "INSERT INTO proposals (proposal_type, content_hash, target_file, proposed_text, status)
+             VALUES ('pref_note', 'h1', 'f', 't', 'rejected')",
+            [],
+        ).unwrap();
+        assert!(!super::review_queue_line(&store).contains("proposal(s) pending"));
+
+        store.conn().execute(
+            "INSERT INTO proposals (proposal_type, content_hash, target_file, proposed_text, status)
+             VALUES ('pref_note', 'h2', 'f', 't', 'pending')",
+            [],
+        ).unwrap();
+        let out = super::review_queue_line(&store);
+        assert!(out.contains("1 proposal(s) pending"), "{out}");
+        assert!(out.contains("cortex review-proposals"), "{out}");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     ///     cargo test -- --ignored --nocapture measure_boot_payload
     #[test]
     #[ignore]
