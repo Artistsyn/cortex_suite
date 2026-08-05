@@ -59,9 +59,20 @@ QCTX_EXE="$SUITE_ROOT/quartz-ctx/target/release/quartz-ctx"
 say "cortex:     $("$CORTEX_EXE" --version 2>&1 | head -1)"
 say "quartz-ctx: $("$QCTX_EXE" --version 2>&1 | head -1)"
 
+# Path of $1 relative to $2, in POSIX shell only.
+#
+# This used to shell out to python3, which contradicted the promise that the
+# suite needs nothing but Rust — and failed outright on a machine without it,
+# silently falling back to an absolute path. Both forms work in an MCP config,
+# so prefer the readable one when the suite sits under the workspace and use
+# absolute otherwise.
 relpath() {
-  python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$1" "$2" 2>/dev/null \
-    || printf '%s' "$1"
+  target="$1"
+  base="${2%/}/"
+  case "$target" in
+    "$base"*) printf '%s' "${target#"$base"}" ;;
+    *)        printf '%s' "$target" ;;
+  esac
 }
 CORTEX_REL="$(relpath "$CORTEX_EXE" "$WORKSPACE")"
 QCTX_REL="$(relpath "$QCTX_EXE" "$WORKSPACE")"
