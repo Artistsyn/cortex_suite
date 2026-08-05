@@ -75,6 +75,33 @@ standalone crates look identical to it.
 Every one of these cost real debugging time. They are ordered by how likely you
 are to hit them.
 
+### 2.0 Running `cortex` from a subdirectory can split your memory in two
+
+**Symptom:** recall quality drops for no reason; patterns you recorded last week
+are gone; two sessions disagree about what the project knows.
+
+`--db` is how cortex is told which database to use. Run the binary from a
+subdirectory without it and you can end up against a *different* `memory.db` —
+`cortex/.cortex/memory.db` instead of the workspace one. Nothing errors. You get
+a second, nearly empty store: separate patterns, anti-patterns, annotations and
+retrieval telemetry.
+
+Cortex searches for an existing `.cortex` in the current and parent directories
+before creating one, preferring directories that look like a real workspace root
+(they contain `cortex.ps1` or `index-sources.json`). That covers most cases, but
+the habit is cheaper than the recovery:
+
+```bash
+cortex --db .cortex/memory.db <subcommand>
+```
+
+Confirm which database is live before trusting a session — the `db` field is in
+the status JSON:
+
+```bash
+cortex --format json status
+```
+
 ### 2.1 A running server holds its own binary — rebuilds silently do nothing
 
 **Symptom:** `cargo build` fails with `failed to remove ... Access is denied
