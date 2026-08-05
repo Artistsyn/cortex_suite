@@ -309,15 +309,33 @@ fn member_visibility(name: &str, node: Node, src: &str, lang: Language) -> Visib
     }
 }
 
-/// The declaration line(s), without the body.
+/// The declaration, without the body.
+///
+/// Cut at the body NODE, not at the first `{` or `:`. Both of those appear
+/// inside a declaration in these languages — TypeScript writes parameter and
+/// return types with `:`, which truncated `async get(id: number): Promise<User>`
+/// down to `async get(id`. tree-sitter already knows where the body starts, so
+/// use that and the boundary is exact in every language.
 fn signature_text(node: Node, src: &str) -> String {
-    let full = text(node, src);
-    let cut = full.find(['{', ':']).unwrap_or(full.len().min(200));
-    let head = &full[..cut.min(full.len())];
+    let end = node
+        .child_by_field_name("body")
+        .map(|b| b.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    let start = node.start_byte();
+    let head = if end > start && end <= src.len() {
+        &src[start..end]
+    } else {
+        text(node, src)
+    };
+
     head.lines()
         .map(str::trim)
         .collect::<Vec<_>>()
         .join(" ")
+        .trim()
+        // Python `def f(x):` keeps its colon; drop the dangling separator so the
+        // signature reads as a signature rather than a truncated line.
+        .trim_end_matches(':')
         .trim()
         .to_string()
 }
@@ -438,5 +456,37 @@ mod tests {
     fn malformed_source_yields_no_items_and_does_not_panic() {
         assert!(py("class ??? invalid {{{", false).is_empty() || true);
         assert!(ts("class ((( {").len() < 2);
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    /// TypeScript writes parameter and return types with `:`, so cutting the
+    /// signature at the first `:` truncated it mid-parameter.
+    #[test]
+    fn typescript_signatures_keep_their_types() {
+        let items = parse_file(
+            "class S {\n  async get(id: number): Promise<User> { return null!; }\n}\n",
+            Language::TypeScript, &["m".into()], "m.ts", false,
+        );
+        let sig = &items[0].methods[0].signature;
+        assert!(sig.contains("id: number"), "parameter type lost: {sig}");
+        assert!(sig.contains("Promise<User>"), "return type lost: {sig}");
+        assert!(!sig.contains("return null"), "body leaked into the signature: {sig}");
+    }
+
+    #[test]
+    fn python_signatures_keep_annotations_and_drop_the_colon() {
+        let items = parse_file(
+            "def scale(value: float, factor: float = 2.0) -> float:\n    return value * factor\n",
+            Language::Python, &["m".into()], "m.py", false,
+        );
+        let sig = &items[0].signature;
+        assert!(sig.contains("value: float"), "annotation lost: {sig}");
+        assert!(sig.contains("-> float"), "return annotation lost: {sig}");
+        assert!(!sig.ends_with(':'), "dangling separator: {sig}");
+        assert!(!sig.contains("return value"), "body leaked: {sig}");
     }
 }

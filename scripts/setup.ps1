@@ -24,6 +24,20 @@ param(
 $ErrorActionPreference = 'Stop'
 $SuiteRoot = Split-Path -Parent $PSScriptRoot
 
+# Run a native command without PowerShell treating its stderr as failure.
+#
+# With $ErrorActionPreference = 'Stop', ANY stderr output from a native exe is
+# raised as a terminating NativeCommandError. cargo writes every "Compiling ..."
+# line to stderr, so a completely successful build aborted this script on the
+# first crate. Exit code is the only trustworthy signal for a native process.
+function Invoke-Native {
+    param([scriptblock] $Command)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & $Command 2>&1 | ForEach-Object { "$_" } }
+    finally { $ErrorActionPreference = $prev }
+}
+
 function Say([string] $m)  { Write-Host "[setup] $m" }
 function Warn([string] $m) { Write-Host "[setup] WARN: $m" -ForegroundColor Yellow }
 function Die([string] $m)  { Write-Host "[setup] ERROR: $m" -ForegroundColor Red; exit 1 }
@@ -53,16 +67,22 @@ if ($running) {
 
 # ── Build ────────────────────────────────────────────────────────────────────
 if (-not $SkipBuild) {
-    Say "building cortex (debug)..."
+    Say "building cortex (debug)... first run compiles dependencies and can take a few minutes"
     Push-Location (Join-Path $SuiteRoot 'cortex')
-    cargo build
-    if ($LASTEXITCODE -ne 0) { Pop-Location; Die "cortex build failed" }
+    Invoke-Native { cargo build } | Select-Object -Last 3 | ForEach-Object { Say "  $_" }
+    if ($LASTEXITCODE -ne 0) { Pop-Location; Die "cortex build failed - see the output above" }
     Pop-Location
 
-    Say "building quartz-ctx (release)..."
+    # Release, because the MCP configs point at target/release for quartz-ctx.
+    # It also compiles the tree-sitter grammars from C, so a missing C toolchain
+    # surfaces here rather than as a confusing runtime gap.
+    Say "building quartz-ctx (release)... compiles tree-sitter grammars, needs a C toolchain"
     Push-Location (Join-Path $SuiteRoot 'quartz-ctx')
-    cargo build --release
-    if ($LASTEXITCODE -ne 0) { Pop-Location; Die "quartz-ctx build failed" }
+    Invoke-Native { cargo build --release } | Select-Object -Last 3 | ForEach-Object { Say "  $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Pop-Location
+        Die "quartz-ctx build failed. If the error mentions a C compiler, cc or link.exe, install the Visual Studio Build Tools with the C++ workload and reopen the terminal."
+    }
     Pop-Location
 }
 
@@ -73,13 +93,32 @@ foreach ($exe in @($CortexExe, $QctxExe)) {
 }
 # Ask the artifact its version rather than trusting the exit code: a failed build
 # leaves the previous binary in place and reports success upstream.
-Say ("cortex:     " + (& $CortexExe --version 2>&1 | Select-Object -First 1))
-Say ("quartz-ctx: " + (& $QctxExe --version 2>&1 | Select-Object -First 1))
+Say ("cortex:     " + (Invoke-Native { & $CortexExe --version } | Select-Object -First 1))
+Say ("quartz-ctx: " + (Invoke-Native { & $QctxExe --version } | Select-Object -First 1))
 
 # ── Paths, relative to the workspace, forward slashes ────────────────────────
+#
+# [System.IO.Path]::GetRelativePath is .NET Core / .NET 5+ only. Windows
+# PowerShell 5.1 runs on .NET Framework 4.x, where that method does not exist —
+# it fails with "does not contain a method named 'GetRelativePath'" on every
+# stock Windows machine. Uri.MakeRelativeUri is available on both.
 function RelPath([string] $target) {
-    $rel = [System.IO.Path]::GetRelativePath($Workspace, $target)
-    return $rel.Replace('\', '/')
+    $fromUri = New-Object System.Uri (($Workspace.TrimEnd('\','/')) + [System.IO.Path]::DirectorySeparatorChar)
+    $toUri   = New-Object System.Uri $target
+    if ($fromUri.Scheme -ne $toUri.Scheme) {
+        # Different volumes have no relative form; an absolute path still works.
+        return $target.Replace('\', '/')
+    }
+    $rel = [System.Uri]::UnescapeDataString($fromUri.MakeRelativeUri($toUri).ToString()).Replace('\', '/')
+
+    # A relative path is nicer when the suite sits near the workspace, and
+    # actively worse when it does not: cloning the suite elsewhere produced
+    # ../../../../../../../../../ which is correct, unreadable, and breaks the
+    # moment either directory moves. Past a few hops, absolute is the safer form.
+    if (($rel -split '\.\./').Count - 1 -gt 3) {
+        return $target.Replace('\', '/')
+    }
+    return $rel
 }
 $cortexRel = RelPath $CortexExe
 $qctxRel   = RelPath $QctxExe
