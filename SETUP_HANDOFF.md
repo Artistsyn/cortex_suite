@@ -346,7 +346,26 @@ is empty — not that the surface is missing.
 sequences, and a thin signal produces a draft full of placeholder text like
 `[describe when to use this]`. Approving that publishes a skill that teaches
 future sessions nothing and costs tokens forever. Reject those; keep the drafts
-that contain a real procedure.
+that contain a real procedure. `skill-approve` refuses a draft that still
+contains `[Edit: ...]` unless you pass `--force`.
+
+**Where approved skills land — both editors.** The two hosts have no path in
+common, so approval writes twice:
+
+| Host | File | How it is used |
+|---|---|---|
+| Claude Code | `<repo>/.claude/skills/<name>/SKILL.md` | auto-discovered; appears in the agent's skill list |
+| VS Code Copilot | `<repo>/.github/prompts/<name>.prompt.md` | invoked as `/<name>` in Copilot Chat |
+
+The prompt file is written only when the repo already has a `.github/`
+directory — the suite will not create one for a repo that has none. Copilot has
+no skills mechanism and reads nothing under `.claude/`, so publishing to only one
+path leaves the skill live for half the team.
+
+Change `skills_dir` under `[skills]` in `.cortex/prefs.toml` if your Claude host
+looks elsewhere. Publishing to a directory nothing reads gives you a skill that is
+approved, on disk, and invisible to every session — which is what the old default
+(`agent_customization/skills`) did.
 
 ### Regenerating API sheets
 

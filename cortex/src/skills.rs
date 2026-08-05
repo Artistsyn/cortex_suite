@@ -345,8 +345,9 @@ pub fn publish_skill(
     name: &str,
     draft_path: &Path,
     skills_dir: &Path,
+    copilot_prompts_dir: Option<&Path>,
     force: bool,
-) -> Result<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     if !draft_path.exists() {
         anyhow::bail!(
             "no draft file at {} - nothing to publish. Re-draft with propose_skill \
@@ -381,11 +382,42 @@ pub fn publish_skill(
         .join("\n");
 
     let safe_name = name.replace(['/', '\\', ' '], "-");
-    let dest_dir  = skills_dir.join(&safe_name);
+    let mut written = Vec::new();
+
+    // Claude Code: <repo>/.claude/skills/<name>/SKILL.md is auto-discovered.
+    let dest_dir = skills_dir.join(&safe_name);
     std::fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join("SKILL.md");
-    std::fs::write(&dest, published)?;
-    Ok(dest)
+    std::fs::write(&dest, &published)?;
+    written.push(dest);
+
+    // VS Code Copilot reads none of that. Its equivalent surface is a prompt
+    // file under `.github/prompts/`, invoked as `/<name>` in Copilot Chat.
+    // Publishing to only one host is how a skill ends up live for half the team.
+    if let Some(prompts_dir) = copilot_prompts_dir {
+        std::fs::create_dir_all(prompts_dir)?;
+        let summary = first_prose_line(&published)
+            .unwrap_or_else(|| format!("Skill: {name}"));
+        let prompt = format!(
+            "---\nmode: agent\ndescription: \"{}\"\n---\n\n{}\n",
+            summary.replace('"', "'"),
+            published,
+        );
+        let prompt_path = prompts_dir.join(format!("{safe_name}.prompt.md"));
+        std::fs::write(&prompt_path, prompt)?;
+        written.push(prompt_path);
+    }
+
+    Ok(written)
+}
+
+/// First real sentence of a skill body, for a prompt-file description.
+/// Skips the heading, HTML comments, blank lines and section headers.
+fn first_prose_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("<!--"))
+        .map(|l| l.chars().take(160).collect())
 }
 
 pub fn set_skill_status(store: &Store, name: &str, status: &str) -> Result<usize> {
@@ -494,7 +526,7 @@ mod tests {
 
         // No draft -> refuse. Nothing to publish is not an approval.
         let missing = drafts.join("skill_absent.md");
-        assert!(super::publish_skill("absent", &missing, &skills, false).is_err());
+        assert!(super::publish_skill("absent", &missing, &skills, None, false).is_err());
 
         // Placeholder draft -> refuse, and name the offending line.
         let tmpl = drafts.join("skill_thin.md");
@@ -504,12 +536,12 @@ mod tests {
 
 - [Edit: describe when to use this]
 ").unwrap();
-        let err = super::publish_skill("thin", &tmpl, &skills, false).unwrap_err().to_string();
+        let err = super::publish_skill("thin", &tmpl, &skills, None, false).unwrap_err().to_string();
         assert!(err.contains("[Edit:"), "{err}");
         assert!(!skills.join("thin").join("SKILL.md").exists(), "refusal must not write");
 
         // ...unless forced.
-        assert!(super::publish_skill("thin", &tmpl, &skills, true).is_ok());
+        assert!(super::publish_skill("thin", &tmpl, &skills, None, true).is_ok());
 
         // A real draft publishes, minus the review scaffolding.
         let real = drafts.join("skill_real.md");
@@ -523,14 +555,26 @@ mod tests {
 
 1. Do the thing.
 ").unwrap();
-        let dest = super::publish_skill("real", &real, &skills, false).unwrap();
+        let prompts = base.join(".github").join("prompts");
+        let out_paths = super::publish_skill("real", &real, &skills, Some(&prompts), false).unwrap();
+        assert_eq!(out_paths.len(), 2, "both hosts must get a copy: {out_paths:?}");
+        let dest = &out_paths[0];
         assert!(dest.exists());
-        assert_eq!(dest, skills.join("real").join("SKILL.md"));
-        let out = std::fs::read_to_string(&dest).unwrap();
+        assert_eq!(dest, &skills.join("real").join("SKILL.md"));
+        let out = std::fs::read_to_string(dest).unwrap();
         assert!(out.contains("Do the thing."));
         assert!(out.contains("Agent-authored"), "provenance is kept");
         assert!(!out.contains("Review and approve:"), "decision scaffolding is dropped");
         assert!(!out.contains("Target:"), "decision scaffolding is dropped");
+
+        // Copilot has no skills mechanism; its surface is a prompt file
+        // invoked as /real in Copilot Chat.
+        let prompt = &out_paths[1];
+        assert_eq!(prompt, &prompts.join("real.prompt.md"));
+        let ptext = std::fs::read_to_string(prompt).unwrap();
+        assert!(ptext.starts_with("---\nmode: agent\n"), "{ptext}");
+        assert!(ptext.contains("description: \"1. Do the thing.\""), "{ptext}");
+        assert!(ptext.contains("Do the thing."));
 
         let _ = std::fs::remove_dir_all(&base);
     }

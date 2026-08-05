@@ -63,6 +63,10 @@ Write the description as **what goes wrong**, not what the feature is, and tag
 with the API name, the behaviour, the domain and the colloquial term — entries
 are found by concept, not exact spelling.
 
+Approved skills are published to `.github/prompts/<name>.prompt.md` — invoke one
+as `/<name>` in Copilot Chat. (The same skill is written to `.claude/skills/` for
+Claude Code; one approval covers both.)
+
 Closeout folds the session into the consolidation pipeline automatically when the
 last run is over 8h old. Nothing reaches your instructions without a person:
 anything awaiting review is listed under **AWAITING YOUR REVIEW** in the closeout

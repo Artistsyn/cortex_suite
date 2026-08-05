@@ -166,7 +166,16 @@ impl Default for SkillsPrefs {
     }
 }
 
-fn default_skills_dir() -> String { "agent_customization/skills".to_string() }
+/// Where an approved skill is published.
+///
+/// `.claude/skills` because that is a path agents actually load: Claude Code
+/// discovers `<repo>/.claude/skills/<name>/SKILL.md` automatically, and
+/// `~/.claude/skills` for user-level ones. The previous default,
+/// `agent_customization/skills`, is read by nothing — a skill published there is
+/// approved, on disk, and invisible to every session.
+///
+/// Override in `prefs.toml` if your host looks somewhere else.
+fn default_skills_dir() -> String { ".claude/skills".to_string() }
 
 /// Memory file lifecycle configuration (Phase 0A).
 #[derive(Debug, Clone, Serialize, Deserialize)]

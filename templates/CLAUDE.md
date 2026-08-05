@@ -141,7 +141,10 @@ cortex review-proposals         # pending proposals, then proposal-approve / pro
 The block is silent when the queue is empty. Read a drafted skill before
 approving it: a draft containing placeholder text (`[describe when...]`) is a
 detector firing on a thin signal, and publishing it teaches future sessions
-nothing.
+nothing. Approval publishes to `.claude/skills/<name>/SKILL.md` (loaded
+automatically here) and to `.github/prompts/<name>.prompt.md` (invoked as
+`/<name>` in Copilot Chat), so one approval covers both editors with no further
+wiring.
 
 ## 6) Editing safety
 

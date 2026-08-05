@@ -4150,12 +4150,20 @@ fn run_skill_approve(name: &str, db_path: &Path, force: bool) -> Result<()> {
     let prefs = load_prefs_from_repo(repo_root);
     let skills_dir = repo_root.join(&prefs.skills.skills_dir);
 
-    let dest = skills::publish_skill(name, &draft_path, &skills_dir, force)?;
+    // Only publish a Copilot prompt file into a repo that already has a
+    // `.github/` — creating one for a repo that has none is presumptuous.
+    let github = repo_root.join(".github");
+    let prompts = github.join("prompts");
+    let copilot = if github.is_dir() { Some(prompts.as_path()) } else { None };
 
-    // Status is recorded only after the file exists.
+    let written = skills::publish_skill(name, &draft_path, &skills_dir, copilot, force)?;
+
+    // Status is recorded only after the files exist.
     skills::set_skill_status(&store, name, "approved")?;
     println!("[cortex] Skill '{name}' approved and published:");
-    println!("         {}", dest.display());
+    for path in &written {
+        println!("         {}", path.display());
+    }
     Ok(())
 }
 
