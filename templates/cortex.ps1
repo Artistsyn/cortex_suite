@@ -75,18 +75,15 @@ Push-Location "$PSScriptRoot\.."
 $DB            = ".cortex\memory.db"
 # First target in index-sources.json, so a workspace with no quartz/ still works.
 $SOURCE        = $null  # resolved below, after $INDEX_TARGETS is read
-$SOURCE_SYNFUL = "synful_quartz\quartz\src"
-$SCOPE_SYNFUL  = "synful"
-$SOURCE_PATHFORGE = "path_forge\src"
-$SCOPE_PATHFORGE  = "path_forge"
+# No per-project source constants. Sources come from index-sources.json; the
+# launcher reports on however many a workspace has, rather than on two it was
+# once written around.
 $INDEX_CONFIG  = ".cortex\index-sources.json"
 $REPO          = "."
 # Derived, never hardcoded: the workspace name is whatever directory this is
 # installed into. Baking in one project's name is how a launcher silently
 # mislabels every other workspace that copies it.
 $NAME          = if ($env:CORTEX_NAME) { $env:CORTEX_NAME } else { Split-Path -Leaf $REPO_ROOT }
-$NAME_SYNFUL   = "${NAME}Synful"
-$NAME_PATHFORGE = "${NAME}PathForge"
 $CARGO         = "cortex\Cargo.toml"
 $BINARY        = "cortex\target\debug\cortex.exe"
 # quartz-ctx is the extraction engine: its api-graph carries full method signatures
@@ -289,7 +286,6 @@ $INDEX_TARGETS = Get-ConfiguredIndexTargets
 if ($INDEX_TARGETS -and $INDEX_TARGETS.Count -gt 0) {
     $SOURCE = [string]$INDEX_TARGETS[0].source
     if ($INDEX_TARGETS.Count -gt 1) {
-        $SOURCE_SYNFUL = [string]$INDEX_TARGETS[1].source
     }
 }
 
@@ -515,7 +511,7 @@ function Write-SelfCheckResult {
             pass = $Pass
             db = $DB
             source_official = $SOURCE
-            source_synful = $SOURCE_SYNFUL
+            sources = @($INDEX_TARGETS | ForEach-Object { $_.source })
             status_ok = $Status.ok
             doctor_ok = $Doctor.ok
             indexed_units = $Status.indexed_units
@@ -529,7 +525,7 @@ function Write-SelfCheckResult {
 
     if ($SelfCheckFormat -eq "line") {
         $resultText = if ($Pass) { "PASS" } else { "FAIL" }
-        Write-Host ("CORTEX_SELFCHECK {0} scope=unified db={1} src_official={2} src_synful={3} indexed_units={4} checks={5}/{6}" -f $resultText, $DB, $SOURCE, $SOURCE_SYNFUL, $Status.indexed_units, $Doctor.checks_pass, $Doctor.checks_total)
+        Write-Host ("CORTEX_SELFCHECK {0} scope=unified db={1} primary_source={2} sources={3} indexed_units={4} checks={5}/{6}" -f $resultText, $DB, $SOURCE, $INDEX_TARGETS.Count, $Status.indexed_units, $Doctor.checks_pass, $Doctor.checks_total)
         return
     }
 
@@ -552,8 +548,14 @@ function Invoke-SelfCheck {
         Write-Prefix "FAIL: missing source path $SOURCE"
         $ok = $false
     }
-    if (-not (Test-Path $SOURCE_SYNFUL)) {
-        Write-Prefix "WARN: synful source path not found: $SOURCE_SYNFUL"
+    # Every source the manifest lists, not one project's second crate. This
+    # used to warn "synful source path not found" on every run in any workspace
+    # that had no synful -- which is all of them but one, and reads to a new
+    # user as a broken install.
+    foreach ($t in $INDEX_TARGETS) {
+        if (-not (Test-Path $t.source)) {
+            Write-Prefix "WARN: configured source path not found: $($t.source)"
+        }
     }
     if (-not (Test-Path $DB)) {
         Write-Prefix "WARN: DB file not found yet: $DB"
@@ -588,13 +590,13 @@ function Invoke-StatusLite {
             parsed = $statusCheck.parsed
             db = $DB
             source_official = $SOURCE
-            source_synful = $SOURCE_SYNFUL
+            sources = @($INDEX_TARGETS | ForEach-Object { $_.source })
         } | ConvertTo-Json -Compress) | Write-Host
         return $statusCheck.ok
     }
 
     if ($SelfCheckFormat -eq "line") {
-        Write-Host ("CORTEX_STATUS scope=unified ok={0} indexed_units={1} db={2} src_official={3} src_synful={4}" -f $statusCheck.ok.ToString().ToLowerInvariant(), $statusCheck.indexed_units, $DB, $SOURCE, $SOURCE_SYNFUL)
+        Write-Host ("CORTEX_STATUS scope=unified ok={0} indexed_units={1} db={2} primary_source={3} sources={4}" -f $statusCheck.ok.ToString().ToLowerInvariant(), $statusCheck.indexed_units, $DB, $SOURCE, $INDEX_TARGETS.Count)
         return $statusCheck.ok
     }
 
@@ -614,13 +616,13 @@ function Invoke-DoctorLite {
             parsed = $doctorCheck.parsed
             db = $DB
             source_official = $SOURCE
-            source_synful = $SOURCE_SYNFUL
+            sources = @($INDEX_TARGETS | ForEach-Object { $_.source })
         } | ConvertTo-Json -Compress) | Write-Host
         return ($doctorCheck.ok -and $doctorCheck.doctor_ok)
     }
 
     if ($SelfCheckFormat -eq "line") {
-        Write-Host ("CORTEX_DOCTOR scope=unified ok={0} workflow_ok={1} checks={2}/{3} db={4} src_official={5} src_synful={6}" -f $doctorCheck.ok.ToString().ToLowerInvariant(), $doctorCheck.doctor_ok.ToString().ToLowerInvariant(), $doctorCheck.checks_pass, $doctorCheck.checks_total, $DB, $SOURCE, $SOURCE_SYNFUL)
+        Write-Host ("CORTEX_DOCTOR scope=unified ok={0} workflow_ok={1} checks={2}/{3} db={4} primary_source={5} sources={6}" -f $doctorCheck.ok.ToString().ToLowerInvariant(), $doctorCheck.doctor_ok.ToString().ToLowerInvariant(), $doctorCheck.checks_pass, $doctorCheck.checks_total, $DB, $SOURCE, $INDEX_TARGETS.Count)
         return ($doctorCheck.ok -and $doctorCheck.doctor_ok)
     }
 
