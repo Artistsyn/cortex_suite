@@ -23,7 +23,14 @@
     "a Cargo workspace's members and a folder of standalone crates alike.",
     "",
     "Windows: binaries are cortex/target/debug/cortex.exe and",
-    "quartz-ctx/target/release/quartz-ctx.exe. macOS/Linux: drop the .exe."
+    "quartz-ctx/target/release/quartz-ctx.exe. macOS/Linux: drop the .exe.",
+    "",
+    "PITFALL - use RELATIVE paths. Both hosts resolve `command` against the workspace",
+    "root, so an absolute path works forever on the machine it was written on and",
+    "fails for everyone else. The reference workspace shipped an absolute",
+    "c:/Users/<someone>/... command in .vscode/mcp.json while .mcp.json used a",
+    "relative one - identical behaviour for the author, a dead server for anyone who",
+    "copied it. `cortex.sh check-mcp` catches this before a user hits it."
   ],
   "mcpServers": {
     "cortex": {

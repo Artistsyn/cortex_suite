@@ -16,7 +16,14 @@
     "a Cargo workspace's members and a folder of standalone crates alike.",
     "",
     "Never write live counts (nodes, items, communities) into a description string.",
-    "They are correct for one day and misleading afterwards - ask the tool instead."
+    "They are correct for one day and misleading afterwards - ask the tool instead.",
+    "",
+    "PITFALL - use RELATIVE paths. Both hosts resolve `command` against the workspace",
+    "root, so an absolute path works forever on the machine it was written on and",
+    "fails for everyone else. The reference workspace shipped an absolute",
+    "c:/Users/<someone>/... command in .vscode/mcp.json while .mcp.json used a",
+    "relative one - identical behaviour for the author, a dead server for anyone who",
+    "copied it. `cortex.sh check-mcp` catches this before a user hits it."
   ],
   "servers": {
     "cortex": {
