@@ -24,6 +24,19 @@ dump) and it is the only thing that records which knowledge proved useful.
 Reviewing everything is fine, just say so:
 `list_patterns(hint: "auditing all patterns", detail: "full")`.
 
+### Ask for a delta on repeat calls
+
+Every `get_anti_patterns` response ends with an `as of <timestamp>` line. Pass it
+back as `since` on your next call in the same session and unchanged entries are
+counted rather than re-listed.
+
+Measured on a 171-entry store: 25,493 bytes -> 3,113, an 87.8% saving, roughly
+5,600 tokens per repeat call. Anything your hint matches is still sent in full,
+so the saving comes out of repetition, not out of the answer.
+
+The hint controls how much of each entry you see; `since` controls how many times
+you see the same thing. Use both.
+
 ## When you get stuck
 
 | Situation | Call |
@@ -72,6 +85,52 @@ last run is over 8h old. Nothing reaches your instructions without a person:
 anything awaiting review is listed under **AWAITING YOUR REVIEW** in the closeout
 report and in `get_session_health`, with the command that resolves it
 (`cortex skill-approve <name>`, `cortex review-proposals`).
+
+### Closing the session
+
+Markers alone do not save anything. When the work is verifiably done, present a
+short summary of what you captured and ask for the word:
+
+```
+KNOWLEDGE COMMITTED
+```
+
+On that reply, call `closeout_session(outcome_type="build_pass",
+inline_approve=true, markers_text=<your [CORTEX-*] markers from this session>)`.
+
+**Pass `markers_text`.** Outside VS Code there is no chat store to scrape, so
+omitting it commits nothing — the session ends and every marker you wrote is
+lost. If the work did not verify, call `closeout_session(outcome_type="build_fail")`
+and do not pass `inline_approve`.
+
+### `[stale index]` in a response
+
+Answers drawn from indexed code carry a one-line notice when the source has
+changed since it was last indexed, naming the roots. It appears once per change,
+not once per call.
+
+It means results about those roots may predate your edits. Either re-run
+`cortex.sh reindex` (`cortex.ps1 reindex` on Windows) or treat answers about
+those roots as possibly behind. It is silent when the index is current, so when
+it does appear it is worth believing.
+
+## Launcher commands
+
+`.cortex/cortex.sh` on macOS and Linux, `.cortex/cortex.ps1` on Windows. Same
+commands on both.
+
+| | |
+|---|---|
+| `reindex` | regenerate api-graphs and re-index every source in the manifest |
+| `deploy` | rebuild cortex without stopping the MCP server |
+| `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |
+| `status` / `doctor` | store summary / pipeline health |
+| `skill-status` | drafts awaiting a human |
+| `-- <args>` | pass anything straight through to the binary |
+
+`deploy` exists because Windows blocks deleting a running executable. It renames
+the live binary out of the way, which Windows does permit, so a rebuild never
+requires hunting and killing the server first.
 
 ## Verify before claiming done
 

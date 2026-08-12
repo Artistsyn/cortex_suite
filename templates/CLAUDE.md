@@ -58,6 +58,19 @@ this very file asked for one, twice.
 Reviewing everything is still fine; just say so:
 `list_patterns(hint: "auditing all patterns", detail: "full")`.
 
+### Ask for a delta on repeat calls
+
+Every `get_anti_patterns` response ends with an `as of <timestamp>` line. Pass it
+back as `since` on your next call in the same session and unchanged entries are
+counted rather than re-listed.
+
+Measured on a 171-entry store: 25,493 bytes -> 3,113, an 87.8% saving, roughly
+5,600 tokens per repeat call. Anything your hint matches is still sent in full,
+so the saving comes out of repetition, not out of the answer.
+
+The hint controls how much of each entry you see; `since` controls how many times
+you see the same thing. Use both.
+
 ## 3) Pre-code check (no trigger word needed)
 
 Before writing any non-trivial function — anything that constructs, ticks,
@@ -145,6 +158,35 @@ nothing. Approval publishes to `.claude/skills/<name>/SKILL.md` (loaded
 automatically here) and to `.github/prompts/<name>.prompt.md` (invoked as
 `/<name>` in Copilot Chat), so one approval covers both editors with no further
 wiring.
+
+### `[stale index]` in a response
+
+Answers drawn from indexed code carry a one-line notice when the source has
+changed since it was last indexed, naming the roots. It appears once per change,
+not once per call.
+
+It means results about those roots may predate your edits. Either re-run
+`cortex.sh reindex` (`cortex.ps1 reindex` on Windows) or treat answers about
+those roots as possibly behind. It is silent when the index is current, so when
+it does appear it is worth believing.
+
+## Launcher commands
+
+`.cortex/cortex.sh` on macOS and Linux, `.cortex/cortex.ps1` on Windows. Same
+commands on both.
+
+| | |
+|---|---|
+| `reindex` | regenerate api-graphs and re-index every source in the manifest |
+| `deploy` | rebuild cortex without stopping the MCP server |
+| `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |
+| `status` / `doctor` | store summary / pipeline health |
+| `skill-status` | drafts awaiting a human |
+| `-- <args>` | pass anything straight through to the binary |
+
+`deploy` exists because Windows blocks deleting a running executable. It renames
+the live binary out of the way, which Windows does permit, so a rebuild never
+requires hunting and killing the server first.
 
 ## 6) Editing safety
 
