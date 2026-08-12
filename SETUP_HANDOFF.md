@@ -42,14 +42,26 @@ into your workspace, and never overwrites an existing file unless you pass
 
 Then:
 
+Setup also installs both launchers into `.cortex/` — `cortex.sh` for macOS and
+Linux, `cortex.ps1` for Windows. They take the same commands, so a mixed team
+runs the same instructions. Neither hardcodes a project: the workspace name is
+the directory it sits in (override with `CORTEX_NAME`).
+
 1. **Edit `.cortex/index-sources.json`** — list your crates. This is the only file
    you must edit by hand.
 2. **Index once:**
    ```bash
    cortex --db .cortex/memory.db index --source my_crate/src --name MyCrate
    ```
-3. **Restart your editor** so it re-reads the MCP config.
-4. **Verify:** ask the agent `get_api_context(hint: "...")`. If it returns your
+3. **Check the MCP configs:**
+   ```bash
+   ./.cortex/cortex.sh check-mcp        # .\.cortex\cortex.ps1 on Windows
+   ```
+   Catches the two failures that produce a server which silently never starts:
+   an absolute path in `command`, and drift between `.mcp.json` and
+   `.vscode/mcp.json`.
+4. **Restart your editor** so it re-reads the MCP config.
+5. **Verify:** ask the agent `get_api_context(hint: "...")`. If it returns your
    types, you are done.
 
 **Requirements:** [Rust](https://rustup.rs), plus a C toolchain for the
@@ -112,7 +124,21 @@ cannot replace it. On Windows the build errors; the dangerous part is that the
 **old binary is still there**, so if you ignore the error the next run uses stale
 code.
 
-**Fix — the deploy sequence that works:**
+**Fix — use `deploy`, which does not need the server stopped at all:**
+
+```bash
+./.cortex/cortex.sh deploy          # .\.cortex\cortex.ps1 deploy on Windows
+```
+
+Windows blocks *deleting* a running executable but permits *renaming* it — the
+trick self-updaters use. `cortex.ps1 deploy` renames the live binary to
+`cortex.exe.old-<timestamp>`, builds fresh into the freed name, and restores the
+old one if the build fails. The running server keeps its old image until it
+restarts naturally. On macOS and Linux replacing a running binary is already
+safe, so `cortex.sh deploy` is just a build; the command exists on both so the
+instructions do not fork.
+
+**If you are doing it by hand instead — the older sequence:**
 
 ```powershell
 Get-Process cortex, quartz-ctx -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -171,6 +197,10 @@ Mixing them (`command: cortex.exe`, `args: ["-File", "script.ps1"]`) starts a
 process that dies immediately.
 
 ### 2.4 Two config files that silently drift
+
+> Run `cortex.sh check-mcp` (or `cortex.ps1 check-mcp`) to catch this
+> automatically — it compares the commands in both files and fails on drift or
+> on an absolute path.
 
 Claude Code reads `.mcp.json`. VS Code reads `.vscode/mcp.json`. They have
 *different shapes* — `mcpServers` vs `servers`, and VS Code needs
@@ -524,7 +554,7 @@ cortex_suite/
 ├── README.md             one-page orientation
 ├── cortex/               memory + project intelligence server (Rust)
 ├── quartz-ctx/           API extraction server (Rust)
-├── templates/            configs and instruction files to copy
+├── templates/            configs, instruction files, and both launchers
 ├── scripts/              setup.ps1 (Windows), setup.sh (macOS/Linux)
 └── docs/GRAPHIFY.md      optional third server: repo-wide structural graph
 ```

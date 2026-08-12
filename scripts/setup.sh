@@ -134,18 +134,26 @@ write_if_absent "$WORKSPACE/.vscode/mcp.json" ".vscode/mcp.json (VS Code)" "$(ca
 EOF
 )"
 
-for pair in "templates/CLAUDE.md:CLAUDE.md" "templates/copilot-instructions.md:.github/copilot-instructions.md"; do
+# Both launchers, regardless of platform: a mixed team shares one workspace,
+# and the Windows developer needs cortex.ps1 in the same checkout the macOS
+# developer gets cortex.sh from.
+for pair in "templates/CLAUDE.md:CLAUDE.md" "templates/copilot-instructions.md:.github/copilot-instructions.md" "templates/cortex.sh:.cortex/cortex.sh" "templates/cortex.ps1:.cortex/cortex.ps1"; do
   src="${pair%%:*}"; dst="${pair##*:}"
   if [ -e "$WORKSPACE/$dst" ] && [ "$FORCE" -eq 0 ]; then
     warn "$dst exists, leaving it alone"
   else
     cp "$SUITE_ROOT/$src" "$WORKSPACE/$dst"
+    case "$dst" in *.sh) chmod +x "$WORKSPACE/$dst" ;; esac
     say "wrote $dst"
   fi
 done
 
 say ""
 say "NEXT: edit .cortex/index-sources.json to list your crates, then run:"
+say "  ./.cortex/cortex.sh reindex        # or .\.cortex\cortex.ps1 reindex on Windows"
+say "  ./.cortex/cortex.sh check-mcp      # confirms both MCP configs agree"
+say ""
+say "Or index a single crate directly:"
 say "  $CORTEX_REL --db .cortex/memory.db index --source <crate>/src --name <Name>"
 say ""
 say "Then restart your editor so it picks up the MCP config."

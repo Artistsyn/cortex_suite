@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Build and wire the cortex + quartz-ctx MCP suite into a workspace (Windows).
@@ -184,7 +184,11 @@ WriteIfAbsent (Join-Path $Workspace '.vscode\mcp.json') $mcpVscode '.vscode/mcp.
 
 foreach ($doc in @(
     @{ src = 'templates\CLAUDE.md';               dst = 'CLAUDE.md';                            label = 'CLAUDE.md' },
-    @{ src = 'templates\copilot-instructions.md'; dst = '.github\copilot-instructions.md';      label = 'copilot-instructions.md' }
+    @{ src = 'templates\copilot-instructions.md'; dst = '.github\copilot-instructions.md';      label = 'copilot-instructions.md' },
+    # Both launchers regardless of platform: a mixed team shares one workspace,
+    # so the macOS developer needs cortex.sh from the same checkout.
+    @{ src = 'templates\cortex.ps1';             dst = '.cortex\cortex.ps1';                   label = 'cortex.ps1' },
+    @{ src = 'templates\cortex.sh';              dst = '.cortex\cortex.sh';                    label = 'cortex.sh' }
 )) {
     $dstPath = Join-Path $Workspace $doc.dst
     New-Item -ItemType Directory -Force -Path (Split-Path $dstPath -Parent) | Out-Null

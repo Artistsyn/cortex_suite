@@ -26,6 +26,15 @@ MSVC Build Tools on Windows, Xcode CLI tools on macOS, `build-essential` on
 Linux). Then edit `.cortex/index-sources.json`, run one `index` command, restart
 your editor.
 
+Setup installs a launcher into `.cortex/` for both platforms — `cortex.sh` and
+`cortex.ps1`, same commands on each:
+
+```bash
+./.cortex/cortex.sh reindex      # re-extract and re-index every configured source
+./.cortex/cortex.sh check-mcp    # confirm both MCP configs agree and use relative paths
+./.cortex/cortex.sh deploy       # rebuild without stopping the running server
+```
+
 Don't want to list crates by hand? `quartz-ctx serve --discover .` finds every
 crate under a directory — workspace members and standalone crates alike.
 
