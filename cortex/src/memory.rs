@@ -503,6 +503,11 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_se_symbol ON symbol_examples(symbol_name);
 
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS session_retrieval_log (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id    TEXT    NOT NULL,
@@ -1331,6 +1336,23 @@ impl Store {
             params![session_key, command, original_chars as i64, filtered_chars as i64, ratio],
         )?;
         Ok(())
+    }
+
+
+    /// Small key/value store for facts about the index itself.
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0),
+        ).optional()?)
     }
 
     pub fn log_session_retrieval(

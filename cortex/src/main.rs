@@ -105,6 +105,18 @@ enum Command {
     #[command(subcommand)]
     Annotate(AnnotateCmd),
 
+    /// Print the indexed sources from .cortex/index-sources.json as TSV.
+    ///
+    /// Exists so the shell launchers need no JSON parser. cortex.sh previously
+    /// shelled out to python3 for this, which quietly made python a dependency
+    /// of a suite that advertises none -- and that only fails on a machine that
+    /// lacks it, which is never the author's.
+    Manifest {
+        /// Repo root holding .cortex/index-sources.json.
+        #[arg(long, default_value = ".")]
+        repo: std::path::PathBuf,
+    },
+
     /// Prune call log and run VACUUM to reclaim space.
     Prune {
         /// Number of MCP call log entries to keep.
@@ -680,6 +692,7 @@ fn main() -> Result<()> {
         Command::Pattern(cmd)      => run_pattern(cmd, &db_path, format),
         Command::AntiPattern(cmd)  => run_anti_pattern(cmd, &db_path, format),
         Command::Annotate(cmd)     => run_annotate(cmd, &db_path, format),
+        Command::Manifest { repo } => run_manifest(&repo),
         Command::Prune { keep_calls } => run_prune(keep_calls, &db_path),
         Command::PruneIndex { keep, apply } => run_prune_index(keep, apply, &db_path),
         Command::Status { full }   => run_status(&db_path, full, format),
@@ -2220,6 +2233,26 @@ Cortex can bootstrap launcher scripts and MCP wiring directly from the cortex re
 
 // ── Command handlers ──────────────────────────────────────────────────────────
 
+/// Emit the manifest's targets as `source<TAB>name<TAB>scope`.
+fn run_manifest(repo: &Path) -> Result<()> {
+    let path = repo.join(".cortex").join("index-sources.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw)?;
+    if let Some(targets) = parsed.get("targets").and_then(|t| t.as_array()) {
+        for t in targets {
+            let src = t.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            if src.is_empty() {
+                continue;
+            }
+            let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let scope = t.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+            println!("{src}	{name}	{scope}");
+        }
+    }
+    Ok(())
+}
+
 fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
 
@@ -2324,6 +2357,22 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     eprintln!("  total: {} units in index", units.len());
     eprintln!("  graph: {} nodes synced, {} edges inferred", synced, inferred);
     eprintln!("  db: {}", db_path.display());
+
+    // Record what this source looked like at ingest, so the server can tell
+    // later whether the store still reflects the code. Keyed by the manifest's
+    // own relative path so it lines up with what stale_roots reads.
+    let rel = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| args.source.strip_prefix(&cwd).ok().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| args.source.clone());
+    // MAIN_SEPARATOR rather than an escaped backslash literal: the manifest
+    // stores forward slashes, and this key has to match what stale_roots builds.
+    let rel_key = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    let fp = cache::root_fingerprint(&args.source);
+    match store.set_meta(&format!("source_fp:{rel_key}"), &fp) {
+        Ok(()) => eprintln!("  stamped: source_fp:{rel_key}"),
+        Err(e) => eprintln!("  warn: could not stamp source fingerprint for {rel_key}: {e}"),
+    }
     eprintln!("\ndone.");
     Ok(())
 }

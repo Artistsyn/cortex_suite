@@ -7,7 +7,8 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::cache::{
-    cache_stats, compute_index_version, get_cached_response, cache_response,
+    cache_stats, compute_index_version, current_index_version, get_cached_response, cache_response,
+    staleness_notice,
     invalidate_stale, SessionRegistry,
 };
 use crate::memory::Store;
@@ -19,6 +20,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Refreshed only when a bootstrap tool fires or begin_protocol_session is called.
 static PROTOCOL_MODE: AtomicBool = AtomicBool::new(false);
 static BOOTSTRAP_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Tools whose answers are drawn from the indexed code, and are therefore the
+/// only ones a stale index can make wrong. Knowledge tools like
+/// get_anti_patterns read hand-written entries and are unaffected.
+const CODE_BACKED: &[&str] = &[
+    "get_item", "get_syntax", "get_usage_examples", "get_helper",
+    "semantic_search", "recall", "query_graph", "get_context",
+    "explain_dependency_path", "simulate_change", "find_related_types",
+];
 
 /// Max response cache entries before LRU eviction kicks in.
 const CACHE_MAX_ENTRIES: usize = 256;
@@ -54,8 +64,9 @@ pub fn serve(
     let engine_name = engine_name.to_string();
     let sessions = SessionRegistry::new();
 
-    // Compute index version once at startup; changes only after `cortex index`.
-    let index_version = compute_index_version(store.conn())
+    // Includes a fingerprint of the source on disk, so the key moves when the
+    // code changes rather than only when someone remembers to reindex.
+    let index_version = compute_index_version(store.conn(), Some(repo_root.as_path()))
         .unwrap_or_else(|_| "unknown".to_string());
 
     // Flush stale cache entries from previous index versions.
@@ -173,6 +184,10 @@ pub fn serve(
                     }
                 }
 
+                // Sampled per request: an edit or a reindex mid-session must move
+                // the key, or the cache serves a world that no longer exists.
+                let index_version = current_index_version(store.conn(), Some(repo_root.as_path()));
+
                 // Check response cache (skip for volatile tools).
                 let cached = if UNCACHEABLE.contains(&tool) {
                     None
@@ -187,7 +202,7 @@ pub fn serve(
                         "content": [{ "type": "text", "text": cached_text }]
                     }))
                 } else {
-                    let result = tools::dispatch(
+                    let mut result = tools::dispatch(
                         tool,
                         &args,
                         &store,
@@ -198,7 +213,11 @@ pub fn serve(
                         &prefs_summary,
                     );
 
-                    // Cache the result if it was successful and tool is cacheable.
+                    // Cache the ORIGINAL answer, before any notice is added.
+                    // A cached notice would be replayed long after the reindex
+                    // that cleared it -- a warning outliving its own condition
+                    // is worse than no warning, because it teaches you to ignore
+                    // the next one.
                     if let Ok(ref res) = result {
                         if !UNCACHEABLE.contains(&tool) {
                             if let Some(text) = res["content"][0]["text"].as_str() {
@@ -206,6 +225,19 @@ pub fn serve(
                                     store.conn(), tool, &args_str,
                                     &index_version, text, CACHE_MAX_ENTRIES,
                                 );
+                            }
+                        }
+                    }
+
+                    // Then attach the notice to the answer it qualifies, so it
+                    // rides on the response the staleness actually affects.
+                    if CODE_BACKED.contains(&tool) {
+                        if let Some(notice) = staleness_notice(store.conn(), repo_root.as_path()) {
+                            if let Ok(ref mut res) = result {
+                                if let Some(text) = res["content"][0]["text"].as_str() {
+                                    let joined = format!("{text}{notice}");
+                                    res["content"][0]["text"] = json!(joined);
+                                }
                             }
                         }
                     }
@@ -510,6 +542,10 @@ fn tools_list() -> Value {
                             "description": "What you are about to write, e.g. 'spawn pooled \
                                             enemy with gravity'. Anti-patterns matching this \
                                             are expanded to full remedy text."
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "The `as of` stamp from a previous response this session. Entries older than it that your hint does not match are counted rather than re-listed, so a repeat call costs a fraction of the first. Omit on the first call."
                         }
                     },
                     "required": ["hint"]

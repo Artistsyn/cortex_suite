@@ -569,6 +569,7 @@ fn ingest_session_trace(
     trace_path: &Path,
     mined_dir: &Path,
     session_key: &str,
+    repo_root: &Path,
 ) -> (Vec<String>, Vec<String>) {
     let Ok(content) = std::fs::read_to_string(trace_path) else {
         return (vec![], vec![]);
@@ -594,17 +595,21 @@ fn ingest_session_trace(
             .and_then(|p| p.as_str());
         if let Some(p) = path_str {
             let norm = p.replace('\\', "/");
-            // Take the component after the repo root if the path is absolute,
-            // else the first component of a relative path.
-            let tag = norm.rsplit_once("/RProjects/")
-                .map(|(_, rest)| rest)
+            // Strip the ACTUAL repo root, which cortex is told at startup,
+            // rather than guessing at directory names.
+            //
+            // This used to look for a literal "/RProjects/" segment and then
+            // skip a component literally named "FlowMake" -- one developer's
+            // folder layout and workspace name baked into the tagger. Anywhere
+            // else the whole path became the tag, so the miner clustered on
+            // noise and skill detection quietly degraded for every user but one.
+            let root_norm = repo_root.to_string_lossy().replace('\\', "/");
+            let tag = norm
+                .strip_prefix(root_norm.trim_end_matches('/'))
                 .unwrap_or(&norm)
                 .trim_start_matches('/')
                 .split('/')
-                // For absolute paths the first component after RProjects is the
-                // repo name — the second is the crate; relative paths start at
-                // the crate directly. Take the first non-repo-looking component.
-                .find(|c| !c.is_empty() && *c != "FlowMake")
+                .find(|c| !c.is_empty())
                 .unwrap_or("")
                 .to_string();
             if !tag.is_empty() && !tag.contains('.') && !tags.iter().any(|t| t == &tag) && tags.len() < 10 {
@@ -665,7 +670,7 @@ fn write_session_snapshot(
     // Code as rich as the VS Code session store makes them for Copilot:
     // real work tools (Edit/Bash/Read...) + touched crates as domain tags.
     let trace_path = repo_root.join(".cortex").join("session-trace.jsonl");
-    let (trace_tools, domain_tags) = ingest_session_trace(&trace_path, &dir, session_key);
+    let (trace_tools, domain_tags) = ingest_session_trace(&trace_path, &dir, session_key, repo_root);
     for t in trace_tools {
         if !tool_seq.contains(&t) {
             tool_seq.push(t);

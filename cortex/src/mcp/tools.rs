@@ -928,31 +928,86 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
     let full = args.get("detail").and_then(|v| v.as_str()) == Some("full");
     let tokens = args.get("hint").and_then(|v| v.as_str()).map(hint_tokens).unwrap_or_default();
 
-    let mut out = format!("{} anti-pattern(s) — DO NOT do these:\n\n", aps.len());
+    // `since`: the `as of` stamp from a previous response. Entries older than it
+    // are counted, not printed.
+    //
+    // Repetition, not expansion, is what makes a second call expensive. The hint
+    // already controls how much of each entry is shown; nothing controlled how
+    // many times the same unchanged index was re-sent. A session that checks
+    // anti-patterns twice paid twice for one body of knowledge.
+    let since = args.get("since").and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+
+    let now = chrono::Utc::now();
+    let mut out = String::new();
     let mut expanded = 0usize;
+    let mut listed = 0usize;
+    let mut unchanged = 0usize;
 
     for ap in &aps {
-        let relevant = hint_score(ap, &tokens) > 0;
-        if full || relevant {
-            out.push_str(&format!("### {}\n✗ wrong:   {}\n✓ correct: {}\n\n",
-                ap.description, ap.wrong, ap.correct));
-            expanded += 1;
-        } else {
-            out.push_str(&format!("- {}\n", ap.description));
-        }
+        // Telemetry is recorded for EVERY entry, shown or not. Only targeted
+        // retrievals feed pattern-survival scoring, so suppressing the log for
+        // omitted entries would quietly starve the very signal the required
+        // hint was introduced to produce.
         if let Some(id) = ap.id {
             let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "get_anti_patterns");
         }
+
+        let relevant = hint_score(ap, &tokens) > 0;
+
+        // An unchanged entry is omitted only when it is ALSO not hint-relevant:
+        // the caller asked about this topic, so the remedy is what they came for
+        // even if they have technically seen it before.
+        if let Some(cut) = since {
+            if ap.added_at <= cut && !(full || relevant) {
+                unchanged += 1;
+                continue;
+            }
+        }
+
+        if full || relevant {
+            out.push_str(&format!("### {}
+✗ wrong:   {}
+✓ correct: {}
+
+",
+                ap.description, ap.wrong, ap.correct));
+            expanded += 1;
+        } else {
+            out.push_str(&format!("- {}
+", ap.description));
+            listed += 1;
+        }
     }
 
-    if !full {
-        let listed = aps.len() - expanded;
-        out.push_str(&format!(
-            "\n({listed} listed by description only — their wrong/correct text is one call away: \
-             get_anti_patterns with hint=\"<what you are writing>\", or detail=\"full\" for all of them.)\n"
+    let header = match since {
+        Some(cut) => format!(
+            "{} anti-pattern(s) — DO NOT do these. {} new or relevant since {};              {} unchanged and omitted.
+
+",
+            aps.len(), expanded + listed, cut.to_rfc3339(), unchanged,
+        ),
+        None => format!("{} anti-pattern(s) — DO NOT do these:
+
+", aps.len()),
+    };
+    let mut body = header;
+    body.push_str(&out);
+
+    if !full && since.is_none() {
+        body.push_str(&format!(
+            "
+({listed} listed by description only — their wrong/correct text is one call away:              get_anti_patterns with hint=\"<what you are writing>\", or detail=\"full\" for all of them.)
+"
         ));
     }
-    Ok(out)
+
+    // The stamp for the next call. Passing it back turns a repeat into a delta.
+    body.push_str(&format!("
+as of {}
+", now.to_rfc3339()));
+    Ok(body)
 }
 
 // ── suggest_pattern ───────────────────────────────────────────────────────────
@@ -2400,5 +2455,108 @@ mod hint_requirement_tests {
     #[test]
     fn an_explicit_audit_is_still_allowed() {
         assert!(require_hint(&json!({"hint": "auditing all patterns"}), "t").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod delta_mode_tests {
+    use super::*;
+
+    fn live_store() -> Option<Store> {
+        let db = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().join(".cortex").join("memory.db");
+        if !db.exists() { return None; }
+        Store::open(&db).ok()
+    }
+
+    /// The number that decides whether delta mode earns its complexity: how much
+    /// smaller is the SECOND call in a session than the first?
+    #[test]
+    fn a_repeat_call_costs_a_fraction_of_the_first() {
+        let Some(store) = live_store() else { return };
+        let hint = "spawn pooled enemy with gravity";
+
+        let first = tool_get_anti_patterns(
+            &serde_json::json!({ "hint": hint }), &store, "test_delta",
+        ).expect("first call");
+
+        // Everything already recorded is "unchanged" from a stamp taken now.
+        let stamp = chrono::Utc::now().to_rfc3339();
+        let second = tool_get_anti_patterns(
+            &serde_json::json!({ "hint": hint, "since": stamp }), &store, "test_delta",
+        ).expect("second call");
+
+        let (a, b) = (first.len(), second.len());
+        eprintln!(
+            "get_anti_patterns  first={} bytes  repeat={} bytes  saved={:.1}%  (~{} tokens saved)",
+            a, b, 100.0 * (a - b) as f64 / a as f64, (a - b) / 4,
+        );
+        assert!(b < a / 2, "a repeat must be at least half the size: {a} -> {b}");
+    }
+
+    /// The saving must not come out of the answer. A hint-relevant remedy is what
+    /// the caller came for, so it is re-sent even when they have seen it before.
+    #[test]
+    fn hint_relevant_remedies_survive_the_delta() {
+        let Some(store) = live_store() else { return };
+        let hint = "spawn pooled enemy with gravity";
+        let stamp = chrono::Utc::now().to_rfc3339();
+
+        let full = tool_get_anti_patterns(
+            &serde_json::json!({ "hint": hint }), &store, "test_delta",
+        ).unwrap();
+        let delta = tool_get_anti_patterns(
+            &serde_json::json!({ "hint": hint, "since": stamp }), &store, "test_delta",
+        ).unwrap();
+
+        let remedies_in = |s: &str| s.matches("✓ correct:").count();
+        assert_eq!(
+            remedies_in(&full), remedies_in(&delta),
+            "every remedy the hint matched must still be present in the delta",
+        );
+        assert!(remedies_in(&delta) > 0, "the fixture hint should match something");
+    }
+
+    /// A delta is only usable if the caller can get the stamp for the next one.
+    #[test]
+    fn every_response_carries_the_stamp_for_the_next_call() {
+        let Some(store) = live_store() else { return };
+        let out = tool_get_anti_patterns(
+            &serde_json::json!({ "hint": "anything" }), &store, "test_delta",
+        ).unwrap();
+        let stamp = out.rsplit("as of ").next().unwrap().trim();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(stamp).is_ok(),
+            "response must end with a parseable `as of` stamp, got {stamp:?}",
+        );
+    }
+
+    /// Telemetry must not be starved by the saving. Only targeted retrievals feed
+    /// pattern-survival scoring, so omitted entries still have to be logged.
+    #[test]
+    fn omitted_entries_are_still_counted_as_retrieved() {
+        let Some(store) = live_store() else { return };
+        let session = format!("test_telemetry_{}", std::process::id());
+        let stamp = chrono::Utc::now().to_rfc3339();
+        let _ = tool_get_anti_patterns(
+            &serde_json::json!({ "hint": "zzz_no_match_expected", "since": stamp }),
+            &store, &session,
+        ).unwrap();
+
+        // expect(), not unwrap_or(0): a query against a table that does not
+        // exist would otherwise return 0 and read as a real measurement.
+        let total: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM session_retrieval_log WHERE session_id = ?1",
+            rusqlite::params![session], |r| r.get(0),
+        ).expect("session_retrieval_log query");
+        let recorded: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM anti_patterns", [], |r| r.get(0),
+        ).expect("anti_patterns count");
+        assert_eq!(
+            total, recorded,
+            "every anti-pattern must be logged as retrieved even when omitted from the text",
+        );
+        let _ = store.conn().execute(
+            "DELETE FROM session_retrieval_log WHERE session_id = ?1", rusqlite::params![session]);
     }
 }
