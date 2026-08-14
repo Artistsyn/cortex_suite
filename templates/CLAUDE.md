@@ -50,6 +50,11 @@ without a `hint`. That is deliberate and it is not about tidiness:
    retrievals feed pattern survival scoring. A hintless call taught the system
    nothing about which knowledge was worth keeping.
 
+**Aim it at names, not intent.** Matching is on whole words; an entry must hit
+**two** distinct hint tokens before it expands (one if your hint is under three
+words), and at most **12** entries expand per call, closest first — the response
+tells you how many were held back. Vague hints now return less, not more.
+
 It is enforced rather than requested because requesting measurably failed:
 across 823 real calls, every tool with a **required** parameter ran at 100%
 compliance, and every tool where the hint was **optional** ran at 2–5% — while
@@ -131,6 +136,21 @@ Tag entries so they are findable by concept, not just exact API name: include th
 API name, the behaviour, the domain, and the colloquial term people actually use.
 Start an anti-pattern description with **what goes wrong**, not what the feature
 is.
+
+### When your entry CORRECTS an older one, retire the old one
+
+```
+cortex anti-pattern supersede <old-id> --by <new-id>
+cortex pattern       supersede <old-id> --by <new-id>
+cortex anti-pattern retired          # what has been retired, and by what
+```
+
+Retired rows stay in the database as history and are never served again. Skip
+this and the store accumulates contradictions and serves **both sides**: on the
+reference workspace two anti-patterns about the same API, written a day apart,
+said opposite things and came back in one response — so the store taught the bug
+that had just been fixed. Nothing automatic can catch that, because each entry
+was true when it was written and only you know which one yours replaces.
 
 ### What happens after closeout
 

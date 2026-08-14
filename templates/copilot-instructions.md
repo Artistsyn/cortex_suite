@@ -21,8 +21,17 @@ Skip only for renames, typos and comments.
 a `hint`. It decides what gets expanded (a hinted call is ~42% the size of a full
 dump) and it is the only thing that records which knowledge proved useful.
 
+Aim it at names, not intent. Matching is on whole words, an entry needs **two**
+distinct hint tokens before it expands (one for a hint under three words), and at
+most **12** expand per call — closest first, with the rest counted in the reply.
+A vague hint now returns less, not more.
+
 Reviewing everything is fine, just say so:
 `list_patterns(hint: "auditing all patterns", detail: "full")`.
+
+**When an entry you add CORRECTS an older one, retire the old one** with
+`cortex anti-pattern supersede <old-id> --by <new-id>` (same for `pattern`).
+Otherwise both are served and the store contradicts itself.
 
 ### Ask for a delta on repeat calls
 
