@@ -282,6 +282,17 @@ pub fn run_closeout(
 /// Capped at 12 patterns per session to keep one noisy session from swinging
 /// the whole store. Returns the number of patterns updated.
 fn apply_retrieval_outcomes(store: &Store, session_key: &str, outcome_type: &str) -> Result<usize> {
+    // The build already answered this question, and more honestly.
+    //
+    // Test outcomes are observed continuously from the compaction hook, so by
+    // the time a session closes its patterns are usually scored from what the
+    // compiler actually said rather than from the outcome_type the agent
+    // reports. Applying both would count one session twice — and closeout is
+    // the weaker of the two, since it is a self-assessment made after the fact.
+    if crate::test_signal::already_scored(store, session_key) {
+        return Ok(0);
+    }
+
     let (use_delta, reverted_delta): (i64, i64) = match outcome_type {
         "build_pass"              => (1, 0),
         "build_fail" | "test_fail" => (1, 1),

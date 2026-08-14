@@ -150,7 +150,7 @@ pkill -x cortex; pkill -x quartz-ctx
 cargo build && cargo build --release
 ```
 
-Then **reindex**, then **clear the response cache** (see 2.2).
+Then **reindex**.
 
 > `cargo test` builds a *separate* test binary. Passing tests do **not** mean the
 > CLI or the MCP server changed. Verifying behaviour through the executable
@@ -161,23 +161,24 @@ Always confirm the artifact rather than the exit code:
 cortex --version
 ```
 
-### 2.2 The response cache replays pre-rebuild output
+### 2.2 The response cache is gone (nothing to clear)
 
-**Symptom:** you fix a tool, rebuild, and the tool behaves exactly as before.
+Older builds cached tool responses keyed on an index version, and that key once
+described only the *data* — so changing how a tool *rendered* data left every
+cached answer "valid" and the rebuilt binary replayed the old output. If you are
+following an older copy of these notes, there is no longer a
+`DELETE FROM response_cache` step and no table to delete from.
 
-cortex caches tool responses keyed on an index version. Historically that key
-described only the *data*, so changing how a tool *renders* data left every
-cached answer "valid" and the rebuilt binary replayed the old output. This cost a
-full false-negative debug cycle on a fix that was already correct.
+The cache was removed rather than fixed again. It was correct and it invalidated
+properly, but it could not save a token by construction: a cache hit returns
+byte-identical text, so the agent pays the same either way. It saved server CPU
+on a workload that was never CPU-bound, and it held zero entries and zero hits
+across every measurement after the last fix. What it did still carry was a
+cache-key correctness problem that had already shipped once.
 
-Current builds mix the binary's identity into the key, so this should not recur.
-If you ever suspect it:
-
-```bash
-sqlite3 .cortex/memory.db "DELETE FROM response_cache;"
-```
-
-Nothing durable lives in that table.
+If a rebuilt binary seems to behave as before, the cause is now upstream of any
+cache — check that `cargo build` actually replaced the executable (§2.1), since a
+failed build leaves the previous one in place.
 
 ### 2.3 MCP config: the subcommand must come first
 

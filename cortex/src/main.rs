@@ -1,8 +1,10 @@
 mod adr;
+mod audit;
 mod cache;
 mod closeout;
 mod compressor;
 mod consolidator;
+mod corrections;
 mod consolidator2;
 mod crystallizer;
 mod git;
@@ -15,6 +17,7 @@ mod meta;
 mod miner;
 mod model;
 mod output_filter;
+mod test_signal;
 mod planner;
 mod recall_match;
 mod prefs;
@@ -158,6 +161,9 @@ enum Command {
     /// Run production-style workflow health checks.
     #[command(subcommand)]
     Doctor(DoctorCmd),
+
+    /// Show which mechanisms have actually fired, and which are silently idle.
+    Fired,
 
     /// Search patterns, anti-patterns, annotations, and indexed units for a topic.
     Recall {
@@ -639,6 +645,16 @@ enum PatternCmd {
     Remove { id: i64 },
     /// Mark a pattern as reverted once and update survival rate.
     Revert { id: i64 },
+    /// Retire a pattern in favour of a newer one. It stays in the DB as history
+    /// but is never served again.
+    Supersede {
+        /// The pattern being retired.
+        id: i64,
+        /// The pattern that replaces it.
+        #[arg(long)] by: i64,
+    },
+    /// List patterns retired by `supersede`.
+    Retired,
     /// Show pattern survival health.
     Health,
 }
@@ -653,6 +669,17 @@ enum AntiPatternCmd {
         #[arg(long, value_delimiter = ',')] tags: Vec<String>,
     },
     Remove { id: i64 },
+    /// Retire an anti-pattern in favour of a newer one. Use this when a later
+    /// entry CORRECTS an earlier one — otherwise both are served, and a reader
+    /// gets told to do the thing the correction exists to prevent.
+    Supersede {
+        /// The anti-pattern being retired.
+        id: i64,
+        /// The anti-pattern that replaces it.
+        #[arg(long)] by: i64,
+    },
+    /// List anti-patterns retired by `supersede`.
+    Retired,
 }
 
 #[derive(Subcommand, Debug)]
@@ -698,6 +725,7 @@ fn main() -> Result<()> {
         Command::Status { full }   => run_status(&db_path, full, format),
         Command::Meta(cmd)        => run_meta(cmd, &db_path, format),
         Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
+        Command::Fired             => audit::run_cli(&Store::open(&db_path)?),
         Command::Recall { topic }  => run_recall(&topic, &db_path, format),
         Command::GitReview { base, repo } => run_git_review(&base, repo.as_deref(), &db_path),
         Command::Adr(cmd)          => run_adr(cmd, &db_path),
@@ -847,31 +875,93 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     let hooks_obj = hooks
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("`hooks` in {filename} is not an object"))?;
-    let post = hooks_obj
+    hooks_obj
         .entry("PostToolUse".to_string())
         .or_insert_with(|| Value::Array(vec![]));
-    let arr = post
-        .as_array_mut()
-        .ok_or_else(|| anyhow::anyhow!("`hooks.PostToolUse` in {filename} is not an array"))?;
+    hooks_obj
+        .entry("UserPromptSubmit".to_string())
+        .or_insert_with(|| Value::Array(vec![]));
 
-    let is_compact = |entry: &Value| -> bool {
+    // The edit guard rides the same mechanism: an mcp_tool hook needs no shell,
+    // no binary path and no per-machine wiring, so it installs itself with the
+    // compaction hook and there is nothing for anyone to remember. It returns an
+    // empty string unless an edit touches a recorded trap, which is why it can
+    // be attached to every edit without becoming noise.
+    let guard_hook = json!({
+        "matcher": "Edit|Write",
+        "hooks": [{
+            "type": "mcp_tool",
+            "server": "cortex",
+            "tool": "edit_guard",
+            "input": {
+                "file_path": "${tool_input.file_path}",
+                "added": "${tool_input.new_string}",
+                "content": "${tool_input.content}"
+            }
+        }]
+    });
+
+    // Corrections ride the same mechanism, on a different event. This is the
+    // only hook that watches the CHAT rather than the tools, and it exists
+    // because an agent that has just been corrected is the worst possible
+    // witness to the fact — the record has to be made by something with no
+    // stake in it. It returns an empty string for almost every message.
+    let challenge_hook = json!({
+        "hooks": [{
+            "type": "mcp_tool",
+            "server": "cortex",
+            "tool": "note_challenge",
+            "input": { "prompt": "${prompt}" }
+        }]
+    });
+
+    let names_tool = |entry: &Value, tool: &str| -> bool {
         entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
             hooks.iter().any(|h| {
-                h.get("tool").and_then(|t| t.as_str()) == Some("compact_output")
+                h.get("tool").and_then(|t| t.as_str()) == Some(tool)
                     && h.get("server").and_then(|s| s.as_str()) == Some("cortex")
             })
         })
     };
+    let is_compact = |e: &Value| names_tool(e, "compact_output");
+    let is_guard = |e: &Value| names_tool(e, "edit_guard");
 
-    // Already present and identical → no-op (unless --force refresh requested).
-    let existing = arr.iter().find(|e| is_compact(e));
-    if let Some(existing) = existing {
-        if !force && *existing == compact_hook {
-            return Ok(HookOutcome::AlreadyPresent);
-        }
+    let is_challenge = |e: &Value| names_tool(e, "note_challenge");
+
+    // A hook is up to date only if it is present AND byte-identical to what we
+    // would write. Anything else is refreshed — including a hook from an older
+    // cortex that passed the wrong template variable, which would otherwise
+    // survive forever looking installed.
+    let array_of = |obj: &serde_json::Map<String, Value>, key: &str| -> Vec<Value> {
+        obj.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default()
+    };
+    let post_now = array_of(hooks_obj, "PostToolUse");
+    let prompt_now = array_of(hooks_obj, "UserPromptSubmit");
+    let up_to_date = post_now.iter().find(|e| is_compact(e)).is_some_and(|e| *e == compact_hook)
+        && post_now.iter().find(|e| is_guard(e)).is_some_and(|e| *e == guard_hook)
+        && prompt_now.iter().find(|e| is_challenge(e)).is_some_and(|e| *e == challenge_hook);
+    if !force && up_to_date {
+        return Ok(HookOutcome::AlreadyPresent);
     }
-    arr.retain(|e| !is_compact(e));
+
+    // PostToolUse: output compaction and the edit guard.
+    let arr = hooks_obj
+        .get_mut("PostToolUse")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("`hooks.PostToolUse` in {filename} is not an array"))?;
+    arr.retain(|e| !is_compact(e) && !is_guard(e));
     arr.push(compact_hook);
+    arr.push(guard_hook);
+
+    // UserPromptSubmit is a SEPARATE event array. Pushing this onto PostToolUse
+    // would be accepted by the JSON and then never fire — exactly the shipped-
+    // and-doing-nothing failure this whole subsystem exists to catch.
+    let prompt_arr = hooks_obj
+        .get_mut("UserPromptSubmit")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("`hooks.UserPromptSubmit` in {filename} is not an array"))?;
+    prompt_arr.retain(|e| !is_challenge(e));
+    prompt_arr.push(challenge_hook);
 
     let rendered = serde_json::to_string_pretty(&Value::Object(root_obj))?;
     std::fs::write(&settings_path, rendered)
@@ -885,11 +975,19 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
     let filename = if shared { "settings.json" } else { "settings.local.json" };
     match outcome {
         HookOutcome::Written => println!(
-            "Wrote .claude/{filename} — cortex compact_output hook installed on PostToolUse(Bash).\n\
-             It losslessly strips build/test progress noise (stdout + stderr) and tees the full \
-             log to .cortex/tee/. Restart Claude Code (or reload the session) for it to take effect.\n\
-             Note: this is a Claude Code hook. VS Code Copilot cannot auto-rewrite tool output — \
-             it can still call the compact_output MCP tool directly (exposed via .vscode/mcp.json)."
+            "Wrote .claude/{filename} — three cortex hooks installed:\n\
+             \x20 compact_output on PostToolUse(Bash) — losslessly strips build/test progress \
+             noise (stdout + stderr) and tees the full log to .cortex/tee/.\n\
+             \x20 edit_guard on PostToolUse(Edit|Write) — names a recorded trap when an edit \
+             touches one. Silent otherwise, and capped at one warning per file and four per \
+             session, so it cannot become wallpaper.\n\
+             \x20 note_challenge on UserPromptSubmit — records that a claim was disputed, so a \
+             correction cannot be quietly dropped by the party that received it. Records a \
+             QUESTION, never a finding: nothing reaches memory until someone checks who was \
+             right, and even then it arrives as a proposal.\n\
+             Restart Claude Code (or reload the session) for them to take effect.\n\
+             Note: these are Claude Code hooks. VS Code Copilot cannot auto-rewrite tool output \
+             or observe edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
         ),
         HookOutcome::AlreadyPresent => {
             println!("cortex compact_output hook already present in .claude/{filename} — no change.")
@@ -922,9 +1020,20 @@ fn auto_install_hook_on_serve(repo: &Path) {
     if !is_claude_code_context(repo) {
         return; // Copilot / unknown host — the MCP tool is still available.
     }
-    let sentinel = repo.join(".cortex").join(".claude-hooks-installed");
+    // The sentinel is versioned. Without that, adding a hook ships it to nobody:
+    // every machine that ever ran cortex already has the unversioned sentinel,
+    // so the install is skipped forever and the new mechanism reports NEVER in
+    // the audit with no explanation. Bump this whenever the hook set changes.
+    const HOOK_SET_VERSION: u32 = 2; // 2: added note_challenge on UserPromptSubmit
+    let cortex_dir = repo.join(".cortex");
+    let sentinel = cortex_dir.join(format!(".claude-hooks-installed.v{HOOK_SET_VERSION}"));
     if sentinel.exists() {
-        return; // Already handled once — respect the user's later edits.
+        return; // This hook set already handled — respect the user's later edits.
+    }
+    // Clear the previous generation's marker so it cannot accumulate.
+    let _ = std::fs::remove_file(cortex_dir.join(".claude-hooks-installed"));
+    for old in 1..HOOK_SET_VERSION {
+        let _ = std::fs::remove_file(cortex_dir.join(format!(".claude-hooks-installed.v{old}")));
     }
     // Personal, git-ignored settings: the hook targets THIS machine's cortex
     // server, so it must not be committed into a teammate's checkout.
@@ -2580,6 +2689,8 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
                 crystallizer::add_pattern(&store, &name, &intent, &body, uses, tags),
             PatternCmd::Remove { id } => crystallizer::remove_pattern(&store, id),
             PatternCmd::Revert { id } => crystallizer::report_revert(&store, id),
+            PatternCmd::Supersede { id, by } => run_supersede(&store, "patterns", id, by),
+            PatternCmd::Retired => run_retired(&store, "patterns"),
             PatternCmd::Health => crystallizer::list_pattern_health(&store),
         };
     }
@@ -2612,6 +2723,11 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
             store.pattern_reverted(id)?;
             print_json(&json!({"ok": true, "action": "revert", "id": id}))
         }
+        PatternCmd::Supersede { id, by } => {
+            let n = store.supersede("patterns", id, by)?;
+            print_json(&json!({"ok": n > 0, "action": "supersede", "id": id, "by": by}))
+        }
+        PatternCmd::Retired => print_json(&store.superseded_rows("patterns")?),
         PatternCmd::Health => {
             let rows = store.pattern_health_rows()?;
             let health: Vec<_> = rows
@@ -2639,6 +2755,8 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
             AntiPatternCmd::Add { description, wrong, correct, tags } =>
                 crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags),
             AntiPatternCmd::Remove { id } => crystallizer::remove_anti_pattern(&store, id),
+            AntiPatternCmd::Supersede { id, by } => run_supersede(&store, "anti_patterns", id, by),
+            AntiPatternCmd::Retired => run_retired(&store, "anti_patterns"),
         };
     }
 
@@ -2662,7 +2780,42 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
             store.delete_anti_pattern(id)?;
             print_json(&json!({"ok": true, "action": "remove", "id": id}))
         }
+        AntiPatternCmd::Supersede { id, by } => {
+            let n = store.supersede("anti_patterns", id, by)?;
+            print_json(&json!({"ok": n > 0, "action": "supersede", "id": id, "by": by}))
+        }
+        AntiPatternCmd::Retired => print_json(&store.superseded_rows("anti_patterns")?),
     }
+}
+
+/// Retire one entry in favour of another, and say what happened.
+///
+/// The message names both sides because the destructive-looking half is the one
+/// that disappears from every future call, and a bare "ok" would not let anyone
+/// check that the right row went.
+fn run_supersede(store: &Store, table: &str, id: i64, by: i64) -> Result<()> {
+    let n = store.supersede(table, id, by)?;
+    if n == 0 {
+        println!("[cortex] {table} #{id} was already retired, or does not exist.");
+    } else {
+        println!("[cortex] {table} #{id} retired — superseded by #{by}.");
+        println!("         It stays in the database as history and will not be served again.");
+    }
+    Ok(())
+}
+
+fn run_retired(store: &Store, table: &str) -> Result<()> {
+    let rows = store.superseded_rows(table)?;
+    if rows.is_empty() {
+        println!("[cortex] no retired {table}.");
+        return Ok(());
+    }
+    println!("[cortex] {} retired {table}:", rows.len());
+    for (id, by, label) in rows {
+        let one_line: String = label.chars().take(88).collect();
+        println!("  #{id:<5} superseded by #{by:<5} {one_line}");
+    }
+    Ok(())
 }
 
 fn run_annotate(cmd: AnnotateCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
@@ -4237,14 +4390,26 @@ fn run_session_orphans(db_path: &Path) -> Result<()> {
     // never could have produced knowledge — counting them as lost work turns a
     // real signal into noise, which is how this reached 57 and got ignored.
     //
-    // Only a session that actually retrieved something had knowledge to lose.
+    // Only a session that actually retrieved something had knowledge to lose —
+    // AND that `test_signal` has not already scored.
+    //
+    // Those are different questions, and conflating them made this report
+    // measure the wrong one. `closeout_run` records whether someone called
+    // `closeout_session`; test-outcome scoring reads the verdict off the build
+    // instead, precisely so an unclosed session is no longer lost. Ignoring that
+    // reported a session as lost work in the same minute its verdict was
+    // written — `session_000000006a7f1600` appeared in this list and in
+    // `session_verdict` at once. A report that cries about work already
+    // recovered is a report people stop reading.
     let mut stmt = store.conn().prepare(
-        "SELECT session_key, started_at,
-                (delta_retrieved + preferences_loaded + anti_patterns_loaded + context_loaded) AS steps,
-                bootstrap_complete
-         FROM protocol_sessions
-         WHERE closeout_run = 0 AND started_at < ?1
-         ORDER BY started_at DESC"
+        "SELECT p.session_key, p.started_at,
+                (p.delta_retrieved + p.preferences_loaded + p.anti_patterns_loaded + p.context_loaded) AS steps,
+                p.bootstrap_complete
+         FROM protocol_sessions p
+         WHERE p.closeout_run = 0
+           AND p.started_at < ?1
+           AND NOT EXISTS (SELECT 1 FROM session_verdict v WHERE v.session_id = p.session_key)
+         ORDER BY p.started_at DESC"
     )?;
     let rows = stmt.query_map(rusqlite::params![grace], |r| {
         Ok((
@@ -4257,18 +4422,33 @@ fn run_session_orphans(db_path: &Path) -> Result<()> {
     let all: Vec<_> = rows.filter_map(|r| r.ok()).collect();
     let (worked, empty): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, _, steps, _)| *steps > 0);
 
-    if worked.is_empty() {
-        println!("[cortex] No sessions did work without a closeout.");
+    // Anything older than a month is archaeology: it pre-dates outcome scoring,
+    // nobody is going to close it, and it will never leave this list. Carrying
+    // it forever turns a live signal into a constant number people learn to
+    // read past — so it is counted, not enumerated.
+    let cutoff = chrono::Utc::now().timestamp() - 30 * 86_400;
+    let (recent, historical): (Vec<_>, Vec<_>) =
+        worked.into_iter().partition(|(_, ts, _, _)| *ts >= cutoff);
+
+    if recent.is_empty() {
+        println!("[cortex] No recent session did work without being scored.");
     } else {
         println!(
-            "[cortex] {} session(s) retrieved knowledge but never closed out:",
-            worked.len()
+            "[cortex] {} session(s) in the last 30 days retrieved knowledge, never closed out, \
+             and have no build verdict:",
+            recent.len()
         );
-        for (key, ts, steps, boot) in &worked {
+        for (key, ts, steps, boot) in &recent {
             let age = (chrono::Utc::now().timestamp() - ts) / 3600;
             let b = if *boot == 1 { ", bootstrap complete" } else { "" };
             println!("  {key} ({age}h ago, {steps}/4 baseline steps{b})");
         }
+    }
+    if !historical.is_empty() {
+        println!(
+            "[cortex] {} older session(s) pre-date outcome scoring — not actionable, not listed.",
+            historical.len()
+        );
     }
     if !empty.is_empty() {
         println!(
@@ -4293,9 +4473,15 @@ fn run_health_report(db_path: &Path) -> Result<()> {
     // with one real session — a number nobody could act on, which is the same
     // as no number at all.
     let orphans: i64 = store.conn().query_row(
-        "SELECT COUNT(*) FROM protocol_sessions
-          WHERE closeout_run=0 AND started_at < (unixepoch()-7200)
-            AND (delta_retrieved + preferences_loaded + anti_patterns_loaded + context_loaded) > 0",
+        // Same two corrections as `session-orphans`: a session `test_signal`
+        // already scored is not lost work whatever `closeout_run` says, and a
+        // session older than the scoring mechanism is not actionable.
+        "SELECT COUNT(*) FROM protocol_sessions p
+          WHERE p.closeout_run=0
+            AND p.started_at < (unixepoch()-7200)
+            AND p.started_at >= (unixepoch()-2592000)
+            AND (p.delta_retrieved + p.preferences_loaded + p.anti_patterns_loaded + p.context_loaded) > 0
+            AND NOT EXISTS (SELECT 1 FROM session_verdict v WHERE v.session_id = p.session_key)",
         [], |r| r.get(0)
     ).unwrap_or(0);
     let gaps: i64 = store.conn().query_row(

@@ -1,16 +1,57 @@
 # Cortex Suite
 
-Two local MCP servers that give a coding agent reliable knowledge of your Rust
-codebase. No network calls, no API keys, no telemetry.
+Two local MCP servers that give a coding agent reliable knowledge of your
+codebase — in **ten languages**, including the calls that cross between them.
+No network calls, no API keys, no telemetry.
 
 | | Owns | How it stays true |
 |---|---|---|
-| **quartz-ctx** | **Structure** — what the code *is*: types, signatures, enum variants, trait impls, `file:line` | parsed live from source, auto-reloads within ~5s of an edit |
+| **quartz-ctx** | **Structure** — what the code *is*: types, signatures, enum variants, interfaces, `file:line` | parsed live from source, auto-reloads within ~5s of an edit |
 | **cortex** | **Judgment** — what you *learned*: patterns, anti-patterns, decisions, corrections | SQLite, grown from your sessions |
 
 The split is enforced, not conventional: quartz-ctx holds no hand-written
-knowledge, and cortex no longer parses Rust itself — it ingests quartz-ctx's
+knowledge, and cortex no longer parses code itself — it ingests quartz-ctx's
 output, so both are fed by one extractor and cannot disagree about what a type is.
+
+## Languages
+
+Rust through `syn`; Python, TypeScript, JavaScript, Go, Java, C#, C/C++, Ruby and
+PHP through tree-sitter. Every front end feeds the **same** project-wide
+resolution pass, so a Go method whose receiver type is three files away, a C++
+member defined out of line in a `.cpp`, and a C# `partial` half all reach their
+type. Interfaces and base classes populate trait-implementation lookups, and call
+edges are extracted for every language.
+
+Each item carries what it is **and where it came from** — language, source root,
+`file:line` — so `Canvas` the Rust struct and `Canvas` the TypeScript class are
+never confused. When several declarations share a name, you get all of them with
+their provenance rather than whichever happened to be first.
+
+Confidence is a three-way tag, not a boolean: `resolved` (a real front end agreed
+the types are these types) → `name_resolved` (cross-file linking by name, no type
+inference) → `ast_only`. An agent cannot calibrate what it is told if everything
+arrives with the same authority.
+
+### Calls that cross the language boundary
+
+A call graph that stops at the language boundary stops where the interesting
+questions start. `trace_across_languages` joins HTTP routes to the
+`fetch`/`axios`/`requests` calls that hit them, and wasm/FFI exports to the code
+that imports them, naming the item at each end.
+
+Path parameters normalise across every syntax, so FastAPI's
+`/api/models/{model_path:path}/animation` matches a JavaScript template literal
+`` `/api/models/${modelPath}/animation` ``. FFI keys fold case and underscores,
+because wasm-bindgen renames `auto_detect_chains` to `autoDetectChains`.
+
+**The unmatched halves are reported too**, and they are usually the finding: a
+call with no route behind it (a rename applied on one side only), a route nothing
+calls, a caller using a verb the route does not declare. No single-language tool
+can see those — the compiler included — because neither side is wrong on its own.
+
+```
+quartz-ctx boundaries --source .
+```
 
 ## Install
 

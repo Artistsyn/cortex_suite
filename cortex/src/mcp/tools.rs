@@ -33,7 +33,6 @@ pub fn dispatch(
         "query_graph"          => tool_query_graph(args, store, session_id),
         "explain_dependency_path" => tool_explain_dependency_path(args, store, session_id),
         "get_preferences"      => tool_get_preferences(args, prefs_summary),
-        "recurrent_think"      => tool_recurrent_think(args, store),
         "simulate_change"      => tool_simulate_change(args, store, session_id),
         "recall"               => tool_recall(args, store, units, sessions, session_id),
         "list_patterns"        => tool_list_patterns(args, store, session_id),
@@ -51,10 +50,163 @@ pub fn dispatch(
         // Lossless output compaction: post-processes output the agent already
         // obtained through the normal (permissioned) Bash path. No execution.
         "compact_output"          => tool_compact_output(args, store, session_id, repo_root),
+        "edit_guard"              => tool_edit_guard(args, store, session_id),
+        "note_challenge"          => tool_note_challenge(args, store, session_id),
+        "resolve_challenge"       => tool_resolve_challenge(args, store),
         other                  => Err(format!("unknown tool: {other}")),
     }?;
 
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+}
+
+// ── user corrections ────────────────────────────────────────────────────────
+
+/// Note a challenge, and — only when one fires — say the one thing the agent
+/// needs to hear.
+///
+/// The returned text is injected into the conversation by the UserPromptSubmit
+/// hook, so it has to earn its place. It is empty for almost every message. When
+/// it is not, it is deliberately a reminder to *check*, not a reminder to record:
+/// the failure this guards against is settling an argument from memory of the
+/// argument.
+fn tool_note_challenge(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
+    let prompt = args["prompt"].as_str().unwrap_or("");
+    if prompt.is_empty() {
+        return Ok(String::new());
+    }
+    // An uninterpolated template arrives as the literal `${prompt}`. Silence
+    // here would look exactly like "no challenges were ever raised" — the
+    // failure mode this project keeps shipping. Say it out loud instead.
+    if prompt.trim_start().starts_with("${") {
+        return Ok(format!(
+            "[cortex] note_challenge received an uninterpolated template ({}). \
+             The UserPromptSubmit hook is installed but its input variable is wrong, \
+             so no correction will ever be recorded. Fix the `input` mapping in \
+             .claude/settings.local.json.",
+            prompt.trim()
+        ));
+    }
+    let outcome = crate::corrections::note(store, session_id, prompt);
+    // Beat before branching: the heartbeat is about the HOOK running, and it
+    // must be recorded on the silent path too — that is the only path there is,
+    // almost always.
+    let _ = crate::corrections::beat(store, matches!(outcome, Ok(Some(_))));
+
+    match outcome {
+        Ok(Some(id)) => Ok(format!(
+            "[cortex] That reads as a challenge to something you said. Settle it by \
+             CHECKING — run the command, read the file — not from memory of the \
+             exchange, then call resolve_challenge(id={id}, ...). If it never gets \
+             settled, `unresolved` is the honest answer and stores nothing."
+        )),
+        // Already noted, or not a challenge. Both are silent.
+        Ok(None) => Ok(String::new()),
+        // A logging failure must never block the user's message.
+        Err(_) => Ok(String::new()),
+    }
+}
+
+fn tool_resolve_challenge(args: &Value, store: &Store) -> Result<String, String> {
+    let id = args["id"].as_i64().ok_or("missing `id`")?;
+    let raw = args["verdict"].as_str().ok_or("missing `verdict`")?;
+    let verdict = crate::corrections::Verdict::parse(raw).ok_or_else(|| {
+        format!("unknown verdict `{raw}` — use user_right, agent_right, mixed, or unresolved")
+    })?;
+    let subject = args["subject"].as_str().unwrap_or("").trim();
+    let evidence = args["evidence"].as_str().unwrap_or("");
+
+    if subject.is_empty() {
+        return Err("missing `subject` — state in one sentence what is actually true".into());
+    }
+    crate::corrections::resolve(store, id, verdict, subject, evidence)
+        .map_err(|e| e.to_string())
+}
+
+// ── edit_guard ──────────────────────────────────────────────────────────────
+
+/// Never warn about the same trap twice in one session.
+/// Never warn more than this many times in one session, whatever matches.
+const EDIT_GUARD_SESSION_CAP: usize = 4;
+/// An unsolicited warning has to clear a higher bar than an asked-for one.
+const EDIT_GUARD_MIN_SCORE: usize = 3;
+
+/// Surface a known trap AT THE MOMENT OF THE EDIT, not at session boot.
+///
+/// Retrieval is pull: a trap in the store only helps if the agent thinks to ask,
+/// and the moment it is least likely to ask is the moment it is most sure — the
+/// recorded anti-pattern "check cortex when most confident" exists because that
+/// is when the checking stops. This is the same knowledge, pushed.
+///
+/// The whole design problem is not finding matches, it is NOT SPEAKING. A hook
+/// that fires on every edit is wallpaper within a session: this very project has
+/// a hook that printed "No preview server is running" on some fifteen
+/// consecutive edits, useful once and ignored thereafter — and an ignored
+/// warning is worse than none, because it trains the reader to skip the next.
+///
+/// So: at most one trap per edit, never the same trap twice in a session, at
+/// most four in total, and a match threshold higher than ordinary retrieval
+/// uses. Silence is the expected outcome and returns an empty string.
+fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
+    // Edit sends new_string; Write sends content. Either may be absent.
+    let added = args
+        .get("added")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| args.get("content").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    // A one-line tweak carries no context to judge; matching it produces noise.
+    if added.len() < 120 {
+        return Ok(String::new());
+    }
+
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    // One warning per file per session. "Never the same trap twice" is not
+    // enough on its own: a file gets edited fifteen times in a row during real
+    // work, and a fresh trap on each of those edits is the wallpaper outcome by
+    // a slower route. Caught by a test that expected silence and got a warning.
+    if store.edit_guard_warned_file(session_id, file_path).unwrap_or(false) {
+        return Ok(String::new());
+    }
+    let already = store.edit_guard_fired_ids(session_id).unwrap_or_default();
+    if already.len() >= EDIT_GUARD_SESSION_CAP {
+        return Ok(String::new());
+    }
+
+    // Score the ADDED text against each trap. `wrong` carries the shape to
+    // avoid, so it is the part worth matching; the description gives the topic.
+    let tokens = hint_tokens(added);
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
+    let best = aps
+        .iter()
+        .filter(|ap| ap.id.is_some_and(|id| !already.contains(&id)))
+        .map(|ap| {
+            let hay =
+                format!("{} {} {}", ap.description, ap.wrong, ap.tags.join(" ")).to_lowercase();
+            (text_hint_score(&hay, &tokens), ap)
+        })
+        .filter(|(s, _)| *s >= EDIT_GUARD_MIN_SCORE)
+        .max_by_key(|(s, _)| *s);
+
+    let Some((score, ap)) = best else { return Ok(String::new()) };
+    let Some(id) = ap.id else { return Ok(String::new()) };
+    let _ = store.record_edit_guard_fire(session_id, id, file_path);
+
+    // Short by construction. The point is to interrupt, not to teach; the full
+    // entry is one get_anti_patterns call away and the description names it.
+    let file = if file_path.is_empty() { "this edit" } else { file_path };
+    let file = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    Ok(format!(
+        "[cortex] {file} touches a recorded trap (match {score}):\n  {}\n  → {}\n",
+        ap.description.trim(),
+        ap.correct.trim(),
+    ))
 }
 
 // ── compact_output ──────────────────────────────────────────────────────────
@@ -90,6 +242,30 @@ fn tool_compact_output(
 
     if raw.is_empty() {
         return Ok(String::new());
+    }
+
+    // Score the session's knowledge from this run, if it was a build or test.
+    //
+    // This is the point where the evidence already arrives: the hook hands over
+    // stdout and stderr for every command, and until now the only thing taken
+    // from a test run was how many characters it saved. Reading the verdict here
+    // costs one substring scan and removes the dependency on anyone remembering
+    // to close the session out.
+    if let Some(passed) = crate::test_signal::classify(command, &raw) {
+        if !passed {
+            // Count it by identity. A single failure is not knowledge; the same
+            // failure across sessions is.
+            let _ = crate::test_signal::note_failure(store, session_id, command, &raw);
+        }
+        match crate::test_signal::observe(store, session_id, command, passed) {
+            Ok(n) if n > 0 => eprintln!(
+                "[cortex] test signal: {} → {} pattern(s) rescored",
+                if passed { "pass" } else { "fail" },
+                n
+            ),
+            Err(e) => eprintln!("[cortex] test signal: could not record: {e}"),
+            _ => {}
+        }
     }
 
     let kind = crate::output_filter::detect_command(command);
@@ -791,17 +967,35 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
     let detail = pattern_detail_tier(args);
     let detail_is_summary = detail == "summary";
     let tokens = args.get("hint").and_then(|v| v.as_str()).map(hint_tokens).unwrap_or_default();
+
+    // Rank first, then expand at most MAX_EXPANDED_ENTRIES of them. This call
+    // reached 71,633 characters on the live store with a broad hint and was
+    // rejected by the transport, so the mandatory pre-code check failed with an
+    // error rather than an answer. An unbounded response is not a large
+    // response; it is an absent one.
+    let threshold = hint_expand_threshold(&tokens);
+    let mut ranked: Vec<(usize, usize)> = patterns
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let hay =
+                format!("{} {} {} {}", p.name, p.intent, p.body, p.uses.join(" ")).to_lowercase();
+            (i, text_hint_score(&hay, &tokens))
+        })
+        .filter(|(_, s)| *s >= threshold)
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    let over_cap = ranked.len().saturating_sub(MAX_EXPANDED_ENTRIES);
+    let chosen: std::collections::HashSet<usize> =
+        ranked.into_iter().take(MAX_EXPANDED_ENTRIES).map(|(i, _)| i).collect();
+
     let mut out = format!("{} approved pattern(s):\n\n", patterns.len());
     let mut expanded = 0usize;
-    for p in &patterns {
+    for (idx, p) in patterns.iter().enumerate() {
         // A pattern relevant to the stated task gets its body preview even at
         // the summary tier — the saving should come from the ones you are not
         // about to use, not from the one you are.
-        let relevant = !tokens.is_empty() && {
-            let hay = format!("{} {} {} {}",
-                p.name, p.intent, p.body, p.uses.join(" ")).to_lowercase();
-            tokens.iter().any(|t| hay.contains(t.as_str()))
-        };
+        let relevant = chosen.contains(&idx);
         let detail = if relevant && detail == "summary" { expanded += 1; "standard" } else { detail };
         let marker = if p.survival_rate < 0.4 {
             "⚠"
@@ -864,6 +1058,29 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
             if expanded > 0 { format!(", {expanded} expanded as relevant") } else { String::new() },
         ));
     }
+    if over_cap > 0 {
+        out.push_str(&format!(
+            "({over_cap} further patterns also matched but were not expanded — the \
+             {MAX_EXPANDED_ENTRIES} closest to your hint are shown.)\n"
+        ));
+    }
+
+    // Last line of defence. The ranking and the cap should already keep this
+    // well under the limit, but a `detail=full` call over a store that keeps
+    // growing must degrade to a shorter answer rather than to a transport error.
+    if out.len() > MAX_RESPONSE_CHARS {
+        let keep = out
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_RESPONSE_CHARS)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        out.truncate(keep);
+        out.push_str(
+            "\n\n[truncated: this response hit the size limit. Pass a narrower hint, \
+             or detail=\"summary\", to see the rest.]\n",
+        );
+    }
 
     // A hint is mandatory now, so it can no longer be absent — but it can still
     // tokenise to nothing (all stop-words, or terms no pattern uses). Say which
@@ -882,6 +1099,17 @@ Note: your hint matched no pattern, so nothing was expanded and no              
 // ── get_anti_patterns ─────────────────────────────────────────────────────────
 
 /// Words too common to discriminate between anti-patterns.
+/// The most entries any one call will expand to full remedy or body text.
+///
+/// Chosen against the live store: a well-aimed hint matches a handful, and the
+/// calls that blew past the transport limit matched 60+. Twelve is generous for
+/// the first and impossible for the second.
+const MAX_EXPANDED_ENTRIES: usize = 12;
+
+/// Hard ceiling on a single tool response, below the transport's own limit so
+/// the failure is a readable truncation note instead of a rejected call.
+const MAX_RESPONSE_CHARS: usize = 48_000;
+
 const HINT_STOPWORDS: &[&str] = &[
     "the", "and", "for", "with", "that", "this", "from", "into", "when",
     "code", "function", "write", "writing", "add", "adding", "new", "make",
@@ -889,20 +1117,62 @@ const HINT_STOPWORDS: &[&str] = &[
 
 /// Tokens from a task hint, lowercased, short and common words removed.
 fn hint_tokens(hint: &str) -> Vec<String> {
-    hint.split(|c: char| !c.is_alphanumeric() && c != '_')
+    let mut v: Vec<String> = hint
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
         .map(|w| w.to_lowercase())
         .filter(|w| w.len() >= 4 && !HINT_STOPWORDS.contains(&w.as_str()))
-        .collect()
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The number of DISTINCT hint tokens a body of text mentions, matched on word
+/// boundaries rather than as bare substrings.
+///
+/// Substring matching over one concatenated haystack is what made expansion
+/// useless. `contains("size")` fires on "resize", "sizes" and "size_hint";
+/// `contains("roll")` fires on "controlled" and "scrolling". Measured on the
+/// live store, the hint "rust sqlite ALTER TABLE migration add column, MCP tool
+/// response size budget" expanded 61 of 193 anti-patterns, among them GIF frame
+/// compositing, MSAA, and Slint string literals -- roughly 30,000 characters of
+/// content that had nothing to do with the task, which is worse than no
+/// expansion because it buries the entries that DO apply.
+///
+/// A short token must match a whole word. A longer one (>= 6 chars) may match a
+/// prefix, so "migration" still finds "migrations" and "migrating" without
+/// "size" finding "resize".
+fn text_hint_score(haystack: &str, tokens: &[String]) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let words: std::collections::HashSet<&str> = haystack
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    tokens
+        .iter()
+        .filter(|t| {
+            words.contains(t.as_str())
+                || (t.len() >= 6 && words.iter().any(|w| w.len() >= t.len() && w.starts_with(t.as_str())))
+        })
+        .count()
+}
+
+/// The score at which an entry is worth expanding.
+///
+/// One incidental word in common is not evidence of relevance; with a hint of
+/// any substance, two are. A one- or two-token hint has nothing to spare, so it
+/// keeps the old bar.
+fn hint_expand_threshold(tokens: &[String]) -> usize {
+    if tokens.len() >= 3 { 2 } else { 1 }
 }
 
 /// How many distinct hint tokens this anti-pattern mentions.
 fn hint_score(ap: &crate::model::AntiPattern, tokens: &[String]) -> usize {
-    if tokens.is_empty() {
-        return 0;
-    }
     let hay = format!("{} {} {} {}", ap.description, ap.wrong, ap.correct, ap.tags.join(" "))
         .to_lowercase();
-    tokens.iter().filter(|t| hay.contains(t.as_str())).count()
+    text_hint_score(&hay, tokens)
 }
 
 /// Every anti-pattern, every time — but the remedy text only where it earns
@@ -939,13 +1209,33 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&chrono::Utc));
 
+    // Which entries earn their remedy text, decided across the WHOLE set before
+    // anything is printed rather than one row at a time.
+    //
+    // Two separate limits, because they fail differently. The threshold keeps
+    // incidental word matches out; the cap keeps a hint that legitimately
+    // matches half the store from producing a response nobody can read -- and,
+    // at 71,633 characters measured on list_patterns, one the transport rejects
+    // outright, which turns the mandatory pre-code check into an error.
+    let threshold = hint_expand_threshold(&tokens);
+    let mut ranked: Vec<(usize, usize)> = aps
+        .iter()
+        .enumerate()
+        .map(|(i, ap)| (i, hint_score(ap, &tokens)))
+        .filter(|(_, s)| *s >= threshold)
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    let over_cap = ranked.len().saturating_sub(MAX_EXPANDED_ENTRIES);
+    let chosen: std::collections::HashSet<usize> =
+        ranked.into_iter().take(MAX_EXPANDED_ENTRIES).map(|(i, _)| i).collect();
+
     let now = chrono::Utc::now();
     let mut out = String::new();
     let mut expanded = 0usize;
     let mut listed = 0usize;
     let mut unchanged = 0usize;
 
-    for ap in &aps {
+    for (idx, ap) in aps.iter().enumerate() {
         // Telemetry is recorded for EVERY entry, shown or not. Only targeted
         // retrievals feed pattern-survival scoring, so suppressing the log for
         // omitted entries would quietly starve the very signal the required
@@ -954,7 +1244,7 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
             let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "get_anti_patterns");
         }
 
-        let relevant = hint_score(ap, &tokens) > 0;
+        let relevant = chosen.contains(&idx);
 
         // An unchanged entry is omitted only when it is ALSO not hint-relevant:
         // the caller asked about this topic, so the remedy is what they came for
@@ -1000,6 +1290,12 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
             "
 ({listed} listed by description only — their wrong/correct text is one call away:              get_anti_patterns with hint=\"<what you are writing>\", or detail=\"full\" for all of them.)
 "
+        ));
+    }
+    if over_cap > 0 {
+        body.push_str(&format!(
+            "\n({over_cap} further entries also matched but were not expanded — the {MAX_EXPANDED_ENTRIES} \
+             closest to your hint are shown. Narrow the hint to reach the rest.)\n"
         ));
     }
 
@@ -1233,94 +1529,6 @@ fn augment_hint(hint: &str, units: &[CodeUnit]) -> String {
     }
 }
 
-// ── recurrent_think ───────────────────────────────────────────────────────────
-
-fn tool_recurrent_think(args: &Value, store: &Store) -> Result<String, String> {
-    let task = args["task"].as_str().ok_or("missing `task`")?;
-    let hypothesis = args["hypothesis"].as_str();
-    let loop_index = args["loop"].as_u64().unwrap_or(0) as u8;
-    let depth_mode = args["depth_mode"].as_str().unwrap_or("auto");
-    let session_key = args["session_key"].as_str();
-    let max_loops = match depth_mode {
-        "shallow" => 2u8,
-        "deep" => args["max_loops"].as_u64().unwrap_or(12).min(16) as u8,
-        _ => args["max_loops"].as_u64().unwrap_or(6).min(16) as u8,
-    };
-
-    // Load persisted scratchpad from SQLite or initialize a new one.
-    // session_key scopes the scratchpad — different sessions with the same task
-    // get distinct scratchpads (Phase 4).
-    let mut scratchpad =
-        crate::reasoner::scratchpad::load_from_db(store.conn(), task, session_key)
-            .map_err(|e| format!("Failed to load scratchpad: {}", e))?
-            .unwrap_or_else(|| crate::reasoner::scratchpad::Scratchpad::new(task, session_key));
-
-    // Add hypothesis if provided. If this is the first invocation and no hypothesis
-    // was provided, seed one from task text so the loop can critique/refine.
-    if let Some(h) = hypothesis {
-        let next_loop = if loop_index == 0 {
-            scratchpad.loop_index.saturating_add(1).max(1)
-        } else {
-            loop_index
-        };
-        scratchpad
-            .add_hypothesis(next_loop, h)
-            .map_err(|e| format!("Failed to add hypothesis: {}", e))?;
-    } else if scratchpad.hypotheses.is_empty() {
-        scratchpad
-            .add_hypothesis(1, &format!("Initial hypothesis for task: {task}"))
-            .map_err(|e| format!("Failed to seed hypothesis: {}", e))?;
-    }
-
-    if scratchpad.hypotheses.is_empty() {
-        return Ok(
-            "No hypothesis available yet. Call recurrent_think again with a `hypothesis` argument to begin critique/refine loops."
-                .to_string(),
-        );
-    }
-
-    let active_loop = scratchpad.loop_index.max(1);
-
-    // Run critique + refine cycle
-    let context = crate::reasoner::recurrent::run_recurrent_loop(
-        &mut scratchpad,
-        store.conn(),
-        active_loop,
-        max_loops,
-    ).map_err(|e| format!("Recurrent loop failed: {}", e))?;
-
-    // Persist scratchpad
-    crate::reasoner::scratchpad::save_to_db(store.conn(), &scratchpad)
-        .map_err(|e| format!("Failed to save scratchpad: {}", e))?;
-
-    // Return context
-    let mut output = format!(
-        "=== RECURRENT THINKING (Loop {}) ===\n\n\
-         Confidence: {:.0}%\n\
-         Depth Mode: {}\n\
-         Continue: {}\n\n",
-        context.loop_index,
-        context.confidence * 100.0,
-        depth_mode,
-        context.should_continue
-    );
-
-    if !context.critiques.is_empty() {
-        output.push_str("Critiques:\n");
-        for c in &context.critiques {
-            output.push_str(&format!("  • {}\n", c));
-        }
-        output.push('\n');
-    }
-
-    if let Some(reason) = &context.halt_reason {
-        output.push_str(&format!("HALTED: {}\n\n", reason));
-    }
-
-    output.push_str(&format!("Next Prompt:\n{}", context.next_prompt));
-
-    Ok(output)
-}
 
 // ── simulate_change ────────────────────────────────────────────────────────────
 
@@ -1713,11 +1921,35 @@ fn review_queue_line(store: &Store) -> String {
         )
         .unwrap_or(0);
 
-    if drafted.is_empty() && proposals == 0 {
+    // Failures that keep coming back. Three distinct sessions is the bar: it
+    // cannot be reached by one bad afternoon of iterating on a single fix, and
+    // anything that clears it has survived being fixed twice already.
+    let repeats = crate::test_signal::recurring(store, 3).unwrap_or_default();
+
+    // Disagreements nobody settled. Listed for the AGENT more than the human:
+    // an open challenge is a correction that was received and dropped, and the
+    // agent that dropped it is the one least likely to remember.
+    let open = crate::corrections::open_count(store).unwrap_or(0);
+
+    if drafted.is_empty() && proposals == 0 && repeats.is_empty() && open == 0 {
         return String::new();
     }
 
     let mut out = String::from("\n\nAWAITING YOUR REVIEW\n");
+    if open > 0 {
+        out.push_str(&format!(
+            "  {open} unsettled challenge(s) — someone disputed a claim and it was \
+             never checked\n    settle each by checking, then resolve_challenge(id, verdict, \
+             subject, evidence)\n"
+        ));
+    }
+    for (sig, count, sample) in &repeats {
+        let first = sample.lines().next().unwrap_or("").trim();
+        out.push_str(&format!(
+            "  recurring failure `{sig}` — hit in {count} sessions\n    {first}\n    \
+             worth recording as a trap? cortex anti-pattern add ...\n"
+        ));
+    }
     if !drafted.is_empty() {
         out.push_str(&format!(
             "  {} skill draft(s): {}\n    approve: cortex skill-approve <name>   reject: cortex skill-reject <name>\n",
@@ -1766,6 +1998,12 @@ fn tool_get_session_health(
 
     // Anything that needs a human decision, on the surface a human actually sees.
     report.push_str(&review_queue_line(store));
+
+    // Whatever has quietly stopped working. Silent when everything is live, so
+    // this can sit here every session without becoming noise — and when it is
+    // not silent, it is naming a mechanism that is doing nothing while looking
+    // fine, which is this project's most repeated failure.
+    report.push_str(&crate::audit::render_problems(&crate::audit::read_all(store)));
     Ok(report)
 }
 
@@ -2549,14 +2787,124 @@ mod delta_mode_tests {
             "SELECT COUNT(*) FROM session_retrieval_log WHERE session_id = ?1",
             rusqlite::params![session], |r| r.get(0),
         ).expect("session_retrieval_log query");
+        // LIVE rows only. A superseded entry is not served, so crediting it as
+        // retrieved would feed survival scoring for knowledge nobody can act on.
         let recorded: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM anti_patterns", [], |r| r.get(0),
+            "SELECT COUNT(*) FROM anti_patterns WHERE superseded_by IS NULL", [], |r| r.get(0),
         ).expect("anti_patterns count");
         assert_eq!(
             total, recorded,
-            "every anti-pattern must be logged as retrieved even when omitted from the text",
+            "every live anti-pattern must be logged as retrieved even when omitted from the text",
         );
         let _ = store.conn().execute(
             "DELETE FROM session_retrieval_log WHERE session_id = ?1", rusqlite::params![session]);
     }
+    // ── hint precision and response bounds ────────────────────────────────────
+
+    #[test]
+    fn a_hint_token_must_match_a_whole_word_not_a_substring() {
+        let t = hint_tokens("resize buffer");
+        // "size" must not be recovered from "resize"; that class of accidental
+        // match is what expanded 61 of 193 entries on an unrelated hint.
+        assert_eq!(text_hint_score("the size of the thing", &["resize".to_string()]), 0);
+        assert_eq!(text_hint_score("we resize the buffer", &t), 2);
+    }
+
+    #[test]
+    fn a_long_token_still_matches_its_own_plural_and_participle() {
+        let t = vec!["migration".to_string()];
+        assert_eq!(text_hint_score("run the migrations", &t), 1);
+        assert_eq!(text_hint_score("migrating the schema", &t), 0, "not a prefix of the token");
+        assert_eq!(text_hint_score("a migration ran", &t), 1);
+    }
+
+    #[test]
+    fn a_short_token_does_not_get_prefix_matching() {
+        // "roll" finding "controlled" and "rolled" is how a thumb question
+        // returned Crystalline physics.
+        assert_eq!(text_hint_score("manually controlled object", &["roll".to_string()]), 0);
+        assert_eq!(text_hint_score("an axial roll", &["roll".to_string()]), 1);
+    }
+
+    #[test]
+    fn a_substantial_hint_needs_two_matches_before_anything_expands() {
+        let many = hint_tokens("sqlite migration column budget");
+        assert!(many.len() >= 3);
+        assert_eq!(hint_expand_threshold(&many), 2);
+        // A short hint has nothing to spare and keeps the single-match bar.
+        assert_eq!(hint_expand_threshold(&hint_tokens("grapple")), 1);
+    }
+
+    #[test]
+    fn distinct_tokens_are_counted_once_however_often_they_repeat() {
+        let t = hint_tokens("cache cache cache");
+        assert_eq!(t.len(), 1);
+        assert_eq!(text_hint_score("cache cache cache cache", &t), 1);
+    }
+
+    // ── edit guard: the tests are about staying quiet ─────────────────────────
+
+    #[test]
+    fn a_small_edit_says_nothing() {
+        let Some(store) = live_store() else { return };
+        let out = tool_edit_guard(
+            &serde_json::json!({ "file_path": "a.rs", "added": "let x = 1;" }),
+            &store,
+            "test_guard_small",
+        )
+        .unwrap();
+        assert!(out.is_empty(), "a one-liner has no context to judge: {out}");
+    }
+
+    #[test]
+    fn an_edit_that_matches_nothing_says_nothing() {
+        let Some(store) = live_store() else { return };
+        let prose = "the quick brown fox jumps over the lazy dog ".repeat(6);
+        let out = tool_edit_guard(
+            &serde_json::json!({ "file_path": "a.txt", "added": prose }),
+            &store,
+            "test_guard_nomatch",
+        )
+        .unwrap();
+        assert!(out.is_empty(), "unrelated text must be silent: {out}");
+    }
+
+    #[test]
+    fn the_same_trap_is_never_raised_twice_in_one_session() {
+        let Some(store) = live_store() else { return };
+        let session = format!("test_guard_dedupe_{}", std::process::id());
+        // Text drawn from a real recorded trap, so it scores.
+        let added = "engine.setHardwareScalingLevel and createPickingRay with \
+                     devicePixelRatio scaling of the canvas rect for the picking ray "
+            .repeat(3);
+        let args = serde_json::json!({ "file_path": "input.js", "added": added });
+
+        let first = tool_edit_guard(&args, &store, &session).unwrap();
+        let second = tool_edit_guard(&args, &store, &session).unwrap();
+        if !first.is_empty() {
+            assert!(second.is_empty(), "a repeated warning trains the reader to ignore it");
+        }
+        let _ = store.conn().execute(
+            "DELETE FROM edit_guard_fires WHERE session_id = ?1",
+            rusqlite::params![session],
+        );
+    }
+
+    #[test]
+    fn a_session_is_never_warned_more_than_the_cap() {
+        assert!(EDIT_GUARD_SESSION_CAP <= 5, "beyond a handful it is wallpaper");
+        assert!(
+            EDIT_GUARD_MIN_SCORE > hint_expand_threshold(&hint_tokens("a b c")),
+            "an unsolicited warning must clear a higher bar than an asked-for one",
+        );
+    }
+
+    #[test]
+    fn the_expansion_cap_is_small_enough_to_fit_the_transport() {
+        // The bound that matters: 12 entries of remedy text cannot approach the
+        // 71,633 chars that got list_patterns rejected outright.
+        assert!(MAX_EXPANDED_ENTRIES <= 16);
+        assert!(MAX_RESPONSE_CHARS < 60_000);
+    }
+
 }

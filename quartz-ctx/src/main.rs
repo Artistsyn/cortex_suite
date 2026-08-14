@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
+mod bridge;
 mod calls;
 mod discover;
 mod helpers;
@@ -70,6 +71,28 @@ enum Command {
     ///   quartz-ctx selfcheck --source quartz/src --name Quartz
     Selfcheck(SelfcheckArgs),
 
+    /// Show where one language calls another, and where it fails to.
+    ///
+    /// Joins HTTP routes to the fetch/axios/requests calls that hit them, and
+    /// wasm/FFI exports to the code that imports them. Reports the unmatched
+    /// halves too — a call with no route behind it is invisible to every
+    /// single-language tool, including the compiler, because neither side is
+    /// wrong on its own.
+    ///
+    /// Example:
+    ///   quartz-ctx boundaries --source vr_workspace/scene_editor_web
+    Boundaries(BoundariesArgs),
+}
+
+#[derive(Parser, Debug)]
+struct BoundariesArgs {
+    /// Root to scan (recursively).
+    #[arg(short, long, default_value = ".")]
+    source: PathBuf,
+
+    /// Only boundaries whose key contains this substring.
+    #[arg(long)]
+    filter: Option<String>,
 }
 
 // ── generate ──────────────────────────────────────────────────────────────────
@@ -235,6 +258,7 @@ fn main() -> Result<()> {
         Command::Generate(args) => run_generate(args),
         Command::Serve(args)    => run_serve(args),
         Command::Selfcheck(args)=> run_selfcheck(args),
+        Command::Boundaries(args)=> run_boundaries(args),
     }
 }
 
@@ -705,4 +729,54 @@ mod tests {
             assert!(names.contains(&expected), "method `{expected}` dropped; got {names:?}");
         }
     }
+}
+
+/// `quartz-ctx boundaries` — the cross-language map, from the terminal.
+fn run_boundaries(args: BoundariesArgs) -> Result<()> {
+    let boundaries = parser::scan_boundaries(&args.source);
+    let links = bridge::link(&boundaries);
+
+    let keep = |k: &str| args.filter.as_ref().map_or(true, |f| k.contains(f.as_str()));
+
+    let joined: Vec<_> = links.iter()
+        .filter(|l| l.provider.is_some() && !l.consumers.is_empty() && keep(&l.key))
+        .collect();
+    let dangling: Vec<_> = links.iter()
+        .filter(|l| l.provider.is_none() && !l.consumers.is_empty() && keep(&l.key))
+        .collect();
+    let unused: Vec<_> = links.iter()
+        .filter(|l| l.provider.is_some() && l.consumers.is_empty() && keep(&l.key))
+        .collect();
+
+    println!("{} joined, {} calls with no route, {} routes with no caller
+",
+             joined.len(), dangling.len(), unused.len());
+
+    for l in &joined {
+        let p = l.provider.as_ref().expect("filtered on provider");
+        let flag = if l.method_mismatch { "  [METHOD MISMATCH]" } else { "" };
+        println!("{}{}", l.label(), flag);
+        println!("    served by {} ({})", p.span, p.language);
+        for c in &l.consumers {
+            println!("    called from {} ({})", c.span, c.language);
+        }
+    }
+    if !dangling.is_empty() {
+        println!("
+CALLS WITH NO MATCHING ROUTE");
+        for l in &dangling {
+            for c in &l.consumers {
+                println!("  {}  <- {} ({})", l.label(), c.span, c.language);
+            }
+        }
+    }
+    if !unused.is_empty() {
+        println!("
+ROUTES NOT CALLED FROM INDEXED CODE ({})", unused.len());
+        for l in unused.iter().take(30) {
+            let p = l.provider.as_ref().expect("filtered on provider");
+            println!("  {}  ({})", l.label(), p.span);
+        }
+    }
+    Ok(())
 }

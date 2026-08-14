@@ -202,7 +202,7 @@ fn render_vocabulary(enums: &[&ApiItem], engine_name: &str, usage: &crate::usage
         }
 
         if !e.methods.is_empty() {
-            method_list(&mut s, &e.methods);
+            method_list(&mut s, &e.methods, fence_lang(e));
         }
     }
 
@@ -253,7 +253,7 @@ fn render_types(structs: &[&ApiItem], engine_name: &str, usage: &crate::usage::U
         }
 
         if !item.methods.is_empty() {
-            method_list(&mut s, &item.methods);
+            method_list(&mut s, &item.methods, fence_lang(item));
         }
 
         if !item.traits_impl.is_empty() {
@@ -280,7 +280,7 @@ fn render_traits(traits: &[&ApiItem], engine_name: &str) -> String {
             for m in &item.methods {
                 l(&mut s, &format!("### `{}`\n", m.name));
                 if !m.doc.is_empty() { l(&mut s, &format!("{}\n", m.doc)); }
-                l(&mut s, &format!("```rust\n{}\n```\n", m.signature));
+                l(&mut s, &format!("```{}\n{}\n```\n", fence_lang(item), m.signature));
             }
         }
         s.push('\n');
@@ -301,7 +301,7 @@ fn render_functions(fns: &[&ApiItem], engine_name: &str) -> String {
             l(&mut s, &format!("_module: `{}`_\n", f.module_str()));
         }
         if !f.doc.is_empty() { l(&mut s, &format!("{}\n", f.doc)); }
-        l(&mut s, &format!("```rust\n{}\n```\n\n", f.signature));
+        l(&mut s, &format!("```{}\n{}\n```\n\n", fence_lang(f), f.signature));
     }
 
     s
@@ -316,7 +316,7 @@ fn render_misc(items: &[&ApiItem], engine_name: &str) -> String {
     for item in items {
         l(&mut s, &format!("## `{}`  _({})\n_", item.name, item.kind.label()));
         if !item.doc.is_empty() { l(&mut s, &format!("{}\n", item.doc)); }
-        l(&mut s, &format!("```rust\n{}\n```\n\n", item.signature));
+        l(&mut s, &format!("```{}\n{}\n```\n\n", fence_lang(item), item.signature));
     }
 
     s
@@ -324,12 +324,12 @@ fn render_misc(items: &[&ApiItem], engine_name: &str) -> String {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-fn method_list(s: &mut String, methods: &[ApiMethod]) {
+fn method_list(s: &mut String, methods: &[ApiMethod], lang: &str) {
     l(s, "**Methods**\n");
     for m in methods {
         l(s, &format!("### `{}`\n", m.name));
         if !m.doc.is_empty() { l(s, &format!("{}\n", m.doc)); }
-        l(s, &format!("```rust\n{}\n```\n", m.signature));
+        l(s, &format!("```{lang}\n{}\n```\n", m.signature));
     }
     s.push('\n');
 }
@@ -341,17 +341,19 @@ fn l(s: &mut String, line: &str) {
 
 // ── Provenance, examples and coverage ────────────────────────────────────────
 
-/// Language tag for a fenced code block, taken from the item's own file.
-/// Labelling a Python class ```rust is a small lie that makes the sheet look
-/// machine-generated and breaks highlighting for every non-Rust project.
-fn fence_lang(item: &ApiItem) -> &'static str {
-    let file = item.span.as_ref().map(|s| s.file.as_str()).unwrap_or("");
-    match file.rsplit('.').next().unwrap_or("") {
-        "py" | "pyi" => "python",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "tsx",
-        "js" | "mjs" | "cjs" | "jsx" => "javascript",
-        _ => "rust",
+/// Language tag for a fenced code block.
+///
+/// Labelling a Python class ```rust is a small lie that breaks highlighting on
+/// every non-Rust project and quietly claims something false about the code.
+///
+/// This existed before and was called by NOTHING — six sites wrote ```rust
+/// directly, so a JavaScript function was published as Rust while a helper sat
+/// beside it doing the right thing unused. It now reads `item.language`, which
+/// the extractor sets, rather than re-deriving it from the file extension.
+fn fence_lang(item: &ApiItem) -> &str {
+    match item.language.as_str() {
+        "" => "rust",
+        other => other,
     }
 }
 
@@ -381,7 +383,7 @@ fn render_examples(item: &ApiItem, usage: &crate::usage::UsageIndex) -> String {
     if !doc_examples.is_empty() {
         out.push_str("**Example**\n\n");
         for code in &doc_examples {
-            out.push_str(&format!("```rust\n{}\n```\n\n", code));
+            out.push_str(&format!("```{}\n{}\n```\n\n", fence_lang(item), code));
         }
     }
 
@@ -389,7 +391,7 @@ fn render_examples(item: &ApiItem, usage: &crate::usage::UsageIndex) -> String {
         if !snips.is_empty() {
             out.push_str("**Used like this**\n\n");
             for s in snips {
-                out.push_str(&format!("```rust\n{}\n```\n_{}_\n\n", s.code, s.location));
+                out.push_str(&format!("```{}\n{}\n```\n_{}_\n\n", fence_lang(item), s.code, s.location));
             }
         }
     }

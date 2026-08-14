@@ -24,7 +24,20 @@ it is never stale.
 - `get_variants(enum)` — exact variants with field types
 - `search_items` / `list_items` / `find_related_types`
 - `get_trait_implementations` / `get_builder_methods` / `get_return_type_usage`
-- Every item carries `file:line`, so cite it rather than making the reader search.
+- `trace_across_languages` — where one language calls another (HTTP routes joined
+  to the `fetch`/`axios`/`requests` calls that hit them; wasm/FFI exports joined
+  to the code importing them). **Run it before renaming or removing an endpoint**,
+  and read the unmatched half of its output: a call with no route behind it, or a
+  caller using a verb the route does not declare, is invisible to every
+  single-language tool because neither side is wrong on its own.
+- Every item carries `file:line` **plus its language and source root**, so cite it
+  rather than making the reader search — and when several declarations share a
+  name, `get_item` lists them all with provenance instead of guessing. Narrow with
+  `language`, `origin` or `file`.
+- **Read the confidence tag.** `resolved` means a real front end agreed the types
+  are these types. `name_resolved` means cross-file linking by name with no type
+  inference — correct about names, capable of confusing two same-named types.
+  `ast_only` knows nothing beyond one file. Do not treat them alike.
 
 **cortex owns JUDGMENT — what we *learned*.** DB-backed, grown from sessions.
 - `get_anti_patterns(hint)` — known traps
@@ -103,6 +116,32 @@ Consult memory at every "I'm not sure" moment, not only at session start.
 | Choosing between approaches | `list_patterns` + `get_anti_patterns` |
 
 The most valuable lookup is the one you skip because you already feel confident.
+
+### When you are corrected
+
+A `UserPromptSubmit` hook watches for a message that disputes something you said
+and records it as an **open question**. It exists because an agent that has just
+been corrected is the worst possible witness to the fact — the record is made by
+something with no stake in the outcome.
+
+Settle it **by checking** — run the command, read the file — not from memory of
+the exchange, then call:
+
+```
+resolve_challenge(id, verdict, subject, evidence)
+```
+
+- `user_right` — proposes an anti-pattern describing **how you went wrong**, which
+  is the reusable part; the conclusion alone is not.
+- `agent_right` — proposes a note that the claim **survived** a challenge. A
+  mistaken challenge is still information, and dropping it means the same
+  question gets re-litigated forever.
+- `unresolved` — stores **nothing**. This is the correct answer when the question
+  was never actually settled, and it is deliberately the cheapest verdict to
+  reach so there is no pressure to invent one.
+
+`evidence` is required and a verdict without it is refused. Everything raised
+here is a proposal pending human review; nothing reaches memory directly.
 
 ## 5) Capturing what you learn
 
@@ -202,7 +241,17 @@ commands on both.
 | `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
+| `fired` | which mechanisms have actually run, and which are silently idle |
 | `-- <args>` | pass anything straight through to the binary |
+
+`fired` answers the one question nothing else asks: *has this ever actually
+run?* This project's recurring failure has never been a broken feature — it is a
+feature that was never running and looked fine. None of those could be caught by
+a test, because each was individually correct.
+
+Mechanisms designed to be silent are watched by a **heartbeat** (did the hook
+run) separately from their **output** (did it find anything), because an empty
+result cannot distinguish a working mechanism from an uninstalled one.
 
 `deploy` exists because Windows blocks deleting a running executable. It renames
 the live binary out of the way, which Windows does permit, so a rebuild never

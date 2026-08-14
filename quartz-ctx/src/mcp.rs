@@ -27,7 +27,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use walkdir::WalkDir;
 
-use crate::model::{ApiItem, ItemKind, Visibility};
+use crate::model::{ApiItem, Confidence, ItemKind, Visibility};
 use crate::{helpers, parser};
 
 // ── Source auto-reload ────────────────────────────────────────────────────────
@@ -48,7 +48,15 @@ fn source_fingerprint(sources: &[(PathBuf, String, bool)]) -> u64 {
         for entry in WalkDir::new(path)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+            // Must watch every language the parser reads, not just Rust —
+            // otherwise a TypeScript or Go project's fingerprint never moves and
+            // the server serves its first parse forever, with the "auto-reloads
+            // within ~5s" promise quietly untrue for everything but Rust.
+            .filter(|e| {
+                let p = e.path();
+                p.extension().map_or(false, |ext| ext == "rs")
+                    || crate::lang::Language::from_path(p).is_some()
+            })
         {
             mix(entry.path().to_string_lossy().as_bytes());
             if let Ok(meta) = entry.metadata() {
@@ -146,7 +154,7 @@ pub fn serve(items: Vec<ApiItem>, engine_name: &str, sources: Vec<(PathBuf, Stri
         let result = match method {
             "initialize"  => Ok(initialize_result(engine_name)),
             "tools/list"  => Ok(tools_list_result()),
-            "tools/call"  => tools_call(&params, &items),
+            "tools/call"  => tools_call(&params, &items, &sources),
             other         => Err(format!("unknown method: {other}")),
         };
 
@@ -188,24 +196,69 @@ fn tools_list_result() -> Value {
                 "name": "get_item",
                 "description": "Get complete details on a specific API item by exact name. \
                                 Returns kind, full signature, doc comment, fields with types, \
-                                all methods, enum variants, and trait implementations. \
-                                Use this when you need the full picture of a type.",
+                                all methods, enum variants, and trait implementations, plus the \
+                                language, source root and file:line it came from. \
+                                When several declarations share the name it lists ALL of them \
+                                with their provenance rather than silently picking one — narrow \
+                                with `language`, `origin` or `file`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
                             "description": "Exact name of the type, enum, trait, or function (case-sensitive)."
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Disambiguate by language: rust, python, typescript, javascript, go, java, csharp, cpp, ruby, php."
+                        },
+                        "origin": {
+                            "type": "string",
+                            "description": "Disambiguate by source root tag (e.g. ss_engine, synful, path_forge)."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Disambiguate by file path substring (e.g. `canvas/core.rs` or `frontend/src/lib`)."
                         }
                     },
                     "required": ["name"]
                 }
             },
             {
+                "name": "trace_across_languages",
+                "description": "Show where one language calls another: HTTP routes joined to the \
+                                fetch/axios/requests calls that hit them, and wasm/FFI exports \
+                                joined to the code that imports them. Names the item at each end, \
+                                with file:line and language. \
+                                ALSO reports the halves that did NOT join — a client call with no \
+                                route behind it (usually a rename applied on one side only), a \
+                                route nothing calls, and a caller using a verb the route does not \
+                                declare. Those are invisible to every single-language tool, \
+                                including the compiler, because neither side is wrong on its own. \
+                                Use before renaming or removing an endpoint, and to understand how \
+                                a frontend and backend actually connect.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Only boundaries whose key contains this substring (e.g. `/api/models` or `solve_ik`)."
+                        },
+                        "include_unmatched": {
+                            "type": "boolean",
+                            "description": "Include calls with no route and routes with no caller. Default true — these are usually the findings."
+                        }
+                    }
+                }
+            },
+            {
                 "name": "list_items",
-                "description": "List all public API items, optionally filtered by kind. \
-                                Results grouped by type (Enums, Structs, Traits, Functions). \
-                                Use this to discover what APIs are available, or get a quick reference of a category.",
+                "description": "List API items, optionally filtered by kind, language, source root \
+                                or directory. Every line carries its provenance \
+                                (language · origin · file:line), and a multi-language result opens \
+                                with a per-language count so a filtered view is never mistaken for \
+                                the whole index. Use this to discover what exists, or to see one \
+                                language's or one directory's surface on its own.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -214,6 +267,18 @@ fn tools_list_result() -> Value {
                             "description": "Filter by kind: struct, enum, trait, fn, type, const. \
                                            Leave blank to list all items grouped by category.",
                             "enum": ["struct", "enum", "trait", "fn", "type", "const"]
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Only items written in this language: rust, python, typescript, javascript, go, java, csharp, cpp, ruby, php."
+                        },
+                        "origin": {
+                            "type": "string",
+                            "description": "Only items from this source root tag (e.g. ss_engine, synful, path_forge)."
+                        },
+                        "directory": {
+                            "type": "string",
+                            "description": "Only items whose file path starts with this directory, relative to the source root (e.g. `frontend/src/lib`)."
                         }
                     }
                 }
@@ -366,7 +431,11 @@ fn tools_list_result() -> Value {
 
 // ── Tool dispatch ─────────────────────────────────────────────────────────────
 
-fn tools_call(params: &Value, items: &[ApiItem]) -> Result<Value, String> {
+fn tools_call(
+    params: &Value,
+    items: &[ApiItem],
+    sources: &[(PathBuf, String, bool)],
+) -> Result<Value, String> {
     let tool_name = params["name"]
         .as_str()
         .ok_or("missing tool name")?;
@@ -383,6 +452,7 @@ fn tools_call(params: &Value, items: &[ApiItem]) -> Result<Value, String> {
         "get_builder_methods"         => tool_get_builder_methods(&args, items),
         "get_return_type_usage"       => tool_get_return_type_usage(&args, items),
         "find_related_types"          => tool_find_related_types(&args, items),
+        "trace_across_languages"      => tool_trace_across_languages(&args, items, sources),
         // ── Phase 1 additions ──
         other                         => Err(format!("unknown tool: {other}")),
     }?;
@@ -394,45 +464,124 @@ fn tools_call(params: &Value, items: &[ApiItem]) -> Result<Value, String> {
 
 // ── Tool implementations ──────────────────────────────────────────────────────
 
+/// One line that says exactly which of several same-named items this is.
+///
+/// Everything a caller needs to tell candidates apart, in the order they would
+/// use to decide: what language, which source root, which file.
+fn provenance(item: &ApiItem) -> String {
+    let mut parts = vec![item.language.clone()];
+    if !item.origin.is_empty() {
+        parts.push(item.origin.clone());
+    }
+    match &item.span {
+        Some(s) => parts.push(format!("{s}")),
+        None if !item.module_str().is_empty() => parts.push(item.module_str()),
+        None => {}
+    }
+    parts.join(" · ")
+}
+
+/// Fence tag matching the item's own language, so rendered code highlights as
+/// what it is. A Go signature in a ```rust fence is a small lie that an agent
+/// reads as a claim about the language.
+fn fence_for(language: &str) -> &str {
+    match language {
+        "csharp" => "csharp",
+        "cpp" => "cpp",
+        other => other,
+    }
+}
+
 fn tool_get_item(args: &Value, items: &[ApiItem]) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("missing `name`")?;
 
-    // Items keep source order: the first match is from the primary engine.
-    let matches: Vec<&ApiItem> = items.iter().filter(|i| i.name == name).collect();
-    let item = *matches.first()
-        .ok_or_else(|| format!("no item named `{name}` found"))?;
+    let mut matches: Vec<&ApiItem> = items.iter().filter(|i| i.name == name).collect();
+    if matches.is_empty() {
+        return Err(format!("no item named `{name}` found"));
+    }
 
+    // Optional disambiguators. Measured on this workspace before they existed:
+    // 367 names collided across scopes, affecting 789 of 962 live units, and
+    // `get_item` answered every one of them by silently returning whichever
+    // happened to be first. A polyglot index makes that sharply worse — `Canvas`
+    // is now plausibly a Rust struct AND a TypeScript class.
+    let want_lang = args["language"].as_str().map(str::to_lowercase);
+    let want_origin = args["origin"].as_str();
+    let want_file = args["file"].as_str();
+    if let Some(l) = &want_lang {
+        matches.retain(|i| i.language.eq_ignore_ascii_case(l));
+    }
+    if let Some(o) = want_origin {
+        matches.retain(|i| i.origin.eq_ignore_ascii_case(o));
+    }
+    if let Some(f) = want_file {
+        let f = f.replace('\\', "/");
+        matches.retain(|i| i.span.as_ref().is_some_and(|s| s.file.contains(&f)));
+    }
+    if matches.is_empty() {
+        return Err(format!(
+            "no item named `{name}` matches those filters — drop them and call again \
+             to see every candidate"
+        ));
+    }
+
+    let item = matches[0];
     let mut out = format!("# `{}` ({})\n\n", item.name, item.kind.label());
 
-    if !item.origin.is_empty() {
-        out.push_str(&format!("origin: `{}`", item.origin));
-        let others: Vec<&str> = matches.iter().skip(1)
-            .map(|i| i.origin.as_str())
-            .filter(|o| !o.is_empty())
-            .collect();
-        if !others.is_empty() {
-            out.push_str(&format!("  (also defined in: {})", others.join(", ")));
+    // Several distinct declarations share this name. Naming them all is the
+    // whole answer here: picking one and staying quiet is how the wrong type's
+    // methods get read as this one's.
+    if matches.len() > 1 {
+        out.push_str(&format!(
+            "> **{} declarations share this name.** Showing the first; \
+             re-call `get_item` with `language`, `origin` or `file` to pick another.\n\n",
+            matches.len()
+        ));
+        for (n, cand) in matches.iter().enumerate() {
+            out.push_str(&format!(
+                "> {}. `{}` — {} ({} method(s))\n",
+                n + 1,
+                cand.kind.label(),
+                provenance(cand),
+                cand.methods.len()
+            ));
         }
-        out.push_str("\n\n");
+        out.push('\n');
     }
+
+    out.push_str(&format!("from: {}\n\n", provenance(item)));
 
     if !item.module_str().is_empty() {
         out.push_str(&format!("module: `{}`\n\n", item.module_str()));
-    }
-    // A citable location, so an agent can open the declaration rather than
-    // search for it.
-    if let Some(span) = &item.span {
-        out.push_str(&format!("defined at: `{span}`\n\n"));
     }
     // Only worth stating when it is not the default public API surface.
     if item.visibility != Visibility::Public {
         out.push_str(&format!("visibility: `{}`\n\n", item.visibility.label()));
     }
+    // Say it only when it changes how the answer should be read. A resolved item
+    // is the promise this server exists to make; an AST-only one is a weaker
+    // claim, and presenting the two identically is how an agent comes to trust a
+    // guessed signature as much as a compiled one.
+    match item.confidence {
+        Confidence::AstOnly => out.push_str(
+            "> **ast_only** — parsed from syntax, not resolved. Names, shapes and \
+             locations are as written; types are not checked and cross-file links \
+             are not followed. Verify a signature before relying on it.\n\n",
+        ),
+        Confidence::NameResolved => out.push_str(
+            "> **name_resolved** — parsed from syntax, then linked across files by \
+             name: members declared away from this type are attached, and declared \
+             bases and interfaces are recorded. Types are not inferred, so two \
+             same-named types can be told apart wrongly, and a call through a \
+             variable names the method without knowing the receiver.\n\n",
+        ),
+        Confidence::Resolved => {}
+    }
     if !item.doc.is_empty() {
         out.push_str(&format!("{}\n\n", item.doc));
     }
 
-    out.push_str(&format!("```rust\n{}\n```\n\n", item.signature));
+    out.push_str(&format!("```{}\n{}\n```\n\n", fence_for(&item.language), item.signature));
 
     if !item.fields.is_empty() {
         out.push_str("## Fields\n\n");
@@ -486,9 +635,20 @@ fn tool_list_items(args: &Value, items: &[ApiItem]) -> Result<String, String> {
         None           => None,
     };
 
+    let lang_filter = args["language"].as_str().map(str::to_lowercase);
+    let origin_filter = args["origin"].as_str().map(str::to_lowercase);
+    let dir_filter = args["directory"].as_str().map(|d| d.replace('\\', "/"));
+
     let filtered: Vec<_> = items
         .iter()
         .filter(|i| kind_filter.as_ref().map_or(true, |k| &i.kind == k))
+        .filter(|i| lang_filter.as_ref().map_or(true, |l| i.language.eq_ignore_ascii_case(l)))
+        .filter(|i| origin_filter.as_ref().map_or(true, |o| i.origin.eq_ignore_ascii_case(o)))
+        .filter(|i| {
+            dir_filter.as_ref().map_or(true, |d| {
+                i.span.as_ref().is_some_and(|s| s.file.starts_with(d.as_str()))
+            })
+        })
         .collect();
 
     if filtered.is_empty() {
@@ -496,6 +656,23 @@ fn tool_list_items(args: &Value, items: &[ApiItem]) -> Result<String, String> {
     }
 
     let mut out = String::new();
+
+    // What this listing actually covers, so a filtered view is never mistaken
+    // for the whole index — and so a polyglot index shows its shape at a glance.
+    let mut by_lang: std::collections::BTreeMap<&str, usize> = Default::default();
+    for i in &filtered {
+        *by_lang.entry(i.language.as_str()).or_default() += 1;
+    }
+    if by_lang.len() > 1 {
+        let breakdown: Vec<String> =
+            by_lang.iter().map(|(l, n)| format!("{l} {n}")).collect();
+        out.push_str(&format!(
+            "{} item(s) across {} languages — {}\n\n",
+            filtered.len(),
+            by_lang.len(),
+            breakdown.join(", ")
+        ));
+    }
 
     // Group by kind for readability when listing everything
     if kind_filter.is_none() {
@@ -511,14 +688,17 @@ fn tool_list_items(args: &Value, items: &[ApiItem]) -> Result<String, String> {
             out.push_str(&format!("## {}\n", label));
             for item in group {
                 let doc = if item.doc_summary().is_empty() { String::new() } else { format!(" — {}", item.doc_summary()) };
-                out.push_str(&format!("- `{}`{}\n", item.name, doc));
+                out.push_str(&format!("- `{}`  _{}_{}\n", item.name, provenance(item), doc));
             }
             out.push('\n');
         }
     } else {
         for item in filtered {
             let doc = if item.doc_summary().is_empty() { String::new() } else { format!(" — {}", item.doc_summary()) };
-            out.push_str(&format!("- `{}` ({}){}\n", item.name, item.kind.label(), doc));
+            out.push_str(&format!(
+                "- `{}` ({})  _{}_{}\n",
+                item.name, item.kind.label(), provenance(item), doc
+            ));
         }
     }
 
@@ -573,9 +753,8 @@ fn tool_search_items(args: &Value, items: &[ApiItem]) -> Result<String, String> 
         if !item.module_str().is_empty() {
             out.push_str(&format!(", module: `{}`", item.module_str()));
         }
-        if !item.origin.is_empty() {
-            out.push_str(&format!(", origin: `{}`", item.origin));
-        }
+        // Provenance carries origin, so listing it separately would repeat it.
+        out.push_str(&format!(", {}", provenance(item)));
         out.push(')');
         if !item.doc_summary().is_empty() {
             out.push_str(&format!("\n  {}", item.doc_summary()));
@@ -707,6 +886,47 @@ fn tool_get_trait_implementations(args: &Value, items: &[ApiItem]) -> Result<Str
     Ok(out)
 }
 
+/// Does this signature return one of `wanted`?
+///
+/// Languages put the return type in three different places, and checking only
+/// for Rust's `-> T` made `get_builder_methods` a Rust-only tool: a Java
+/// `public Builder withSize(int w)` and a TypeScript `withSize(w: number): this`
+/// are both textbook chainable methods that it reported as non-chainable, which
+/// reads as "this type is not a builder" rather than "I only know one syntax".
+fn returns_one_of(signature: &str, method_name: &str, wanted: &[&str]) -> bool {
+    // NOTE: whitespace is load-bearing in the prefix-type case, so this cannot
+    // work on a flattened string — `public Widget size(...)` collapses to
+    // `publicWidgetsize(...)` and the return type stops being a separate token.
+    let sig = signature.trim();
+    let ret: &str = if let Some((_, after)) = sig.rsplit_once("->") {
+        // Rust, PHP 7+, Python annotations.
+        after
+    } else if let Some((_, after)) = sig.rsplit_once("):") {
+        // TypeScript / Kotlin / Swift: the type follows the parameter list.
+        after
+    } else if sig
+        .rsplit_once(')')
+        .is_some_and(|(_, tail)| !tail.trim().is_empty())
+    {
+        // Go: `func (b *Builder) Size(n int) *Builder`.
+        sig.rsplit_once(')').unwrap().1
+    } else {
+        // Java, C#, C++: the type PRECEDES the name.
+        let Some(at) = sig.find(&format!("{method_name}(")) else { return false };
+        sig[..at].split_whitespace().next_back().unwrap_or("")
+    };
+    let ret = ret
+        .trim()
+        .trim_end_matches(['{', ';', ')', ','])
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c| c == '&' || c == '*' || c == ' ')
+        .trim_end_matches("::")
+        .trim();
+    !ret.is_empty() && wanted.iter().any(|w| ret == *w)
+}
+
 fn tool_get_builder_methods(args: &Value, items: &[ApiItem]) -> Result<String, String> {
     let base_type = args["base_type"].as_str().ok_or("missing `base_type`")?;
 
@@ -731,12 +951,7 @@ fn tool_get_builder_methods(args: &Value, items: &[ApiItem]) -> Result<String, S
         let chainable: Vec<&crate::model::ApiMethod> = item
             .methods
             .iter()
-            .filter(|m| {
-                let sig = m.signature.replace(' ', "");
-                sig.contains("->Self")
-                    || sig.contains(&format!("->{}", item.name))
-                    || sig.contains(&format!("->{builder_name}"))
-            })
+            .filter(|m| returns_one_of(&m.signature, &m.name, &[&item.name, &builder_name, "Self", "this"]))
             .collect();
         let terminal: Vec<&crate::model::ApiMethod> = item
             .methods
@@ -1019,4 +1234,177 @@ mod borrow_tests {
             assert_eq!(classify(owned), "owned", "{owned} misclassified");
         }
     }
+}
+
+#[cfg(test)]
+mod builder_return_tests {
+    use super::returns_one_of;
+
+    /// A builder is a builder in every language. Checking only for Rust's
+    /// `-> Self` reported Java and TypeScript builders as "not a builder",
+    /// which is a wrong answer rather than a missing one.
+    #[test]
+    fn a_chainable_method_is_recognised_in_every_syntax() {
+        let w = &["Widget", "WidgetBuilder", "Self", "this"];
+        assert!(returns_one_of("pub fn size(self, n: u32) -> Self", "size", w), "rust");
+        assert!(returns_one_of("fn size(self) -> Widget", "size", w), "rust named");
+        assert!(returns_one_of("public Widget size(int n)", "size", w), "java");
+        assert!(returns_one_of("public WidgetBuilder size(int n)", "size", w), "java builder");
+        assert!(returns_one_of("size(n: number): this", "size", w), "typescript this");
+        assert!(returns_one_of("size(n: number): Widget", "size", w), "typescript named");
+        assert!(returns_one_of("func (b *WidgetBuilder) Size(n int) *WidgetBuilder", "Size", w), "go");
+    }
+
+    #[test]
+    fn a_method_returning_something_else_is_not_chainable() {
+        let w = &["Widget", "WidgetBuilder", "Self", "this"];
+        assert!(!returns_one_of("pub fn area(&self) -> f32", "area", w));
+        assert!(!returns_one_of("public int area()", "area", w));
+        assert!(!returns_one_of("area(): number", "area", w));
+        assert!(!returns_one_of("public void render()", "render", w));
+    }
+}
+
+// ── cross-language tracing ──────────────────────────────────────────────────
+
+/// Every place one language calls another, and every place one tries to.
+///
+/// The unmatched halves are the point as much as the matched ones. A client call
+/// with no route behind it is a broken call — a typo, or an endpoint that was
+/// renamed on one side only — and it is invisible to every single-language tool,
+/// including a compiler, because neither side is wrong on its own.
+fn tool_trace_across_languages(
+    args: &Value,
+    items: &[ApiItem],
+    sources: &[(PathBuf, String, bool)],
+) -> Result<String, String> {
+    use crate::bridge::{link, BridgeKind, Boundary};
+
+    let filter = args["path"].as_str().map(str::to_lowercase);
+    let show_orphans = args["include_unmatched"].as_bool().unwrap_or(true);
+
+    let mut boundaries: Vec<Boundary> = Vec::new();
+    if sources.is_empty() {
+        return Ok("No source roots configured, so there is nothing to scan.".into());
+    }
+    for (path, _tag, _priv) in sources {
+        boundaries.extend(parser::scan_boundaries(path));
+    }
+    if boundaries.is_empty() {
+        return Ok(
+            "No language boundaries found. This project either has no HTTP routes, \
+             wasm exports or FFI symbols, or it declares them in a framework this \
+             does not yet recognise."
+                .into(),
+        );
+    }
+
+    let links = link(&boundaries);
+    let matched: Vec<_> = links
+        .iter()
+        .filter(|l| l.provider.is_some() && !l.consumers.is_empty())
+        .filter(|l| filter.as_ref().map_or(true, |f| l.key.to_lowercase().contains(f)))
+        .collect();
+
+    // Name the item at each end where we can: a handler name is an answer, a
+    // file:line is homework.
+    let name_at = |file: &str, line: usize| -> String {
+        items
+            .iter()
+            .filter(|i| i.span.as_ref().is_some_and(|s| s.file == file))
+            .filter(|i| {
+                let l = i.span.as_ref().map(|s| s.line).unwrap_or(0);
+                (l >= line && l <= line + 4) || l <= line
+            })
+            .min_by_key(|i| {
+                let l = i.span.as_ref().map(|s| s.line).unwrap_or(0);
+                if l >= line { l - line } else { line - l }
+            })
+            .map(|i| format!("`{}`", i.name))
+            .unwrap_or_default()
+    };
+
+    let mut out = String::from("# Cross-language call edges\n\n");
+    out.push_str(&format!(
+        "{} joined boundar(ies) across {} declared endpoint(s)/export(s).\n\n",
+        matched.len(),
+        links.iter().filter(|l| l.provider.is_some()).count()
+    ));
+
+    for l in &matched {
+        let p = l.provider.as_ref().expect("filtered on provider");
+        let icon = match l.kind {
+            BridgeKind::Http => "HTTP",
+            BridgeKind::Ffi => "FFI",
+        };
+        out.push_str(&format!("## {icon} `{}`\n\n", l.label()));
+        if l.method_mismatch {
+            out.push_str(
+                "> **method mismatch** — a caller uses a verb the route does not declare. \
+                 Neither side is wrong on its own, which is why nothing else catches this.\n\n",
+            );
+        }
+        out.push_str(&format!(
+            "- **served by** {} {} — `{}` _{}_\n",
+            name_at(&p.span.file, p.span.line),
+            p.method.as_deref().unwrap_or(""),
+            p.span,
+            p.language
+        ));
+        for c in &l.consumers {
+            out.push_str(&format!(
+                "- **called from** {} — `{}` _{}_\n",
+                name_at(&c.span.file, c.span.line),
+                c.span,
+                c.language
+            ));
+        }
+        out.push('\n');
+    }
+
+    if show_orphans {
+        let dangling: Vec<_> = links
+            .iter()
+            .filter(|l| l.provider.is_none() && !l.consumers.is_empty())
+            .filter(|l| filter.as_ref().map_or(true, |f| l.key.to_lowercase().contains(f)))
+            .collect();
+        if !dangling.is_empty() {
+            out.push_str("## Calls with no matching route\n\n");
+            out.push_str(
+                "Each of these calls an endpoint nothing in the indexed sources declares. \
+                 That is usually a rename applied on one side only, a typo, or a route \
+                 served by a system outside these roots.\n\n",
+            );
+            for l in dangling {
+                out.push_str(&format!("- `{}`\n", l.label()));
+                for c in &l.consumers {
+                    out.push_str(&format!("  - from `{}` _{}_\n", c.span, c.language));
+                }
+            }
+            out.push('\n');
+        }
+
+        let unused: Vec<_> = links
+            .iter()
+            .filter(|l| l.provider.is_some() && l.consumers.is_empty())
+            .filter(|l| filter.as_ref().map_or(true, |f| l.key.to_lowercase().contains(f)))
+            .collect();
+        if !unused.is_empty() {
+            out.push_str(&format!(
+                "## Declared but never called from indexed code ({})\n\n\
+                 Not necessarily dead — an external client, another repo, or a \
+                 dynamically-built URL would all look like this.\n\n",
+                unused.len()
+            ));
+            for l in unused.iter().take(40) {
+                let p = l.provider.as_ref().expect("filtered on provider");
+                out.push_str(&format!("- `{}` — `{}` _{}_\n", l.label(), p.span, p.language));
+            }
+            if unused.len() > 40 {
+                out.push_str(&format!("- …and {} more\n", unused.len() - 40));
+            }
+        }
+    }
+
+    Ok(out)
 }

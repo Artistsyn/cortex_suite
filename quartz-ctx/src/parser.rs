@@ -30,6 +30,9 @@ pub fn parse_dir(dir: &Path) -> Result<Vec<ApiItem>> {
 pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
     let mut all_items: Vec<ApiItem> = Vec::new();
     let mut orphan_impls: Vec<PendingImpl> = Vec::new();
+    let mut skipped_generated = 0usize;
+    let mut partial_types: Vec<String> = Vec::new();
+    let mut boundaries: Vec<crate::bridge::Boundary> = Vec::new();
 
     for entry in WalkDir::new(dir)
         .into_iter()
@@ -53,24 +56,42 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
             }
         };
 
-        // Non-Rust files go through tree-sitter. Their items are AST-only —
-        // no type resolution — which is a weaker signal than the `syn` path and
-        // is labelled as such, but vastly better than the previous behaviour of
-        // returning nothing at all and looking like an empty project.
+        // Non-Rust files go through tree-sitter. They feed the SAME orphan list
+        // as the Rust front end, so a Go method whose receiver type is declared
+        // three files away, or a C++ member defined out of line in a .cpp, is
+        // attached by the one pass below rather than dropped. Routing them past
+        // that pass is what made every non-Rust project look like a pile of
+        // types with no behaviour.
         if let Some(lang) = crate::lang::Language::from_path(path) {
+            if looks_generated(path, &content) {
+                skipped_generated += 1;
+                continue;
+            }
             let module_path = derive_module_path(dir, path);
             let rel_path = path
                 .strip_prefix(dir)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            all_items.extend(crate::lang::parse_file(
+            boundaries.extend(crate::bridge::scan_file(
+                Path::new(&rel_path),
+                &content,
+                lang.label(),
+            ));
+            let extracted = crate::lang::parse_file(
                 &content,
                 lang,
                 &module_path,
                 &rel_path,
                 opts.include_private,
-            ));
+            );
+            all_items.extend(extracted.items);
+            orphan_impls.extend(extracted.orphans);
+            for name in extracted.partial_types {
+                if !partial_types.contains(&name) {
+                    partial_types.push(name);
+                }
+            }
             continue;
         }
 
@@ -82,6 +103,15 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
                     .unwrap_or(path)
                     .to_string_lossy()
                     .replace('\\', "/");
+                // Rust is on both sides of these boundaries: it serves routes
+                // (axum, actix) and exports wasm/FFI symbols that JavaScript
+                // imports. Scanning only the tree-sitter languages would find
+                // every caller and none of the callees.
+                boundaries.extend(crate::bridge::scan_file(
+                    Path::new(&rel_path),
+                    &content,
+                    "rust",
+                ));
                 let (items, leftovers) =
                     extract_items(&file, &module_path, &rel_path, opts.include_private);
                 all_items.extend(items);
@@ -90,6 +120,51 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
             Err(e) => {
                 eprintln!("warn: could not parse {}: {}", path.display(), e);
             }
+        }
+    }
+
+    // Fold each declared-partial type's halves into one, keeping the first
+    // occurrence as canonical. Only names the SOURCE declared `partial` are
+    // touched — two same-named types that were never declared as one stay two.
+    for name in &partial_types {
+        let mut idxs: Vec<usize> = all_items
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.name == *name)
+            .map(|(n, _)| n)
+            .collect();
+        if idxs.len() < 2 {
+            continue;
+        }
+        let keep = idxs.remove(0);
+        for &other in idxs.iter() {
+            let donor = all_items[other].clone();
+            let owner = &mut all_items[keep];
+            for m in donor.methods {
+                if !owner.methods.iter().any(|e| e.name == m.name) {
+                    owner.methods.push(m);
+                }
+            }
+            for f in donor.fields {
+                if !owner.fields.iter().any(|e| e.name == f.name) {
+                    owner.fields.push(f);
+                }
+            }
+            for t in donor.traits_impl {
+                if !owner.traits_impl.contains(&t) {
+                    owner.traits_impl.push(t);
+                }
+            }
+            for c in donor.calls {
+                if !owner.calls.iter().any(|e| e.from == c.from && e.to == c.to) {
+                    owner.calls.push(c);
+                }
+            }
+        }
+        // Drop the folded-in halves, highest index first so the rest stay valid.
+        idxs.sort_unstable_by(|a, b| b.cmp(a));
+        for other in idxs {
+            all_items.remove(other);
         }
     }
 
@@ -134,7 +209,148 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
         // Types from outside the scanned roots (e.g. std types) stay unattached.
     }
 
+    // Join the language boundaries and hang the resulting edges on the items
+    // that own them, so a cross-language hop lives in the same call graph as an
+    // ordinary call. A separate report would be a separate thing to remember to
+    // read.
+    attach_cross_language_edges(&mut all_items, &crate::bridge::link(&boundaries));
+
+    // Say what was skipped. A filter that silently drops files is one nobody can
+    // tell apart from a project that genuinely has none — and if this one ever
+    // over-matches, this line is the only way anyone finds out.
+    if skipped_generated > 0 {
+        eprintln!(
+            "  skipped {skipped_generated} generated/minified file(s) — build output, not API"
+        );
+    }
+
     Ok(all_items)
+}
+
+/// Which indexed item does `file:line` belong to?
+///
+/// Two cases, and they point in opposite directions:
+///
+/// * A route DECORATOR sits above the handler it decorates — `@app.post(...)` on
+///   line 1, `def save_animation` on line 2. The owner is just below.
+/// * A call sits INSIDE the function that makes it, so the owner is the latest
+///   declaration above it.
+///
+/// Looking only downward mislabels every call; looking only upward mislabels
+/// every decorated route, and the failure is silent either way because the
+/// fallback (`file:line`) still looks like an answer.
+fn item_at<'a>(items: &'a [ApiItem], file: &str, line: usize) -> Option<&'a ApiItem> {
+    let in_file = |i: &&ApiItem| i.span.as_ref().is_some_and(|s| s.file == file);
+
+    // A declaration within a few lines BELOW is a decorated/annotated item.
+    // The window is small on purpose: a function fifty lines later is unrelated.
+    let below = items
+        .iter()
+        .filter(in_file)
+        .filter(|i| {
+            let l = i.span.as_ref().map(|s| s.line).unwrap_or(0);
+            l >= line && l <= line + 4
+        })
+        .min_by_key(|i| i.span.as_ref().map(|s| s.line).unwrap_or(0));
+    if below.is_some() {
+        return below;
+    }
+
+    items
+        .iter()
+        .filter(in_file)
+        .filter(|i| i.span.as_ref().is_some_and(|s| s.line <= line))
+        .max_by_key(|i| i.span.as_ref().map(|s| s.line).unwrap_or(0))
+}
+
+/// Hang each joined boundary on the item that makes the call.
+///
+/// The edge names the PROVIDING ITEM where one can be identified, not just its
+/// file — `saveAnimation → save_animation` is an answer, `animationState.js:187
+/// → server.py:166` is a lookup someone still has to do.
+fn attach_cross_language_edges(items: &mut [ApiItem], links: &[crate::bridge::Link]) {
+    // Resolve everything against an immutable view first: the borrow checker
+    // will not allow reading `items` while mutating it.
+    let mut planned: Vec<(usize, CallEdge)> = Vec::new();
+
+    for l in links {
+        let Some(p) = &l.provider else { continue };
+        let target = item_at(items, &p.span.file, p.span.line)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| format!("{}:{}", p.span.file, p.span.line));
+
+        for c in &l.consumers {
+            // An `import { solve_ik } from './pkg/…'` sits at the top of the
+            // file, inside nothing. Its real callers are whichever items in that
+            // file actually call the imported symbol — which the per-language
+            // call extraction has already recorded.
+            let mut owners: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| {
+                    i.span.as_ref().is_some_and(|s| s.file == c.span.file)
+                        && i.calls.iter().any(|e| e.to == c.raw || e.to.ends_with(&format!("::{}", c.raw)))
+                })
+                .map(|(n, _)| n)
+                .collect();
+
+            if owners.is_empty() {
+                let by_position = item_at(items, &c.span.file, c.span.line)
+                    .and_then(|o| items.iter().position(|i| i.name == o.name && i.span == o.span));
+                owners.extend(by_position);
+            }
+
+            for idx in owners {
+                planned.push((
+                    idx,
+                    CallEdge {
+                        from: items[idx].name.clone(),
+                        to: target.clone(),
+                        kind: CallKind::CrossLanguage,
+                        span: Some(c.span.clone()),
+                    },
+                ));
+            }
+        }
+    }
+
+    for (idx, edge) in planned {
+        let owner = &mut items[idx];
+        if !owner.calls.iter().any(|e| e.to == edge.to && e.kind == CallKind::CrossLanguage) {
+            owner.calls.push(edge);
+        }
+    }
+}
+
+/// Every language boundary under `dir`, without parsing anything.
+///
+/// A pure text scan, so it is cheap enough for a tool to call per request rather
+/// than requiring the whole index to carry the result around.
+pub fn scan_boundaries(dir: &Path) -> Vec<crate::bridge::Boundary> {
+    let mut out = Vec::new();
+    for entry in WalkDir::new(dir)
+        .into_iter()
+        .filter_entry(|e| !is_excluded_dir(e))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        let language = if path.extension().map_or(false, |x| x == "rs") {
+            "rust"
+        } else {
+            match crate::lang::Language::from_path(path) {
+                Some(l) => l.label(),
+                None => continue,
+            }
+        };
+        let Ok(content) = std::fs::read_to_string(path) else { continue };
+        if looks_generated(path, &content) {
+            continue;
+        }
+        let rel = path.strip_prefix(dir).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        out.extend(crate::bridge::scan_file(Path::new(&rel), &content, language));
+    }
+    out
 }
 
 /// Parse multiple source roots, tagging every item with its origin slug.
@@ -192,7 +408,62 @@ const EXCLUDED_DIRS: &[&str] = &[
     ".tox",
     ".next",
     ".svelte-kit",
+    "coverage",
+    "__snapshots__",
+    "site-packages",
+    "bower_components",
+    "third_party",
+    "Pods",
 ];
+
+/// Is this file build output rather than source?
+///
+/// A directory blocklist cannot answer this. Measured on this workspace's own
+/// web editor: `dist`, `build` and `out` were all excluded, and 2,900 of 3,271
+/// extracted items still came from Vite bundles sitting in `static/assets/` —
+/// a directory name no blocklist would think to carry. The extracted "API" was
+/// 89% minifier output, with types genuinely named `n`, `t` and `r`.
+///
+/// That matters far more for JavaScript than for Rust, where `target/` catches
+/// everything, and it is the difference between quartz-ctx being useful on a
+/// front end and being actively misleading there.
+///
+/// So this asks the FILE, not its folder. Two independent signals, either
+/// sufficient:
+///
+/// * a build-tool naming convention (`.min.js`, `.bundle.js`, or a content
+///   hash suffix like `main-CqJdblBk.js`), and
+/// * a line longer than 5,000 characters, which is what minification produces
+///   and what hand-written source essentially never contains. This one needs no
+///   convention to hold, so it survives a bundler nobody here has heard of.
+pub fn looks_generated(path: &Path, content: &str) -> bool {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.contains(".min.") || name.contains(".bundle.") || name.ends_with(".map") {
+            return true;
+        }
+        // `main-CqJdblBk.js` — an 8-character base64url hash before the
+        // extension. Splitting at the LAST hyphen is wrong: base64url includes
+        // `-`, so `iesTextureLoader-BkJ8-dRq.js` splits to a 3-character tail and
+        // sails through. Anchor on the fixed width instead.
+        if let Some(stem) = name.rsplit_once('.').map(|(s, _)| s) {
+            let b = stem.as_bytes();
+            if b.len() >= 9 && b[b.len() - 9] == b'-' {
+                let tail = &stem[stem.len() - 8..];
+                // A hash has no word shape: it either carries a digit or
+                // scatters capitals. One leading capital is just a name, so
+                // `my-Renderer.js` must survive while `main-CqJdblBk.js` and
+                // `tools.functions-BHN4804L.js` do not.
+                let caps = tail.chars().filter(|c| c.is_ascii_uppercase()).count();
+                let hashy = tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    && (tail.chars().any(|c| c.is_ascii_digit()) || caps >= 3);
+                if hashy {
+                    return true;
+                }
+            }
+        }
+    }
+    content.lines().any(|l| l.len() > 5_000)
+}
 
 /// Count the `.rs` files `parse_dir` would actually read under `dir`.
 /// Diagnostics must apply the same exclusions as the parser, or `selfcheck`
@@ -352,16 +623,22 @@ fn extract_items(
     (visitor.items, leftovers)
 }
 
-struct PendingImpl {
-    self_ty: String,
-    trait_name: Option<String>,
-    methods: Vec<ApiMethod>,
+/// An `impl`-like block whose owning type has not been located yet.
+///
+/// Visible to `lang` so the tree-sitter front ends can feed the SAME global
+/// attachment pass the Rust front end uses. Giving every language its own
+/// resolution pass is how the cross-file impl bug got fixed in one extractor and
+/// lived on for months in another; there is exactly one pass here.
+pub(crate) struct PendingImpl {
+    pub(crate) self_ty: String,
+    pub(crate) trait_name: Option<String>,
+    pub(crate) methods: Vec<ApiMethod>,
     /// Calls made from this impl's method bodies, attached to the owning type
     /// alongside the methods themselves.
-    calls: Vec<CallEdge>,
+    pub(crate) calls: Vec<CallEdge>,
     /// Module path the `impl` block itself was found in — used to pick the
     /// right owner when several indexed types share a name.
-    module_path: Vec<String>,
+    pub(crate) module_path: Vec<String>,
 }
 
 struct ApiVisitor {
@@ -460,6 +737,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             generics,
             traits_impl: vec![],
             origin: String::new(),
+            // Rust goes through syn, which resolves types and links impls
+            // across files. That is a different kind of answer from the
+            // tree-sitter path, and the difference travels with the item.
+            confidence: Confidence::Resolved,
+            language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
             calls: Vec::new(),
@@ -524,6 +806,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             generics,
             traits_impl: vec![],
             origin: String::new(),
+            // Rust goes through syn, which resolves types and links impls
+            // across files. That is a different kind of answer from the
+            // tree-sitter path, and the difference travels with the item.
+            confidence: Confidence::Resolved,
+            language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
             calls: Vec::new(),
@@ -550,6 +837,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             generics: generics_to_string(&node.sig.generics),
             traits_impl: vec![],
             origin: String::new(),
+            // Rust goes through syn, which resolves types and links impls
+            // across files. That is a different kind of answer from the
+            // tree-sitter path, and the difference travels with the item.
+            confidence: Confidence::Resolved,
+            language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.sig.ident, &self.rel_path),
             calls: crate::calls::calls_in_block(
@@ -602,6 +894,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             generics,
             traits_impl: vec![],
             origin: String::new(),
+            // Rust goes through syn, which resolves types and links impls
+            // across files. That is a different kind of answer from the
+            // tree-sitter path, and the difference travels with the item.
+            confidence: Confidence::Resolved,
+            language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
             calls: Vec::new(),
@@ -698,6 +995,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             generics: generics_to_string(&node.generics),
             traits_impl: vec![],
             origin: String::new(),
+            // Rust goes through syn, which resolves types and links impls
+            // across files. That is a different kind of answer from the
+            // tree-sitter path, and the difference travels with the item.
+            confidence: Confidence::Resolved,
+            language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
             calls: Vec::new(),
@@ -736,6 +1038,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             generics: String::new(),
             traits_impl: vec![],
             origin: String::new(),
+            // Rust goes through syn, which resolves types and links impls
+            // across files. That is a different kind of answer from the
+            // tree-sitter path, and the difference travels with the item.
+            confidence: Confidence::Resolved,
+            language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
             calls: Vec::new(),
@@ -936,5 +1243,258 @@ mod impl_attach_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The whole point of routing tree-sitter output through the shared resolution
+/// pass: behaviour declared away from its type must find its way home.
+///
+/// These are end-to-end over a real directory, not over one file, because the
+/// per-file version of every one of them passes while producing types with no
+/// methods — which is precisely the bug this project has already shipped twice.
+#[cfg(test)]
+mod cross_file_tests {
+    use super::*;
+
+    fn fixture(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("quartz-ctx-xfile").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (rel, src) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, src).unwrap();
+        }
+        dir
+    }
+
+    fn methods_of(items: &[ApiItem], name: &str) -> Vec<String> {
+        items
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| {
+                panic!("no `{name}`; got {:?}", items.iter().map(|i| &i.name).collect::<Vec<_>>())
+            })
+            .methods
+            .iter()
+            .map(|m| m.name.clone())
+            .collect()
+    }
+
+    /// Go's normal layout: the struct in one file, its methods in another.
+    #[test]
+    fn a_go_method_reaches_a_type_declared_in_another_file() {
+        let dir = fixture(
+            "go_split",
+            &[
+                ("canvas.go", "package canvas\n\ntype Canvas struct {\n\tWidth int\n}\n"),
+                ("draw.go", "package canvas\n\nfunc (c *Canvas) Draw() error { return nil }\n"),
+                ("flush.go", "package canvas\n\nfunc (c *Canvas) Flush() {}\n"),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        let mut ms = methods_of(&items, "Canvas");
+        ms.sort();
+        assert_eq!(ms, vec!["Draw", "Flush"], "Go behaviour never reached its type");
+    }
+
+    /// C++'s normal layout: declarations in the header, definitions in the .cpp.
+    #[test]
+    fn a_cpp_out_of_line_definition_reaches_its_header_class() {
+        let dir = fixture(
+            "cpp_split",
+            &[
+                ("canvas.hpp", "class Canvas {\npublic:\n  void draw();\n};\n"),
+                ("canvas.cpp", "#include \"canvas.hpp\"\nvoid Canvas::flush() { reset(); }\n"),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        let mut ms = methods_of(&items, "Canvas");
+        ms.sort();
+        assert_eq!(ms, vec!["draw", "flush"]);
+    }
+
+    /// C# `partial` is the language's own statement that these are one type.
+    #[test]
+    fn csharp_partial_halves_rejoin() {
+        let dir = fixture(
+            "cs_split",
+            &[
+                ("Canvas.cs", "public partial class Canvas { public void Draw() {} }\n"),
+                ("Canvas.Input.cs", "public partial class Canvas { public void OnKey() {} }\n"),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        let canvases: Vec<&ApiItem> = items.iter().filter(|i| i.name == "Canvas").collect();
+        let joined: Vec<String> = canvases
+            .iter()
+            .flat_map(|c| c.methods.iter().map(|m| m.name.clone()))
+            .collect();
+        assert!(joined.contains(&"Draw".to_string()), "{joined:?}");
+        assert!(joined.contains(&"OnKey".to_string()), "{joined:?}");
+        assert!(
+            canvases.iter().any(|c| c.methods.len() == 2),
+            "the halves never met: {:?}",
+            canvases.iter().map(|c| c.methods.len()).collect::<Vec<_>>()
+        );
+    }
+
+    /// Rust and tree-sitter languages share one pass, so a mixed repo must not
+    /// lose either side.
+    #[test]
+    fn a_mixed_language_project_extracts_all_of_it() {
+        let dir = fixture(
+            "polyglot",
+            &[
+                ("src/lib.rs", "pub struct RustThing;\nimpl RustThing { pub fn go(&self) {} }\n"),
+                ("api/server.py", "class PyThing:\n    def handle(self): pass\n"),
+                ("web/app.ts", "export class TsThing { render(): void {} }\n"),
+                ("svc/main.go", "package p\ntype GoThing struct{}\nfunc (g *GoThing) Run() {}\n"),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        assert_eq!(methods_of(&items, "RustThing"), vec!["go"]);
+        assert_eq!(methods_of(&items, "PyThing"), vec!["handle"]);
+        assert_eq!(methods_of(&items, "TsThing"), vec!["render"]);
+        assert_eq!(methods_of(&items, "GoThing"), vec!["Run"], "Go lost its method in a mixed repo");
+
+        // And the confidence tag must survive the shared pass, so a consumer can
+        // still tell which half of the answer came from a resolving front end.
+        let rust = items.iter().find(|i| i.name == "RustThing").unwrap();
+        let go = items.iter().find(|i| i.name == "GoThing").unwrap();
+        assert!(rust.confidence.is_fully_resolved());
+        assert!(!go.confidence.is_fully_resolved(), "tree-sitter output must not claim syn's grade");
+    }
+
+    /// Build output must not reach the index, whatever folder it sits in.
+    #[test]
+    fn bundled_javascript_is_not_indexed_as_api() {
+        let dir = fixture(
+            "bundles",
+            &[
+                ("frontend/src/real.js", "export function realThing() {}\n"),
+                ("static/assets/main-CqJdblBk.js", "export function n(){};export function t(){}\n"),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert!(names.contains(&"realThing"), "{names:?}");
+        assert!(!names.contains(&"n"), "minifier output reached the index: {names:?}");
+    }
+}
+
+/// Cross-language edges, end to end over a real directory.
+#[cfg(test)]
+mod bridge_wiring_tests {
+    use super::*;
+
+    fn fixture(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("quartz-ctx-bridge").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (rel, src) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, src).unwrap();
+        }
+        dir
+    }
+
+    /// The shape of this workspace's own editor: a JS module calling a FastAPI
+    /// route. Both halves were already indexed and nothing joined them, so
+    /// "what breaks if I rename this endpoint" had no answer in either
+    /// direction.
+    #[test]
+    fn a_javascript_caller_links_to_the_python_handler_it_calls() {
+        let dir = fixture(
+            "js_to_py",
+            &[
+                (
+                    "server.py",
+                    "@app.post(\"/api/models/{model_path:path}/animation\")\n\
+                     def save_animation(model_path: str):\n    return 1\n",
+                ),
+                (
+                    "frontend/src/lib/animationState.js",
+                    "export async function saveAnimation(modelPath) {\n\
+                     \x20 return fetch(`/api/models/${modelPath}/animation`, { method: 'POST' });\n}\n",
+                ),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        let caller = items
+            .iter()
+            .find(|i| i.name == "saveAnimation")
+            .unwrap_or_else(|| panic!("caller missing: {:?}", items.iter().map(|i| &i.name).collect::<Vec<_>>()));
+
+        let edge = caller
+            .calls
+            .iter()
+            .find(|e| e.kind == CallKind::CrossLanguage)
+            .unwrap_or_else(|| panic!("no cross-language edge: {:?}", caller.calls));
+        assert_eq!(
+            edge.to, "save_animation",
+            "the edge must name the handler, not just its file"
+        );
+        assert!(edge.span.as_ref().unwrap().file.ends_with("animationState.js"));
+    }
+
+    /// avatar_ik_wasm's actual shape: a Rust function exported to JS.
+    #[test]
+    fn a_javascript_import_links_to_the_rust_wasm_export() {
+        let dir = fixture(
+            "js_to_wasm",
+            &[
+                ("src/lib.rs", "#[wasm_bindgen]\npub fn solve_ik(x: f32) -> f32 { x }\n"),
+                ("web/ik.js", "import { solve_ik } from './pkg/avatar_ik_wasm.js';\nexport function run() { return solve_ik(1.0); }\n"),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        let linked: Vec<&ApiItem> = items
+            .iter()
+            .filter(|i| i.calls.iter().any(|e| e.kind == CallKind::CrossLanguage))
+            .collect();
+        assert!(!linked.is_empty(), "wasm boundary produced no edge");
+        assert!(
+            linked.iter().any(|i| i.calls.iter().any(|e| e.to == "solve_ik")),
+            "edge does not name the exported symbol: {:?}",
+            linked.iter().map(|i| &i.calls).collect::<Vec<_>>()
+        );
+    }
+
+    /// Nothing may be invented. A call to an endpoint that does not exist must
+    /// produce no edge at all — a plausible-looking wrong edge is worse than a
+    /// missing one.
+    #[test]
+    fn a_call_with_no_matching_route_produces_no_edge() {
+        let dir = fixture(
+            "orphan_call",
+            &[
+                ("server.py", "@app.get(\"/api/scenes\")\ndef list_scenes():\n    return []\n"),
+                ("web/app.js", "export function load() { return fetch('/api/scenez'); }\n"),
+            ],
+        );
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        assert!(
+            !items.iter().any(|i| i.calls.iter().any(|e| e.kind == CallKind::CrossLanguage)),
+            "invented an edge for a call to a nonexistent endpoint"
+        );
+    }
+
+    #[test]
+    fn scan_boundaries_finds_both_sides_without_parsing() {
+        let dir = fixture(
+            "scan_only",
+            &[
+                ("server.py", "@app.get(\"/api/health\")\ndef h(): pass\n"),
+                ("web/app.js", "fetch('/api/health');\n"),
+            ],
+        );
+        let b = scan_boundaries(&dir);
+        let links = crate::bridge::link(&b);
+        assert!(
+            links.iter().any(|l| l.provider.is_some() && !l.consumers.is_empty()),
+            "{links:?}"
+        );
     }
 }

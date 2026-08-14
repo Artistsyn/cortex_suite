@@ -34,10 +34,41 @@ pub struct ApiItem {
     /// Where this item is declared. `None` only when the span was unavailable.
     #[serde(default)]
     pub span: Option<SourceSpan>,
+    /// How much this item's shape can be trusted.
+    ///
+    /// Rust goes through `syn`, which resolves the language: types are real,
+    /// impls are attached across files, a signature means what it says.
+    /// Everything else is read off a concrete syntax tree — names and shapes as
+    /// WRITTEN, with no type resolution and no cross-file linking.
+    ///
+    /// The distinction has to travel with the item. `lang.rs` claimed in a
+    /// doc-comment that non-Rust items were "tagged `confidence: ast_only`, and
+    /// the tools say so" — no such field existed, so 283 items extracted from a
+    /// JavaScript frontend reached cortex indistinguishable from resolved Rust.
+    /// An agent cannot calibrate what it is told if everything arrives with the
+    /// same authority.
+    #[serde(default)]
+    pub confidence: Confidence,
+    /// Which language this item was written in (`rust`, `go`, `typescript`, …).
+    ///
+    /// Separate from `confidence` and from `origin`, because they answer
+    /// different questions and a polyglot index needs all three. `origin` says
+    /// which source root ("ss_engine"), `span` says which file, and this says
+    /// which language — so `Canvas` the Rust struct and `Canvas` the TypeScript
+    /// class can be told apart at a glance rather than by inspecting a path.
+    ///
+    /// Defaulted rather than optional so an older `api-graph.json` still loads;
+    /// the default is `rust`, which is what every item predating this field was.
+    #[serde(default = "default_language")]
+    pub language: String,
     /// Calls made from this item's own bodies (its methods, or a free function's
     /// body). Deduped, so a call made in a loop counts once.
     #[serde(default)]
     pub calls: Vec<CallEdge>,
+}
+
+fn default_language() -> String {
+    "rust".to_string()
 }
 
 /// One call site found inside an item's body.
@@ -66,6 +97,14 @@ pub enum CallKind {
     Path,
     /// `receiver.method(..)` — only the method name is known here.
     Method,
+    /// A call that leaves the language: an HTTP request answered by a route in
+    /// another service, or a wasm/FFI symbol exported by another crate.
+    ///
+    /// Resolved through the literal both sides share (a URL path, an exported
+    /// symbol name) rather than through either language's type system, which is
+    /// the only thing that CAN join them — and is why a rename on one side has
+    /// always been invisible from the other.
+    CrossLanguage,
 }
 
 impl CallKind {
@@ -73,7 +112,60 @@ impl CallKind {
         match self {
             Self::Path => "path",
             Self::Method => "method",
+            Self::CrossLanguage => "cross_language",
         }
+    }
+}
+
+/// How far an extractor could see when it produced an item.
+///
+/// Not a quality score — a statement about the method. `Resolved` means a real
+/// compiler front end agreed the types are these types. `AstOnly` means the
+/// shape was read off the syntax as written, which is correct about names and
+/// silent about meaning: a TypeScript `foo(x: Bar)` records `Bar` without any
+/// idea what `Bar` is, or whether it exists.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// Parsed by a resolving front end (`syn` for Rust).
+    #[default]
+    Resolved,
+    /// Parsed from a concrete syntax tree (tree-sitter), then linked across
+    /// files by NAME — methods attached to the owner they name, bases and
+    /// interfaces recorded as declared, calls resolved where the syntax says so.
+    ///
+    /// This is a real resolution step, and the distinction from `AstOnly`
+    /// matters: those items know nothing beyond their own file. It is still not
+    /// type resolution, so two same-named types in one project can be told apart
+    /// wrongly, and a call through a variable names the method without knowing
+    /// the receiver.
+    NameResolved,
+    /// Parsed from a concrete syntax tree with no cross-file linking at all.
+    /// Names and shapes within one file, and nothing more.
+    AstOnly,
+}
+
+impl Confidence {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::NameResolved => "name_resolved",
+            Self::AstOnly => "ast_only",
+        }
+    }
+
+    /// True when the caller should treat the shape as indicative, not exact.
+    ///
+    /// Covers name-resolved items too: a name link can be wrong in a way a type
+    /// link cannot, so anything that would be unsafe to trust blindly from
+    /// `ast_only` is equally unsafe here.
+    pub fn is_ast_only(&self) -> bool {
+        matches!(self, Self::AstOnly | Self::NameResolved)
+    }
+
+    /// Did a resolving front end produce this?
+    pub fn is_fully_resolved(&self) -> bool {
+        matches!(self, Self::Resolved)
     }
 }
 

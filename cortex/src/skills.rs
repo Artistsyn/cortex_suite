@@ -33,6 +33,27 @@ pub fn detect_skill_candidates(
         let name = derive_skill_name(&cluster.tool_sequence);
         if name.is_empty() { continue; }
 
+        // A decision already taken is not re-opened.
+        //
+        // The miner is name-stable by design, so the same cluster produces the
+        // same candidate every run. Without this it re-drafted whatever the
+        // human had already ruled on, and the review queue kept re-presenting
+        // it: `workflow-general` was rejected and came back at the very next
+        // closeout, twice in one day. A queue that ignores your answer trains
+        // you to ignore the queue.
+        if let Some(status) = stored_status(store, &name)? {
+            if status == "rejected" || status == "approved" {
+                // Occurrence still counts — the evidence is real even though the
+                // verdict stands — but nothing is drafted or surfaced again.
+                let _ = store.conn().execute(
+                    "UPDATE skill_candidates SET occurrence_count = ?1, last_seen_at = unixepoch()
+                     WHERE name = ?2",
+                    params![cluster.members.len() as i64, name],
+                );
+                continue;
+            }
+        }
+
         // Compute confidence: fraction of sessions that produced build_pass.
         let pass = cluster.outcome_counts.get("build_pass").copied().unwrap_or(0);
         let total = cluster.members.len();
@@ -500,9 +521,26 @@ pub fn set_skill_status(store: &Store, name: &str, status: &str) -> Result<usize
 }
 
 /// Set the draft_path for a skill candidate.
+/// The status a candidate already carries, if it is known at all.
+fn stored_status(store: &Store, name: &str) -> Result<Option<String>> {
+    let s = store
+        .conn()
+        .query_row(
+            "SELECT status FROM skill_candidates WHERE name = ?1",
+            params![name],
+            |r| r.get::<_, String>(0),
+        )
+        .ok();
+    Ok(s)
+}
+
 pub fn set_skill_draft_path(store: &Store, name: &str, path: &str) -> Result<()> {
+    // Second line of defence: never overwrite a verdict. detect_skill_candidates
+    // already skips these, but this is the call that actually flipped a rejected
+    // candidate back to 'drafted', so it refuses on its own account.
     store.conn().execute(
-        "UPDATE skill_candidates SET draft_path = ?1, status = 'drafted' WHERE name = ?2",
+        "UPDATE skill_candidates SET draft_path = ?1, status = 'drafted'
+         WHERE name = ?2 AND status NOT IN ('rejected', 'approved')",
         params![path, name],
     )?;
     Ok(())

@@ -52,21 +52,78 @@ pub struct UsageSource {
 /// under the type's own documentation, which is worse than showing nothing.
 pub fn discover_sources(src_root: &Path) -> Vec<UsageSource> {
     let mut out = vec![UsageSource { path: src_root.to_path_buf(), all_statements: false }];
-    if let Some(crate_root) = src_root.parent() {
-        for candidate in ["examples", "tests", "benches"] {
-            let p = crate_root.join(candidate);
-            if p.is_dir() {
-                out.push(UsageSource { path: p, all_statements: true });
-            }
+    let mut push_dir = |out: &mut Vec<UsageSource>, p: PathBuf| {
+        if p.is_dir() && !out.iter().any(|s| s.path == p) {
+            out.push(UsageSource { path: p, all_statements: true });
         }
-        for candidate in ["example.rs", "main.rs"] {
-            let p = crate_root.join(candidate);
-            if p.is_file() {
+    };
+
+    // Look in the scanned root AND its parent: Rust keeps `examples/` beside
+    // `src/`, while a Python or Go project is usually scanned at its own root.
+    let mut roots = vec![src_root.to_path_buf()];
+    if let Some(parent) = src_root.parent() {
+        roots.push(parent.to_path_buf());
+    }
+    for root in roots {
+        // Convention names across the languages this tool indexes. Missing one
+        // does not error — it silently yields no examples, which is why they are
+        // listed exhaustively rather than assumed.
+        for candidate in [
+            "examples", "example", "tests", "test", "benches", // rust, go, java, php
+            "__tests__", "spec", "specs", "e2e", "cypress",     // js/ts, ruby
+            "demo", "demos", "samples", "sample",               // c#, java, cpp
+            "docs/examples", "src/test", "src/test/java",       // maven/gradle layout
+        ] {
+            push_dir(&mut out, root.join(candidate));
+        }
+        for candidate in ["example.rs", "main.rs", "example.py", "demo.py", "main.go"] {
+            let p = root.join(candidate);
+            if p.is_file() && !out.iter().any(|s| s.path == p) {
                 out.push(UsageSource { path: p, all_statements: true });
             }
         }
     }
     out
+}
+
+/// Is this file a test or example by its NAME?
+///
+/// Every language this tool indexes puts at least some of its tests beside the
+/// code rather than in a `tests/` directory — Go requires it (`canvas_test.go`),
+/// and the JS ecosystem overwhelmingly prefers it (`fingerHandles.test.js`). A
+/// directory-only search finds none of those, which is the difference between
+/// worked syntax for a front end and an empty examples section.
+pub fn is_test_or_example_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return false };
+    // Keep the original case: `CanvasTest.java` marks the boundary with a
+    // capital, and lowercasing first throws that away.
+    let raw = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let lower = raw.to_lowercase();
+
+    // The boundary is load-bearing. A bare `ends_with("test")` reads `latest.ts`
+    // as a test file and silently mines a real module as if it were an example.
+    const SEPARATED: &[&str] = &[
+        "_test", "-test", ".test", "_tests", "-tests", ".tests",
+        "_spec", "-spec", ".spec", "_example", "-example", ".example",
+        ".stories", // storybook: usage by construction
+    ];
+    if SEPARATED.iter().any(|s| lower.ends_with(s)) {
+        return true;
+    }
+    if matches!(lower.as_str(), "test" | "tests" | "spec" | "specs" | "example" | "examples") {
+        return true;
+    }
+    for p in ["test_", "test-", "test.", "spec_", "spec."] {
+        if lower.starts_with(p) {
+            return true;
+        }
+    }
+    // CamelCase conventions: `CanvasTest`, `CanvasTests`, `TestCanvas`.
+    if raw.ends_with("Test") || raw.ends_with("Tests") || raw.ends_with("Spec") {
+        return true;
+    }
+    raw.strip_prefix("Test")
+        .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_uppercase()))
 }
 
 /// Mine `sources` for statements that mention any of `names`.
@@ -82,25 +139,51 @@ pub fn harvest(sources: &[UsageSource], names: &HashSet<String>) -> UsageIndex {
                 .into_iter()
                 .filter_entry(|e| !crate::parser::is_excluded_walk_entry(e))
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |x| x == "rs"))
+                .filter(|e| {
+                    let p = e.path();
+                    p.extension().map_or(false, |x| x == "rs")
+                        || crate::lang::Language::from_path(p).is_some()
+                })
                 .map(|e| e.path().to_path_buf())
                 .collect()
         };
 
         for file in files {
             let Ok(text) = std::fs::read_to_string(&file) else { continue };
-            let Ok(parsed) = syn::parse_file(&text) else { continue };
             let lines: Vec<&str> = text.lines().collect();
             let label = file.to_string_lossy().replace('\\', "/");
 
-            let mut collector = StmtCollector {
-                spans: Vec::new(),
-                all_statements: source.all_statements,
-                in_test: false,
-            };
-            syn::visit::Visit::visit_file(&mut collector, &parsed);
+            // Non-Rust files go through tree-sitter for their statement spans.
+            //
+            // The `in_test` distinction the Rust path makes with `#[test]` has no
+            // equivalent here — these languages put tests in separate FILES. So
+            // the rule is the file itself: mine it when it sits in an examples or
+            // tests directory, or when its name follows a test convention
+            // (`canvas_test.go`, `fingerHandles.test.js`, `test_canvas.py`).
+            // Mining the rest of the implementation tree would surface the API
+            // defining itself as usage, which the Rust path already learned is
+            // worse than showing nothing.
+            let spans: Vec<(usize, usize)> =
+                if let Some(lang) = crate::lang::Language::from_path(&file) {
+                    if !source.all_statements && !is_test_or_example_file(&file) {
+                        continue;
+                    }
+                    if crate::parser::looks_generated(&file, &text) {
+                        continue;
+                    }
+                    crate::lang::statement_spans(&text, lang)
+                } else {
+                    let Ok(parsed) = syn::parse_file(&text) else { continue };
+                    let mut collector = StmtCollector {
+                        spans: Vec::new(),
+                        all_statements: source.all_statements,
+                        in_test: false,
+                    };
+                    syn::visit::Visit::visit_file(&mut collector, &parsed);
+                    collector.spans
+                };
 
-            for (start, end) in collector.spans {
+            for (start, end) in spans {
                 if start == 0 || start > lines.len() || end > lines.len() || end < start {
                     continue;
                 }
@@ -371,5 +454,99 @@ fn main() {
             !snips.iter().any(|s| s.code.starts_with("fn helper")),
             "a nested fn definition was captured as usage"
         );
+    }
+}
+
+/// Usage mining across every indexed language.
+///
+/// This module advertised "worked syntax mined from examples and tests" while
+/// filtering on `.rs` — so for a Python, Go or TypeScript project it produced
+/// nothing at all, and an empty examples section is indistinguishable from a
+/// project that has no examples.
+#[cfg(test)]
+mod polyglot_tests {
+    use super::*;
+
+    fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join("quartz-ctx-usage").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (rel, src) in files {
+            let p = dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, src).unwrap();
+        }
+        dir
+    }
+
+    fn names(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_and_example_files_are_recognised_by_name_in_every_ecosystem() {
+        for yes in [
+            "canvas_test.go", "test_canvas.py", "canvas_test.py",
+            "fingerHandles.test.js", "widget.spec.ts", "widget_spec.rb",
+            "CanvasTest.java", "CanvasTests.cs", "Button.stories.jsx",
+        ] {
+            assert!(is_test_or_example_file(Path::new(yes)), "missed {yes}");
+        }
+        for no in ["canvas.go", "fingerHandles.js", "server.py", "Canvas.java", "latest.ts"] {
+            assert!(!is_test_or_example_file(Path::new(no)), "false positive on {no}");
+        }
+    }
+
+    #[test]
+    fn examples_are_harvested_from_every_language() {
+        let dir = fixture(
+            "polyglot_usage",
+            &[
+                ("examples/demo.py", "def main():\n    c = Canvas(800, 600)\n    c.draw()\n"),
+                ("examples/demo.ts", "function main() {\n  const w = new Widget();\n  w.render();\n}\n"),
+                ("canvas_test.go", "package p\nfunc TestDraw(t *testing.T) {\n\tc := NewCanvas()\n\tc.Flush()\n}\n"),
+                ("src/App.test.js", "it('renders', () => {\n  const s = new SceneState();\n  s.undo();\n});\n"),
+            ],
+        );
+        let sources = discover_sources(&dir);
+        let idx = harvest(&sources, &names(&["Canvas", "Widget", "NewCanvas", "SceneState"]));
+
+        for want in ["Canvas", "Widget", "NewCanvas", "SceneState"] {
+            let got = idx.get(want);
+            assert!(
+                got.is_some_and(|v| !v.is_empty()),
+                "no usage harvested for {want}; index has {:?}",
+                idx.keys().collect::<Vec<_>>()
+            );
+        }
+        // And every snippet must carry a citable location.
+        for (name, snips) in &idx {
+            for s in snips {
+                assert!(s.location.contains(':'), "{name} snippet has no file:line");
+            }
+        }
+    }
+
+    /// The implementation tree defines the API; it does not use it. Mining it
+    /// would offer a class's own body as an example of calling that class.
+    #[test]
+    fn plain_implementation_files_are_not_mined_as_usage() {
+        let dir = fixture(
+            "impl_not_usage",
+            &[("src/canvas.py", "class Canvas:\n    def draw(self):\n        self.flush()\n")],
+        );
+        let idx = harvest(&discover_sources(&dir), &names(&["Canvas"]));
+        assert!(idx.get("Canvas").is_none(), "implementation code offered as usage: {idx:?}");
+    }
+
+    /// Minified bundles are not examples, however many names they mention.
+    #[test]
+    fn generated_bundles_are_not_mined_as_usage() {
+        let dir = fixture(
+            "bundle_not_usage",
+            &[("examples/main-CqJdblBk.js", "const c=new Canvas();c.draw();\n")],
+        );
+        let idx = harvest(&discover_sources(&dir), &names(&["Canvas"]));
+        assert!(idx.get("Canvas").is_none(), "bundle offered as usage: {idx:?}");
     }
 }

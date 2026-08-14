@@ -283,6 +283,85 @@ impl Store {
                 added_at    TEXT NOT NULL
             );
 
+            -- Which traps the edit guard has already raised, per session, so an
+            -- unsolicited warning is never repeated at the same author.
+            -- Every build/test result the compaction hook sees, and what the
+            -- session's verdict was scored as. The verdict is stored because it
+            -- can CHANGE: a session that passes at 14:09 and fails at 14:40 has
+            -- to have its earlier credit taken back, not doubled.
+            CREATE TABLE IF NOT EXISTS test_outcomes (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT    NOT NULL,
+                command      TEXT    NOT NULL,
+                passed       INTEGER NOT NULL,
+                observed_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_test_outcomes_session
+                ON test_outcomes(session_id);
+
+            CREATE TABLE IF NOT EXISTS session_verdict (
+                session_id  TEXT PRIMARY KEY,
+                passed      INTEGER NOT NULL,
+                scored_ids  TEXT    NOT NULL,  -- JSON array of pattern ids credited
+                updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            -- Failures counted by identity, so a recurring one can be told from
+            -- a one-off. Nothing is proposed on a first sighting: noise does not
+            -- repeat, traps do.
+            CREATE TABLE IF NOT EXISTS recurring_errors (
+                signature     TEXT PRIMARY KEY,
+                sample        TEXT NOT NULL,
+                command       TEXT NOT NULL,
+                sessions      TEXT NOT NULL DEFAULT '[]',
+                seen_count    INTEGER NOT NULL DEFAULT 1,
+                proposed      INTEGER NOT NULL DEFAULT 0,
+                first_seen_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            -- Moments the user disputed something the agent claimed. A row here
+            -- is a QUESTION, not a finding: `verdict` stays NULL until somebody
+            -- actually checked, and only then does anything reach the proposal
+            -- queue. Storing the user's side on sight would teach the store
+            -- things that are false — both directions genuinely occur.
+            CREATE TABLE IF NOT EXISTS challenges (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL,
+                cue         TEXT NOT NULL,
+                excerpt     TEXT NOT NULL,
+                verdict     TEXT,
+                subject     TEXT,
+                evidence    TEXT,
+                raised_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+                resolved_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_challenges_session
+                ON challenges(session_id);
+
+            -- Proof a hook RAN, separate from whether it found anything.
+            --
+            -- Without this the audit cannot tell a correctly-silent mechanism
+            -- from a dead one: note_challenge fires on every message and records
+            -- a row only when a claim is disputed, so an empty challenges table
+            -- means either nobody argued or the hook was never installed - and
+            -- those need opposite responses. Every silent-by-design mechanism
+            -- needs a heartbeat that is not its own output.
+            CREATE TABLE IF NOT EXISTS hook_heartbeat (
+                hook       TEXT PRIMARY KEY,
+                fired      INTEGER NOT NULL DEFAULT 0,
+                matched    INTEGER NOT NULL DEFAULT 0,
+                last_fired INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE IF NOT EXISTS edit_guard_fires (
+                session_id      TEXT NOT NULL,
+                anti_pattern_id INTEGER NOT NULL,
+                file            TEXT NOT NULL DEFAULT '',
+                fired_at        TEXT NOT NULL,
+                PRIMARY KEY (session_id, anti_pattern_id)
+            );
+
             CREATE TABLE IF NOT EXISTS annotations (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic       TEXT NOT NULL,
@@ -818,6 +897,108 @@ impl Store {
             )?;
         }
 
+        self.ensure_supersession_columns()?;
+        self.ensure_compression_family_column()?;
+        self.ensure_edit_guard_file_column()?;
+
+        Ok(())
+    }
+
+    /// `file` on edit_guard_fires (idempotent).
+    ///
+    /// CREATE TABLE IF NOT EXISTS does not alter a table that already exists, so
+    /// a column added to the schema after a database was created is simply
+    /// absent — and because the guard's writes are deliberately non-fatal, the
+    /// failure was invisible: the query errored, `unwrap_or(false)` let the
+    /// warning through, and the insert dropped on the floor.
+    fn ensure_edit_guard_file_column(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(edit_guard_fires)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cols = std::collections::HashSet::new();
+        for c in rows {
+            cols.insert(c?);
+        }
+        if !cols.contains("file") {
+            self.conn.execute(
+                "ALTER TABLE edit_guard_fires ADD COLUMN file TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `command_family` on compression_savings (idempotent), plus a one-time
+    /// backfill so the history already collected becomes analysable.
+    fn ensure_compression_family_column(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(compression_savings)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cols = std::collections::HashSet::new();
+        for c in rows {
+            cols.insert(c?);
+        }
+        if !cols.contains("command_family") {
+            self.conn
+                .execute("ALTER TABLE compression_savings ADD COLUMN command_family TEXT", [])?;
+        }
+
+        // Guard the backfill on a rule version, not on the column's existence.
+        // The parsing rule is the thing that changes; bumping this re-derives
+        // history so old rows and new ones are always grouped the same way. The
+        // first rule missed newline separators and filed 78 rows under path
+        // fragments, which is exactly the kind of correction this has to allow.
+        const FAMILY_RULE_VERSION: &str = "2";
+        let applied: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'compression_family_rule'", [], |r| {
+                r.get(0)
+            })
+            .ok();
+        if applied.as_deref() == Some(FAMILY_RULE_VERSION) {
+            return Ok(());
+        }
+
+        // Backfill in Rust rather than SQL: the parsing rule is the same one new
+        // rows use, so history and future agree by construction.
+        let existing: Vec<(i64, String)> = {
+            let mut s = self.conn.prepare("SELECT id, command FROM compression_savings")?;
+            let r = s.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            r.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, cmd) in existing {
+            self.conn.execute(
+                "UPDATE compression_savings SET command_family = ?1 WHERE id = ?2",
+                params![Self::command_family(&cmd), id],
+            )?;
+        }
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('compression_family_rule', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![FAMILY_RULE_VERSION],
+        )?;
+        Ok(())
+    }
+
+    /// `superseded_by` on both knowledge tables (idempotent).
+    ///
+    /// Nullable and unconstrained by a foreign key on purpose: the replacement
+    /// lives in the same table, and a REFERENCES clause added by ALTER TABLE
+    /// cannot be enforced retroactively by SQLite anyway. `supersede()` does the
+    /// checking.
+    fn ensure_supersession_columns(&self) -> Result<()> {
+        for table in ["patterns", "anti_patterns"] {
+            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut cols = std::collections::HashSet::new();
+            for c in rows {
+                cols.insert(c?);
+            }
+            if !cols.contains("superseded_by") {
+                self.conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN superseded_by INTEGER"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -990,7 +1171,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, intent, body, uses, tags, approved_at, use_count,
                     reverted_count, survival_rate
-             FROM patterns ORDER BY survival_rate DESC, use_count DESC, approved_at DESC"
+             FROM patterns WHERE superseded_by IS NULL
+             ORDER BY survival_rate DESC, use_count DESC, approved_at DESC"
         )?;
         let rows = stmt.query_map([], row_to_pattern)?;
         let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1114,11 +1296,104 @@ impl Store {
 
     pub fn all_anti_patterns(&self) -> Result<Vec<AntiPattern>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, description, wrong, correct, tags, added_at FROM anti_patterns"
+            "SELECT id, description, wrong, correct, tags, added_at
+             FROM anti_patterns WHERE superseded_by IS NULL"
         )?;
         let rows = stmt.query_map([], row_to_anti_pattern)?;
         let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(items)
+    }
+
+    /// Retire an entry in favour of a newer one, without deleting it.
+    ///
+    /// A correction used to be ADDED beside the thing it corrected, and both were
+    /// then served on every call. Two anti-patterns about the same API said
+    /// opposite things and came back in one response, so the store actively
+    /// taught the bug that had just been fixed. Nothing else in the design could
+    /// catch that: every entry is true of the moment it was written, and only the
+    /// author of the correction knows which older entry it replaces.
+    ///
+    /// Superseded rows stay in the table -- they are the record of what was once
+    /// believed, and closeout evidence still points at their ids -- but retrieval
+    /// never shows them again.
+    pub fn supersede(&self, table: &str, old_id: i64, new_id: i64) -> Result<usize> {
+        if !matches!(table, "patterns" | "anti_patterns") {
+            anyhow::bail!("supersede: unknown table '{table}'");
+        }
+        if old_id == new_id {
+            anyhow::bail!("supersede: an entry cannot supersede itself (id {old_id})");
+        }
+        // The replacement must exist and must itself be live, or a typo would
+        // retire a good entry in favour of nothing.
+        let live: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1 AND superseded_by IS NULL"),
+            params![new_id],
+            |r| r.get(0),
+        )?;
+        if live == 0 {
+            anyhow::bail!("supersede: no live {table} row with id {new_id} to supersede in favour of");
+        }
+        let n = self.conn.execute(
+            &format!("UPDATE {table} SET superseded_by = ?1 WHERE id = ?2 AND superseded_by IS NULL"),
+            params![new_id, old_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Which traps the edit guard has already raised this session.
+    ///
+    /// Per-session rather than global: a trap worth naming once while you are
+    /// editing is not worth naming again three edits later, but it IS worth
+    /// naming again next week in a different piece of work.
+    pub fn edit_guard_fired_ids(&self, session_id: &str) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT anti_pattern_id FROM edit_guard_fires WHERE session_id = ?1")?;
+        let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Has this session already been warned about this file?
+    ///
+    /// One warning per file, not per trap. A file is edited many times in a row
+    /// during real work — this session touched some files fifteen times — and
+    /// "never the same trap twice" alone still permits a fresh trap on each of
+    /// those edits, which is the wallpaper outcome by a slower route.
+    pub fn edit_guard_warned_file(&self, session_id: &str, file: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edit_guard_fires WHERE session_id = ?1 AND file = ?2",
+            params![session_id, file],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn record_edit_guard_fire(
+        &self,
+        session_id: &str,
+        anti_pattern_id: i64,
+        file: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edit_guard_fires (session_id, anti_pattern_id, file, fired_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, anti_pattern_id, file, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Entries retired by `supersede`, newest replacement first.
+    pub fn superseded_rows(&self, table: &str) -> Result<Vec<(i64, i64, String)>> {
+        if !matches!(table, "patterns" | "anti_patterns") {
+            anyhow::bail!("superseded_rows: unknown table '{table}'");
+        }
+        let label = if table == "patterns" { "name" } else { "description" };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, superseded_by, {label} FROM {table}
+             WHERE superseded_by IS NOT NULL ORDER BY superseded_by DESC"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn delete_anti_pattern(&self, id: i64) -> Result<()> {
@@ -1314,6 +1589,48 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+/// The tool a command belongs to, for grouping compaction telemetry.
+///
+/// The full command string is kept for forensics, but it is useless for
+/// analysis: measured on the live store, 3,468 of 3,487 rows had a distinct
+/// `command`, because every one embeds a working directory, a path or a flag.
+/// "Which tools does compaction actually help?" — the question the 14%
+/// applicability rate exists to answer — could not be asked at all.
+///
+/// Environment assignments and `cd ... &&` prefixes are stepped over, since the
+/// interesting token is the program that produced the output.
+pub fn command_family(command: &str) -> String {
+    let mut rest = command.trim();
+    loop {
+        let head = rest.split_whitespace().next().unwrap_or("");
+        let is_env_assignment = head.contains('=') && !head.starts_with('-');
+        let is_prefix = matches!(head, "cd" | "sudo" | "time" | "env" | "nohup");
+        if !(is_env_assignment || is_prefix) {
+            break;
+        }
+        // Step past this token, and past a `&&`/`;` separator if one follows.
+        rest = rest[head.len()..].trim_start();
+        if is_prefix && head != "env" {
+            // The separator may be `&&`, `;` or a newline — a multi-line script
+            // is common. Take whichever comes first, or give up if the command
+            // is only the prefix. Missing the newline case attributed 78 rows to
+            // "src" and "vr_workspace", which are path fragments, not programs.
+            let cut = ["&&", ";", "\n"]
+                .iter()
+                .filter_map(|sep| rest.find(sep).map(|i| i + sep.len()))
+                .min();
+            match cut {
+                Some(i) => rest = rest[i..].trim_start(),
+                None => break, // `cd somewhere` with nothing after it
+            }
+        }
+    }
+    let head = rest.split_whitespace().next().unwrap_or("").trim_matches(['"', '\'', '(']);
+    // Keep the program, drop any path leading to it.
+    let base = head.rsplit(['/', '\\']).next().unwrap_or(head);
+    if base.is_empty() { "(unknown)".to_string() } else { base.to_lowercase() }
+}
+
     /// Record a lossless-compaction saving for telemetry. Non-fatal by
     /// contract — callers ignore the Result so a logging failure never breaks
     /// the compaction itself.
@@ -1331,9 +1648,16 @@ impl Store {
         };
         self.conn.execute(
             "INSERT INTO compression_savings
-                (session_key, command, original_chars, filtered_chars, ratio)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_key, command, original_chars as i64, filtered_chars as i64, ratio],
+                (session_key, command, command_family, original_chars, filtered_chars, ratio)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_key,
+                command,
+                Self::command_family(command),
+                original_chars as i64,
+                filtered_chars as i64,
+                ratio
+            ],
         )?;
         Ok(())
     }

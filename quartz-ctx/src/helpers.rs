@@ -61,7 +61,7 @@ pub fn find_related_apis(query: &str, items: &[ApiItem]) -> Vec<ApiItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ItemKind, Visibility};
+    use crate::model::{Confidence, ItemKind, Visibility};
 
     fn item(name: &str, doc: &str) -> ApiItem {
         ApiItem {
@@ -78,6 +78,8 @@ mod tests {
             origin: String::new(),
             visibility: Visibility::Public,
             span: None,
+            confidence: Confidence::Resolved,
+            language: "rust".to_string(),
             calls: Vec::new(),
         }
     }

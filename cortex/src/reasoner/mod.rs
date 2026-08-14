@@ -1,4 +1,4 @@
-//! Recurrent reasoning layer — iterative hypothesis refinement with critique and confidence scoring.
+//! Change simulation.
 //!
 //! The reasoner enables Copilot to tackle complex tasks by iterating through:
 //! 1. Propose: generate hypothesis
@@ -8,6 +8,4 @@
 //!
 //! Inspired by OpenMythos multi-step reasoning.
 
-pub mod scratchpad;
-pub mod recurrent;
 pub mod simulator;
