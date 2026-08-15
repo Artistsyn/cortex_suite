@@ -1306,7 +1306,7 @@ fn tool_trace_across_languages(
     let matched: Vec<_> = links
         .iter()
         .filter(|l| l.provider.is_some() && !l.consumers.is_empty())
-        .filter(|l| filter.as_ref().map_or(true, |f| l.key.to_lowercase().contains(f)))
+        .filter(|l| filter.as_ref().map_or(true, |f| l.matches(f)))
         .collect();
 
     // Name the item at each end where we can: a handler name is an answer, a
@@ -1401,7 +1401,7 @@ fn tool_trace_across_languages(
         let dangling: Vec<_> = links
             .iter()
             .filter(|l| l.provider.is_none() && !l.consumers.is_empty())
-            .filter(|l| filter.as_ref().map_or(true, |f| l.key.to_lowercase().contains(f)))
+            .filter(|l| filter.as_ref().map_or(true, |f| l.matches(f)))
             .collect();
         if !dangling.is_empty() {
             out.push_str("## Calls with no matching route\n\n");
@@ -1422,7 +1422,7 @@ fn tool_trace_across_languages(
         let unused: Vec<_> = links
             .iter()
             .filter(|l| l.provider.is_some() && l.consumers.is_empty())
-            .filter(|l| filter.as_ref().map_or(true, |f| l.key.to_lowercase().contains(f)))
+            .filter(|l| filter.as_ref().map_or(true, |f| l.matches(f)))
             .collect();
         if !unused.is_empty() {
             out.push_str(&format!(

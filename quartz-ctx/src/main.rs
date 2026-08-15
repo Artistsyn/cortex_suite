@@ -736,16 +736,16 @@ fn run_boundaries(args: BoundariesArgs) -> Result<()> {
     let boundaries = parser::scan_boundaries(&args.source);
     let links = bridge::link(&boundaries);
 
-    let keep = |k: &str| args.filter.as_ref().map_or(true, |f| k.contains(f.as_str()));
+    let keep = |l: &bridge::Link| args.filter.as_ref().map_or(true, |f| l.matches(f));
 
     let joined: Vec<_> = links.iter()
-        .filter(|l| l.provider.is_some() && !l.consumers.is_empty() && keep(&l.key))
+        .filter(|l| l.provider.is_some() && !l.consumers.is_empty() && keep(l))
         .collect();
     let dangling: Vec<_> = links.iter()
-        .filter(|l| l.provider.is_none() && !l.consumers.is_empty() && keep(&l.key))
+        .filter(|l| l.provider.is_none() && !l.consumers.is_empty() && keep(l))
         .collect();
     let unused: Vec<_> = links.iter()
-        .filter(|l| l.provider.is_some() && l.consumers.is_empty() && keep(&l.key))
+        .filter(|l| l.provider.is_some() && l.consumers.is_empty() && keep(l))
         .collect();
 
     println!("{} joined, {} calls with no route, {} routes with no caller

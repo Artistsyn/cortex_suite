@@ -93,11 +93,32 @@ pub struct Link {
 }
 
 impl Link {
+    /// Does this link match a user-supplied filter?
+    ///
+    /// Must consider the LABEL as well as the key. For FFI the key is folded
+    /// (`ffi:autodetectchains`) and the label is what the tool prints
+    /// (`ffi:auto_detect_chains`), so filtering on the key alone means the exact
+    /// string a caller just read back off the output matches nothing. A filter
+    /// that cannot find its own output is worse than no filter: it returns an
+    /// empty result that reads as "there is nothing there".
+    pub fn matches(&self, needle: &str) -> bool {
+        let n = needle.to_lowercase();
+        if n.is_empty() {
+            return true;
+        }
+        self.key.to_lowercase().contains(&n)
+            || self.label().to_lowercase().contains(&n)
+            // …and the raw spelling on either side, since a caller is as likely
+            // to paste the name they saw in the SOURCE as the one in the report.
+            || self.provider.as_ref().is_some_and(|b| b.raw.to_lowercase().contains(&n))
+            || self.consumers.iter().any(|b| b.raw.to_lowercase().contains(&n))
+    }
+
     /// How to show this link to a human.
     ///
     /// The folded FFI key (`ffi:autodetectchains`) is a matching artefact and
-    /// appears nowhere in the source, so printing it makes the reader hunt for
-    /// a name that does not exist. Show the spelling the provider actually used,
+    /// appears nowhere in the source, so printing it makes the reader hunt for a
+    /// name that does not exist. Show the spelling the provider actually used,
     /// falling back to a caller's when nothing provides it.
     pub fn label(&self) -> String {
         match self.kind {
@@ -672,5 +693,46 @@ mod origin_tests {
         tag_origin(&mut b, "avatar_ik_wasm");
         assert_eq!(b[0].origin, "avatar_ik_wasm");
         assert_eq!(b[0].span.file, "lib.rs", "the relative path is unchanged");
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn ffi_link() -> Link {
+        let b = scan_file(
+            Path::new("lib.rs"),
+            "#[wasm_bindgen]\npub fn auto_detect_chains(x: f32) -> f32 { x }\n",
+            "rust",
+        );
+        link(&b).into_iter().next().unwrap()
+    }
+
+    /// A filter that cannot find its own output is worse than no filter: it
+    /// returns an empty result, which reads as "there is nothing there".
+    /// The FFI join key is folded (`ffi:autodetectchains`); the label the tool
+    /// PRINTS is `ffi:auto_detect_chains`, and that is the string a caller will
+    /// paste back in.
+    #[test]
+    fn a_filter_matches_the_name_the_tool_printed() {
+        let l = ffi_link();
+        assert_eq!(l.label(), "ffi:auto_detect_chains");
+        assert!(l.matches("ffi:auto_detect_chains"), "the printed label must match");
+        assert!(l.matches("auto_detect"), "a substring of it must match");
+        assert!(l.matches("ffi:autodetectchains"), "the folded key must still match");
+        assert!(l.matches("AUTO_DETECT"), "case-insensitive");
+        assert!(l.matches(""), "an empty filter matches everything");
+        assert!(!l.matches("solve_body_pose"), "an unrelated name must not match");
+    }
+
+    #[test]
+    fn an_http_filter_still_matches_its_path() {
+        let mut b = scan_file(Path::new("server.py"), "@app.get(\"/api/scenes\")\n", "python");
+        b.extend(scan_file(Path::new("app.js"), "fetch('/api/scenes');\n", "javascript"));
+        let l = link(&b).into_iter().find(|l| l.provider.is_some()).unwrap();
+        assert!(l.matches("/api/scenes"));
+        assert!(l.matches("scenes"));
+        assert!(!l.matches("/api/models"));
     }
 }

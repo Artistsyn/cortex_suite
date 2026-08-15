@@ -53,6 +53,27 @@ can see those — the compiler included — because neither side is wrong on its
 quartz-ctx boundaries --source .
 ```
 
+**This depends entirely on how far up you point each root.** For a Rust library,
+point at its `src` — that is the project. For anything with more than one
+language in it, point at the **application directory**: a web app whose backend
+is `server.py` and whose frontend is `frontend/src` is **one** root.
+
+Rooting at `app/frontend/src` indexes the callers and not the routes they call,
+so every call reports as *no matching route* — which is indistinguishable from a
+genuinely broken call. The reference workspace shipped exactly this mistake and
+reported five real, working endpoints as orphaned. The same applies across the
+FFI boundary: a wasm crate and the JavaScript importing it must both be listed,
+or you get two lists of false findings describing one working boundary.
+
+Pointing at an app root is safe. Build output is rejected by **shape** — a
+content-hash filename, or any line over 5,000 characters — not by folder name,
+so bundles are skipped even when they sit somewhere no blocklist would look. The
+skip count is always printed.
+
+`.cortex/index-sources.json` carries all of this in its own comment block, and
+`boundaries` is the check: a long *calls with no matching route* list usually
+means a root is missing from the manifest, not that the code is broken.
+
 ## Install
 
 ```powershell
