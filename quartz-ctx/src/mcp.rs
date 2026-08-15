@@ -1287,8 +1287,11 @@ fn tool_trace_across_languages(
     if sources.is_empty() {
         return Ok("No source roots configured, so there is nothing to scan.".into());
     }
-    for (path, _tag, _priv) in sources {
-        boundaries.extend(parser::scan_boundaries(path));
+    for (path, tag, _priv) in sources {
+        let mut found = parser::scan_boundaries(path);
+        // Without this, `lib.rs` means `lib.rs` in EVERY root at once.
+        crate::bridge::tag_origin(&mut found, tag);
+        boundaries.extend(found);
     }
     if boundaries.is_empty() {
         return Ok(
@@ -1308,20 +1311,52 @@ fn tool_trace_across_languages(
 
     // Name the item at each end where we can: a handler name is an answer, a
     // file:line is homework.
-    let name_at = |file: &str, line: usize| -> String {
-        items
+    //
+    // `symbol` is the boundary's own name — used for imports, which sit at the
+    // top of a file inside nothing, so the useful answer is whichever item
+    // actually calls the imported symbol rather than whatever happens to be
+    // declared near line 1.
+    let name_at = |file: &str, line: usize, symbol: &str, origin: &str| -> String {
+        // Origin FIRST: span.file is relative to its own scan root, so matching on
+        // the filename alone treats every root's `lib.rs` as the same file.
+        let same_place = |i: &&ApiItem| {
+            i.origin == origin && i.span.as_ref().is_some_and(|s| s.file == file)
+        };
+        let near = items
             .iter()
-            .filter(|i| i.span.as_ref().is_some_and(|s| s.file == file))
+            .filter(same_place)
             .filter(|i| {
                 let l = i.span.as_ref().map(|s| s.line).unwrap_or(0);
                 (l >= line && l <= line + 4) || l <= line
             })
+            // Tie-break BELOW the line. An attribute or decorator precedes the
+            // item it belongs to, so at equal distance the one underneath is the
+            // owner — `#[wasm_bindgen]` on line 34 named the `Pose` struct on
+            // line 33 instead of the `auto_detect_chains` fn on line 35, both
+            // exactly one line away.
             .min_by_key(|i| {
                 let l = i.span.as_ref().map(|s| s.line).unwrap_or(0);
-                if l >= line { l - line } else { line - l }
+                let dist = if l >= line { l - line } else { line - l };
+                (dist, u8::from(l < line))
             })
-            .map(|i| format!("`{}`", i.name))
-            .unwrap_or_default()
+            .map(|i| format!("`{}`", i.name));
+
+        // An import names nothing near it. Fall back to whoever calls it.
+        let callers: Vec<&str> = items
+            .iter()
+            .filter(same_place)
+            .filter(|i| {
+                !symbol.is_empty()
+                    && i.calls.iter().any(|e| {
+                        e.to == symbol || e.to.ends_with(&format!("::{symbol}"))
+                    })
+            })
+            .map(|i| i.name.as_str())
+            .collect();
+        if !callers.is_empty() {
+            return format!("`{}`", callers.join("`, `"));
+        }
+        near.unwrap_or_default()
     };
 
     let mut out = String::from("# Cross-language call edges\n\n");
@@ -1346,7 +1381,7 @@ fn tool_trace_across_languages(
         }
         out.push_str(&format!(
             "- **served by** {} {} — `{}` _{}_\n",
-            name_at(&p.span.file, p.span.line),
+            name_at(&p.span.file, p.span.line, &p.raw, &p.origin),
             p.method.as_deref().unwrap_or(""),
             p.span,
             p.language
@@ -1354,7 +1389,7 @@ fn tool_trace_across_languages(
         for c in &l.consumers {
             out.push_str(&format!(
                 "- **called from** {} — `{}` _{}_\n",
-                name_at(&c.span.file, c.span.line),
+                name_at(&c.span.file, c.span.line, &c.raw, &c.origin),
                 c.span,
                 c.language
             ));

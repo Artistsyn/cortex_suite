@@ -60,6 +60,15 @@ pub struct Boundary {
     /// Path as written, before normalisation — so a human can recognise it.
     pub raw: String,
     pub language: String,
+    /// Which source root this came from.
+    ///
+    /// `span.file` is relative to its OWN scan root, so `lib.rs` in
+    /// `avatar_ik_wasm/src` and `lib.rs` in any other crate are the same string.
+    /// Resolving a boundary to an item by filename alone therefore names an item
+    /// from whichever root happened to match first — it reported a `Pose` struct
+    /// from a different crate as the handler for `auto_detect_chains`. Set by
+    /// the scanner, not the parser, exactly like `ApiItem::origin`.
+    pub origin: String,
     pub span: SourceSpan,
 }
 
@@ -157,6 +166,15 @@ fn patterns() -> &'static Patterns {
     })
 }
 
+/// Stamp every boundary with the source root it came from.
+///
+/// Called by the scanner once per root, mirroring how `ApiItem::origin` is set.
+pub fn tag_origin(boundaries: &mut [Boundary], origin: &str) {
+    for b in boundaries {
+        b.origin = origin.to_string();
+    }
+}
+
 /// Join key for a symbol crossing the FFI boundary.
 ///
 /// Rust exports `auto_detect_chains`; the JavaScript that calls it says
@@ -239,6 +257,7 @@ pub fn scan_file(path: &Path, text: &str, language: &str) -> Vec<Boundary> {
                     method,
                     raw: raw.to_string(),
                     language: language.to_string(),
+                origin: String::new(),
                     span: SourceSpan { file: rel.clone(), line: line_no },
                 });
             }
@@ -260,6 +279,7 @@ pub fn scan_file(path: &Path, text: &str, language: &str) -> Vec<Boundary> {
                     method: None,
                     raw: name.clone(),
                     language: language.to_string(),
+                origin: String::new(),
                     span: SourceSpan { file: rel.clone(), line: line_no },
                 });
             }
@@ -273,6 +293,7 @@ pub fn scan_file(path: &Path, text: &str, language: &str) -> Vec<Boundary> {
                 method: None,
                 raw: name,
                 language: language.to_string(),
+                origin: String::new(),
                 span: SourceSpan { file: rel.clone(), line: line_no },
             });
         }
@@ -292,6 +313,7 @@ pub fn scan_file(path: &Path, text: &str, language: &str) -> Vec<Boundary> {
                     method: None,
                     raw: sym.to_string(),
                     language: language.to_string(),
+                origin: String::new(),
                     span: SourceSpan { file: rel.clone(), line: line_no },
                 });
             }
@@ -628,5 +650,27 @@ mod ffi_naming_tests {
         // Each side keeps the spelling it actually uses.
         assert_eq!(joined[0].provider.as_ref().unwrap().raw, "auto_detect_chains");
         assert_eq!(joined[0].consumers[0].raw, "autoDetectChains");
+    }
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    /// `span.file` is relative to its OWN scan root, so `lib.rs` is the same
+    /// string in every crate. Resolving a boundary to an item by filename alone
+    /// named a `Pose` struct from an unrelated crate as the handler for
+    /// `auto_detect_chains` — a wrong answer that reads exactly like a right one.
+    #[test]
+    fn a_boundary_carries_the_root_it_came_from() {
+        let mut b = scan_file(
+            Path::new("lib.rs"),
+            "#[wasm_bindgen]\npub fn solve_ik(x: f32) -> f32 { x }\n",
+            "rust",
+        );
+        assert!(b[0].origin.is_empty(), "the scanner sets it, not the parser");
+        tag_origin(&mut b, "avatar_ik_wasm");
+        assert_eq!(b[0].origin, "avatar_ik_wasm");
+        assert_eq!(b[0].span.file, "lib.rs", "the relative path is unchanged");
     }
 }
