@@ -72,6 +72,14 @@ param(
 
 Push-Location "$PSScriptRoot\.."
 
+# The script lives in <repo>\.cortex\, so the repo root is its parent -- resolved
+# to a real path rather than left as "..\", because $NAME below is derived from
+# it. This was previously referenced without ever being assigned: with no
+# StrictMode, $REPO_ROOT was $null, `Split-Path -Leaf $null` returned nothing,
+# and every workspace that did not set CORTEX_NAME got an EMPTY name while the
+# comment beside it promised the name was derived from the directory.
+$REPO_ROOT     = (Resolve-Path "$PSScriptRoot\..").Path
+
 $DB            = ".cortex\memory.db"
 # First target in index-sources.json, so a workspace with no quartz/ still works.
 $SOURCE        = $null  # resolved below, after $INDEX_TARGETS is read
@@ -84,12 +92,30 @@ $REPO          = "."
 # installed into. Baking in one project's name is how a launcher silently
 # mislabels every other workspace that copies it.
 $NAME          = if ($env:CORTEX_NAME) { $env:CORTEX_NAME } else { Split-Path -Leaf $REPO_ROOT }
-$CARGO         = "cortex\Cargo.toml"
-$BINARY        = "cortex\target\debug\cortex.exe"
+# Locate the suite source. The two crates sit either directly at the workspace
+# root - the layout the reference workspace grew up with - or inside a
+# cortex_suite checkout, which is what the Quickstart's
+# `git clone <this-repo> cortex_suite` actually gives you. Hardcoding the first
+# meant every command that shells out to cargo failed with "manifest path
+# cortex\Cargo.toml does not exist" for anyone who followed the README, while
+# setup.ps1 had already written a working .mcp.json pointing at cortex_suite\ -
+# so the MCP servers ran and the launcher did not. Detect instead;
+# CORTEX_SUITE overrides for any other layout.
+$SUITE = if ($env:CORTEX_SUITE) {
+    ($env:CORTEX_SUITE.TrimEnd('\', '/')) + '\'
+} elseif (Test-Path (Join-Path $REPO_ROOT "cortex\Cargo.toml")) {
+    ""
+} elseif (Test-Path (Join-Path $REPO_ROOT "cortex_suite\cortex\Cargo.toml")) {
+    "cortex_suite\"
+} else {
+    ""   # fall through; the missing-manifest error is the clear one
+}
+$CARGO         = "${SUITE}cortex\Cargo.toml"
+$BINARY        = "${SUITE}cortex\target\debug\cortex.exe"
 # quartz-ctx is the extraction engine: its api-graph carries full method signatures
 # with types, per-method docs and field docs that cortex's own parser discards.
 # Optional - if the binary is absent, reindex falls back to cortex-only extraction.
-$QCTX_BINARY   = "quartz-ctx\target\release\quartz-ctx.exe"
+$QCTX_BINARY   = "${SUITE}quartz-ctx\target\release\quartz-ctx.exe"
 $QCTX_OUT      = ".cortex\apigraph"
 
 function Write-Prefix {
@@ -259,15 +285,24 @@ function Set-McpConfig {
         $cfg | Add-Member -NotePropertyName inputs -NotePropertyValue @() -Force
     }
 
+    # Forward slashes: they work on Windows and survive JSON escaping. The
+    # command follows $SUITE so a cortex_suite checkout is wired correctly, and
+    # --source follows the manifest rather than the literal "quartz/src" this
+    # once emitted -- that hardcode wrote the reference project's own layout
+    # into every other workspace's MCP config, where the server then failed to
+    # start with nothing in the config looking wrong.
+    $cortexCommand = ("${SUITE}cortex/target/debug/cortex.exe") -replace '\\', '/'
+    $cortexSource  = if ($SOURCE) { $SOURCE } else { "src" }
+
     $cortexServer = [pscustomobject]@{
         type = "stdio"
-        command = "cortex/target/debug/cortex.exe"
+        command = $cortexCommand
         args = @(
             "--db",
             ".cortex/memory.db",
             "serve",
             "--source",
-            "quartz/src",
+            $cortexSource,
             "--repo",
             ".",
             "--name",
@@ -284,9 +319,14 @@ function Set-McpConfig {
 
 $INDEX_TARGETS = Get-ConfiguredIndexTargets
 if ($INDEX_TARGETS -and $INDEX_TARGETS.Count -gt 0) {
-    $SOURCE = [string]$INDEX_TARGETS[0].source
-    if ($INDEX_TARGETS.Count -gt 1) {
-    }
+    # Prefer the first root that actually exists, not simply the first listed.
+    # `reindex` only warns about a missing root and carries on, but quartz-ctx
+    # treats its PRIMARY source as fatal and exits before the MCP handshake -
+    # so a manifest whose first entry is a tree this machine has not checked
+    # out yet yields a server that never starts, while check-mcp passes and
+    # both config files agree. Ordering is not cosmetic here.
+    $existing = $INDEX_TARGETS | Where-Object { Test-Path ([string]$_.source) } | Select-Object -First 1
+    $SOURCE = if ($existing) { [string]$existing.source } else { [string]$INDEX_TARGETS[0].source }
 }
 
 function Invoke-CargoCaptureWithRetry {

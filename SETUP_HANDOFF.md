@@ -315,6 +315,61 @@ binaries; leave it off for libraries so their indexed surface stays the API they
 actually promise. The setting is **per root**, so one server can serve a library
 at its API surface and an app at full structure simultaneously.
 
+### 2.12 The launcher and the MCP config disagreed about where the suite lives
+
+**Symptom:** the MCP servers work, but every `cortex.sh` / `cortex.ps1` command
+that touches cargo dies with ``manifest path `cortex/Cargo.toml` does not
+exist``.
+
+This hit anyone who followed the Quickstart. `git clone <this-repo> cortex_suite`
+puts the crates at `cortex_suite/cortex/`, and `setup.sh` correctly wrote a
+`.mcp.json` pointing there — but both launchers hardcoded `cortex/Cargo.toml`,
+the layout of the reference workspace, where the crates sat at the root. So the
+servers ran and the launcher did not, which reads as "the launcher is broken"
+rather than "these two disagree".
+
+Both launchers now detect: `cortex/Cargo.toml` at the root, else
+`cortex_suite/cortex/Cargo.toml`, with `CORTEX_SUITE` overriding for any other
+layout. If your checkout is somewhere else entirely:
+
+```bash
+CORTEX_SUITE=tools/cortex_suite ./.cortex/cortex.sh status
+```
+
+### 2.13 A missing source root used to kill the server, but only in first place
+
+**Symptom:** quartz-ctx "fails to start" with no useful message, on a workspace
+where `check-mcp` passes and `cortex reindex` is perfectly happy.
+
+`quartz-ctx serve` treated its **primary** source — index 0 of the merged root
+list — as fatal if the path did not exist, while warning and skipping every root
+after it. That gave the *order* of `index-sources.json` a meaning it does not
+have. A workspace part-way through a migration, with some trees checked out and
+others not, got a server that exited before the MCP handshake purely because an
+absent root happened to be listed first. Nothing else disagreed: `reindex` warns
+and carries on over the same manifest, `check-mcp` passes because both config
+files genuinely are identical, and no path in either file is wrong.
+
+Every missing root now warns and is skipped wherever it sits. Being unable to
+serve **anything** is still an error, and it now names every root it tried plus
+the working directory it resolved them against — because that is almost always
+the real cause.
+
+The general lesson, and it is the one this file keeps relearning: **a passing
+config check means the files agree, not that the server starts.** Verify by
+handshaking it.
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+| cortex_suite/quartz-ctx/target/release/quartz-ctx serve \
+    --sources-from .cortex/index-sources.json --name MyWorkspace
+```
+
+A `tools/list` result means it is genuinely up. Anything else is not.
+
 ---
 
 ## 3. Daily use
@@ -470,6 +525,9 @@ names.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Server "not connected" | binary missing, or `serve` not first in args | check the path exists; see 2.3 |
+| ``manifest path `cortex/Cargo.toml` does not exist`` | launcher assumed the crates sit at the workspace root | update the launchers, or set `CORTEX_SUITE`; see 2.12 |
+| quartz-ctx dead, but `check-mcp` passes | a source root that does not exist on this machine | rebuild quartz-ctx; see 2.13 |
+| Workspace name is empty on Windows | `cortex.ps1` read an unassigned `$REPO_ROOT` | update `cortex.ps1`, or set `CORTEX_NAME` |
 | Tool behaves as before a fix | stale binary or cached response | 2.1 then 2.2 |
 | `Access is denied (os error 5)` | server holds the binary | stop processes first (2.1) |
 | Editor sees different data than Claude Code | config drift | 2.4 |

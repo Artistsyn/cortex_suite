@@ -25,16 +25,35 @@ NAME="${CORTEX_NAME:-$(basename "$ROOT")}"
 DB="${CORTEX_DB:-.cortex/memory.db}"
 INDEX_CONFIG=".cortex/index-sources.json"
 REPO="."
-CARGO="cortex/Cargo.toml"
 QCTX_OUT=".cortex/apigraph"
+
+# ── Locate the suite source ──────────────────────────────────────────────────
+# The two crates sit either directly at the workspace root -- the layout the
+# reference workspace grew up with -- or inside a cortex_suite checkout, which
+# is what the Quickstart's `git clone <this-repo> cortex_suite` actually gives
+# you. Hardcoding the first meant every command that shells out to cargo failed
+# with "manifest path `cortex/Cargo.toml` does not exist" for anyone who
+# followed the README, while setup.sh had already written a working .mcp.json
+# pointing at cortex_suite/ -- so the MCP servers ran and the launcher did not.
+# Detect instead; CORTEX_SUITE overrides for any other layout.
+if [ -n "${CORTEX_SUITE:-}" ]; then
+    SUITE="${CORTEX_SUITE%/}/"
+elif [ -f "cortex/Cargo.toml" ]; then
+    SUITE=""
+elif [ -f "cortex_suite/cortex/Cargo.toml" ]; then
+    SUITE="cortex_suite/"
+else
+    SUITE=""   # fall through; the missing-manifest error below is the clear one
+fi
+CARGO="${SUITE}cortex/Cargo.toml"
 
 # Windows shells (Git Bash / MSYS) still want the .exe suffix.
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;;
     *)                    EXE=""     ;;
 esac
-BINARY="cortex/target/debug/cortex${EXE}"
-QCTX_BINARY="quartz-ctx/target/release/quartz-ctx${EXE}"
+BINARY="${SUITE}cortex/target/debug/cortex${EXE}"
+QCTX_BINARY="${SUITE}quartz-ctx/target/release/quartz-ctx${EXE}"
 
 say() { printf '[cortex] %s\n' "$*"; }
 die() { say "$*"; exit 1; }
@@ -53,8 +72,26 @@ manifest_targets() {
     fi
 }
 
+# The first root that actually exists, not simply the first listed.
+#
+# `reindex` only warns about a missing root and carries on, but quartz-ctx
+# treats its PRIMARY source as fatal and exits before the MCP handshake -- so a
+# manifest whose first entry is a tree this machine has not checked out yet
+# yields a server that never starts, while check-mcp passes and both config
+# files agree. Ordering is not cosmetic here.
 primary_source() {
-    manifest_targets | head -1 | cut -f1
+    # The loop runs in a subshell because of the pipe, so it cannot `return`
+    # out of the function -- capture its output instead and decide here.
+    _existing="$(manifest_targets | cut -f1 | while IFS= read -r src; do
+        if [ -e "$src" ]; then printf '%s' "$src"; break; fi
+    done)"
+    if [ -n "$_existing" ]; then
+        printf '%s' "$_existing"
+    else
+        # Nothing on disk: fall back to the first listed so the error names a
+        # real configured path rather than an empty string.
+        manifest_targets | head -1 | cut -f1
+    fi
 }
 
 run_bin() {

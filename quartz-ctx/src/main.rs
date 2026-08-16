@@ -415,14 +415,21 @@ fn run_serve(args: ServeArgs) -> Result<()> {
     }
 
     let mut sources: Vec<(PathBuf, String, bool)> = Vec::new();
-    for (i, (src, scope, include_private)) in requested.iter().enumerate() {
+    for (src, scope, include_private) in requested.iter() {
+        // Every missing root warns and is skipped, wherever it sits in the list.
+        //
+        // This used to make index 0 alone fatal, which gave a manifest's ORDER a
+        // meaning it does not have: a workspace part-way through a migration --
+        // some trees checked out, others not yet -- got a server that exited
+        // before the MCP handshake purely because an absent root happened to be
+        // listed first. The host reports that as a vague connection failure, and
+        // nothing else disagrees: `cortex reindex` warns and carries on over the
+        // same manifest, and `check-mcp` passes because both config files really
+        // are identical. Nothing on disk looks wrong; the server is simply dead.
+        //
+        // Being unable to serve ANYTHING is still an error -- that check is
+        // after the loop, where it can name every root it tried.
         if !src.exists() {
-            if i == 0 {
-                return Err(anyhow!(
-                    "primary source path does not exist: {}\nhelp: verify --source path and MCP working directory",
-                    src.display()
-                ));
-            }
             eprintln!("warn: skipping missing source: {}", src.display());
             continue;
         }
@@ -466,6 +473,26 @@ fn run_serve(args: ServeArgs) -> Result<()> {
             }
         }
         sources.push((src.clone(), tag, *include_private));
+    }
+
+    // Nothing left to serve is the real failure, and it is worth naming every
+    // root that was tried: the cause is almost always a working directory the
+    // MCP host resolved differently than expected, which one path alone does
+    // not make obvious.
+    if sources.is_empty() {
+        let tried = requested
+            .iter()
+            .map(|(p, _, _)| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow!(
+            "no source path exists - nothing to serve\ntried:\n{tried}\n\
+             help: paths resolve against the MCP working directory, not the config file.\n\
+             help: cwd is {}",
+            std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".into())
+        ));
     }
 
     for (path, tag, include_private) in &sources {
