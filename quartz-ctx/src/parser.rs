@@ -1030,11 +1030,10 @@ impl<'ast> Visit<'ast> for ApiVisitor {
         // Capture the actual value expression (truncated) — agents asking for
         // engine constants need the real number, not an ellipsis.
         let expr = &node.expr;
-        let mut value = quote!(#expr).to_string().replace(" :: ", "::");
-        if value.len() > 60 {
-            value.truncate(57);
-            value.push_str("...");
-        }
+        let value = crate::model::ellipsize(
+            &quote!(#expr).to_string().replace(" :: ", "::"),
+            60,
+        );
         self.items.push(ApiItem {
             kind: ItemKind::Const,
             name: node.ident.to_string(),

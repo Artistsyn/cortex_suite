@@ -199,6 +199,27 @@ impl Visibility {
     }
 }
 
+/// Shorten to at most `max` CHARACTERS, with an ellipsis when anything was cut.
+///
+/// `String::truncate` takes a byte index and panics outright if it lands inside
+/// a multi-byte character. That is not a hypothetical: this crashed the whole
+/// extraction run for a crate on
+///
+///   const STANDALONE: &[char] = &['–', '—', '§', '⁂', '•', '◦'];
+///
+/// where byte 57 sits mid-character. One `const` took down every item in the
+/// root, and the launcher was discarding stderr, so the only visible symptom
+/// was an api-graph that quietly never appeared.
+pub fn ellipsize(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
 /// A source location an agent can cite and open: `path:line`.
 /// `file` is relative to the scanned root and always uses forward slashes, so it
 /// reads identically on every platform.

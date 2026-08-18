@@ -1126,8 +1126,7 @@ fn tool_get_api_context(args: &Value, items: &[ApiItem]) -> Result<String, Strin
             _ => {
                 // Up to 8 method signatures, truncated — the callable surface.
                 for m in item.methods.iter().take(8) {
-                    let mut sig = m.signature.clone();
-                    if sig.len() > 100 { sig.truncate(97); sig.push_str("..."); }
+                    let sig = crate::model::ellipsize(&m.signature, 100);
                     block.push_str(&format!("  - `{sig}`\n"));
                 }
                 if item.methods.len() > 8 {

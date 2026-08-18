@@ -711,3 +711,29 @@ fn a_dotted_base_class_names_one_type_not_two() {
     let x = parse("class T(unittest.TestCase):\n    def m(self): pass\n", Language::Python, false);
     assert_eq!(item(&x, "T").traits_impl, vec!["TestCase".to_string()]);
 }
+
+// ── truncation ──────────────────────────────────────────────────────────────
+
+/// `String::truncate` takes a BYTE index and panics if it lands inside a
+/// multi-byte character. A single `const` of unicode chars in one crate
+/// therefore killed the whole extraction run for that root — and the launcher
+/// was discarding stderr, so the only symptom was an api-graph that never
+/// appeared.
+#[test]
+fn shortening_a_value_never_splits_a_character() {
+    use crate::model::ellipsize;
+
+    // The real one, from tale_forge_core/src/import/chunking.rs.
+    let real = "& ['–' , '—' , '§' , '⁂' , '•' , '◦']";
+    let cut = ellipsize(real, 12);
+    assert!(cut.ends_with("..."), "{cut}");
+    assert_eq!(cut.chars().count(), 12);
+
+    // Every prefix length is a safe cut, not only the lucky ones.
+    for n in 1..=real.chars().count() + 2 {
+        let _ = ellipsize(real, n);
+    }
+
+    assert_eq!(ellipsize("short", 60), "short");
+    assert_eq!(ellipsize("", 60), "");
+}
