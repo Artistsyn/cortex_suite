@@ -238,7 +238,7 @@ commands on both.
 |---|---|
 | `reindex` | regenerate api-graphs and re-index every source in the manifest |
 | `deploy` | rebuild cortex without stopping the MCP server |
-| `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |
+| `check-mcp` | validate both MCP configs: every command resolves, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
 | `fired` | which mechanisms have actually run, and which are silently idle |

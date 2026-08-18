@@ -47,19 +47,35 @@ Linux, `cortex.ps1` for Windows. They take the same commands, so a mixed team
 runs the same instructions. Neither hardcodes a project: the workspace name is
 the directory it sits in (override with `CORTEX_NAME`).
 
+It writes `.cortex/suite.env` too, recording where the suite itself lives. The
+launcher needs that whenever the suite is not inside the workspace — which is
+what the Quickstart above produces. Delete the file and re-run setup if the
+suite moves; `CORTEX_SUITE` in the environment overrides it.
+
+**Both servers start before you have configured anything.** A manifest listing
+roots that do not exist here — including the placeholder one setup just wrote —
+gives you a running quartz-ctx whose every tool answers with what is missing and
+how to fix it. That is deliberate: a server that exits before the MCP handshake
+shows up in the host as an unexplained connection failure, and an index that is
+empty *silently* is worse still, because "no item named `Canvas`" then reads as a
+fact about your code.
+
 1. **Edit `.cortex/index-sources.json`** — list your crates. This is the only file
-   you must edit by hand.
+   you must edit by hand. New roots are picked up within ~5s, without a restart.
 2. **Index once:**
    ```bash
-   cortex --db .cortex/memory.db index --source my_crate/src --name MyCrate
+   ./.cortex/cortex.sh reindex          # .\.cortex\cortex.ps1 on Windows
    ```
+   It reports how many of the configured roots it actually indexed, and exits
+   non-zero if that is none.
 3. **Check the MCP configs:**
    ```bash
    ./.cortex/cortex.sh check-mcp        # .\.cortex\cortex.ps1 on Windows
    ```
    Catches the two failures that produce a server which silently never starts:
-   an absolute path in `command`, and drift between `.mcp.json` and
-   `.vscode/mcp.json`.
+   a `command` that does not resolve from the workspace root, and drift between
+   `.mcp.json` and `.vscode/mcp.json`. An absolute path is fine — it is required
+   when the suite lives outside the workspace — as long as it exists here.
 4. **Restart your editor** so it re-reads the MCP config.
 5. **Verify:** ask the agent `get_api_context(hint: "...")`. If it returns your
    types, you are done.

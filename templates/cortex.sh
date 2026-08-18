@@ -35,7 +35,22 @@ QCTX_OUT=".cortex/apigraph"
 # with "manifest path `cortex/Cargo.toml` does not exist" for anyone who
 # followed the README, while setup.sh had already written a working .mcp.json
 # pointing at cortex_suite/ -- so the MCP servers ran and the launcher did not.
-# Detect instead; CORTEX_SUITE overrides for any other layout.
+#
+# There is a THIRD layout, and it is the one the Quickstart actually describes:
+# the suite cloned somewhere of its own and pointed at a workspace elsewhere
+# (`./setup.sh ~/code/my-project`). Neither probe below can find it -- nothing
+# in the workspace records where it went -- so every cargo-shelling command
+# failed, and worse, `reindex` read its target list through the binary it could
+# not find, looped zero times, and printed "done. indexed configured sources".
+# A no-op that reports success is the failure this project keeps meeting.
+#
+# So setup writes the path it used into .cortex/suite.env, and that is read
+# here. CORTEX_SUITE in the environment still wins, for any layout nobody has
+# thought of yet.
+if [ -z "${CORTEX_SUITE:-}" ] && [ -f ".cortex/suite.env" ]; then
+    # shellcheck disable=SC1091
+    . ".cortex/suite.env"
+fi
 if [ -n "${CORTEX_SUITE:-}" ]; then
     SUITE="${CORTEX_SUITE%/}/"
 elif [ -f "cortex/Cargo.toml" ]; then
@@ -74,11 +89,11 @@ manifest_targets() {
 
 # The first root that actually exists, not simply the first listed.
 #
-# `reindex` only warns about a missing root and carries on, but quartz-ctx
-# treats its PRIMARY source as fatal and exits before the MCP handshake -- so a
-# manifest whose first entry is a tree this machine has not checked out yet
-# yields a server that never starts, while check-mcp passes and both config
-# files agree. Ordering is not cosmetic here.
+# `cortex serve` takes ONE --source, so handing it a path that is not on this
+# machine indexes nothing. (quartz-ctx used to make this fatal as well, exiting
+# before the MCP handshake when its first root was missing; it now skips missing
+# roots and starts either way, so manifest order no longer decides whether a
+# server comes up. It still decides what cortex indexes here.)
 primary_source() {
     # The loop runs in a subshell because of the pipe, so it cannot `return`
     # out of the function -- capture its output instead and decide here.
@@ -133,24 +148,58 @@ deploy)
 reindex)
     [ -f "$INDEX_CONFIG" ] || die "no $INDEX_CONFIG - nothing to index"
 
+    # Count what was read and what was indexed, and report on both.
+    #
+    # "done. indexed configured sources" used to print unconditionally, so a
+    # run that indexed NOTHING looked exactly like a run that indexed
+    # everything. Both ways to get there are ordinary on a new machine: a
+    # manifest of roots that are not checked out here, and a launcher that
+    # cannot find the binary it reads the manifest with (see suite.env above) --
+    # the second yields zero targets and used to be completely silent.
+    TARGETS=0
+    INDEXED=0
+
     # Process substitution rather than a temp file: no cleanup path to get
     # wrong, and no collision between two runs in the same second.
     while IFS="$(printf '	')" read -r SRC TNAME SCOPE; do
         [ -n "${SRC:-}" ] || continue
+        TARGETS=$((TARGETS + 1))
         if [ ! -d "$SRC" ]; then
             say "WARN: skipping missing source path $SRC"
             continue
         fi
+        INDEXED=$((INDEXED + 1))
 
         # quartz-ctx is the extractor: its api-graph carries full signatures that
         # cortex's own pass does not. Optional -- a missing binary degrades to
         # cortex extraction rather than failing the reindex.
+        # The flag is --output, and the context directory is pinned rather than
+        # guessed.
+        #
+        # It read --out, which the binary rejects with "unexpected argument",
+        # and the whole call was wrapped in >/dev/null 2>&1 -- so the extractor
+        # that carries full signatures had never run through this launcher, on
+        # any workspace, and every reindex silently fell back to cortex's weaker
+        # pass while reporting success. The candidate path was guessed too:
+        # without --context-dir the tree lands under the source's own directory
+        # name, so "primary" never existed for an unscoped target and the graph
+        # would have been missed even had the call worked.
+        #
+        # Failures are reported now. Optional means "degrades to cortex
+        # extraction", not "fails invisibly".
         GRAPH=""
         if [ -x "$QCTX_BINARY" ]; then
             CTXDIR="${SCOPE:-primary}"
-            if "$QCTX_BINARY" generate --source "$SRC" --name "${TNAME:-$NAME}"                  --out "$QCTX_OUT" --include-private >/dev/null 2>&1; then
+            if "$QCTX_BINARY" generate --source "$SRC" --name "${TNAME:-$NAME}" \
+                   --output "$QCTX_OUT" --context-dir "$CTXDIR" --include-private >/dev/null; then
                 CANDIDATE="$QCTX_OUT/docs/$CTXDIR/api-graph.json"
-                [ -f "$CANDIDATE" ] && GRAPH="$CANDIDATE"
+                if [ -f "$CANDIDATE" ]; then
+                    GRAPH="$CANDIDATE"
+                else
+                    say "WARN: api-graph not written for $SRC - indexing without it"
+                fi
+            else
+                say "WARN: quartz-ctx generate failed for $SRC - indexing without api-graph"
             fi
         fi
 
@@ -173,7 +222,26 @@ reindex)
         fi
     done < <(manifest_targets)
 
-    say "done. indexed configured sources into $DB"
+    if [ "$TARGETS" -eq 0 ]; then
+        say "read 0 targets from $INDEX_CONFIG - nothing was indexed."
+        if [ ! -x "$BINARY" ] && [ ! -f "$CARGO" ]; then
+            say "  the cortex binary and source are both unreachable from here."
+            say "  expected: $BINARY"
+            say "  fix: re-run the suite's setup script for this workspace, or set"
+            say "       CORTEX_SUITE=/path/to/cortex_suite (or write it to .cortex/suite.env)"
+        else
+            say "  check that $INDEX_CONFIG has a non-empty \"targets\" list."
+        fi
+        exit 1
+    fi
+
+    if [ "$INDEXED" -eq 0 ]; then
+        say "none of the $TARGETS configured source path(s) exist here - nothing was indexed."
+        say "  edit $INDEX_CONFIG so its targets point at roots present in $ROOT"
+        exit 1
+    fi
+
+    say "done. indexed $INDEXED of $TARGETS configured source(s) into $DB"
     ;;
 
 check-mcp)
@@ -191,12 +259,60 @@ check-mcp)
             problems=$((problems + 1))
             continue
         fi
-        # An absolute path: a leading / or a drive letter.
-        if grep -qE '"command"[[:space:]]*:[[:space:]]*"(/|[A-Za-z]:)' "$f"; then
-            say "ABSOLUTE PATH in $f - resolve commands against the workspace root instead:"
-            grep -nE '"command"[[:space:]]*:[[:space:]]*"(/|[A-Za-z]:)' "$f" | sed 's/^/    /'
-            problems=$((problems + 1))
-        fi
+
+        # Does each command actually resolve to something runnable from here?
+        #
+        # This used to fail ANY absolute path, which was wrong in the one layout
+        # the Quickstart recommends: a suite cloned outside the workspace can
+        # only be named absolutely, and setup.sh writes exactly that. So the
+        # checker called its own installer's output broken and told the user to
+        # "resolve against the workspace root", which is impossible when the
+        # binary is not under it -- a remediation that leaves you where it found
+        # you.
+        #
+        # What actually breaks a host is a command that does not resolve: a
+        # relative path against a cwd the host chose differently, a bare name
+        # that is only on an interactive shell's PATH, or an absolute path from
+        # somebody else's machine. Check for THAT, and treat portability as a
+        # separate note rather than a failure.
+        while IFS= read -r cmd; do
+            [ -n "$cmd" ] || continue
+            case "$cmd" in
+                /*|[A-Za-z]:*)
+                    if [ ! -x "$cmd" ]; then
+                        say "BROKEN COMMAND in $f - absolute path does not exist here:"
+                        say "    $cmd"
+                        say "    (an absolute path is fine when the suite lives outside the"
+                        say "     workspace, but it does not survive being copied to another"
+                        say "     machine - re-run setup.sh there)"
+                        problems=$((problems + 1))
+                    fi
+                    ;;
+                */*)
+                    if [ ! -x "$ROOT/$cmd" ]; then
+                        say "BROKEN COMMAND in $f - not found relative to the workspace root:"
+                        say "    $cmd  (looked in $ROOT)"
+                        problems=$((problems + 1))
+                    fi
+                    ;;
+                *)
+                    # A bare name resolves through PATH -- and a GUI-launched
+                    # editor inherits the launchd/systemd PATH, not the one your
+                    # shell builds, so ~/.cargo/bin is typically absent there.
+                    if ! command -v "$cmd" >/dev/null 2>&1; then
+                        say "BROKEN COMMAND in $f - '$cmd' is not on PATH"
+                        problems=$((problems + 1))
+                    elif ! (env -i PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin" \
+                            command -v "$cmd" >/dev/null 2>&1); then
+                        say "NOTE: '$cmd' in $f resolves in this shell but not on a bare PATH."
+                        say "    A GUI-launched editor will report it as not found."
+                        say "    Fix: install or symlink it somewhere on the system PATH."
+                    fi
+                    ;;
+            esac
+        done <<EOF
+$(grep -oE '"command"[[:space:]]*:[[:space:]]*"[^"]+"' "$f" | sed 's/.*: *//' | tr -d '"')
+EOF
     done
 
     # Drift between the two: the same tool answering differently per editor is
@@ -218,7 +334,7 @@ check-mcp)
     fi
 
     if [ "$problems" -eq 0 ]; then
-        say "mcp configs: relative paths, and both hosts agree"
+        say "mcp configs: every command resolves, and both hosts agree"
     else
         say "mcp configs: $problems problem(s)"
         exit 1
@@ -228,7 +344,12 @@ check-mcp)
 doctor|selfcheck|status|recall|health-report|graph-diff|meta|prune|review|crystallize|adr|\
 consolidate|correction|cluster-sessions|detect-skills|propose-gaps|propose-survival|\
 consolidate-pipeline|consolidate-if-stale|review-proposals|skill-status|skill-approve|\
-skill-reject|scoreboard|pattern|anti-pattern|prefs|annotate|context|graph|index|watch)
+skill-reject|scoreboard|pattern|anti-pattern|prefs|annotate|context|graph|index|watch|\
+fired)
+    # `fired` is on this list because it was documented as a launcher command
+    # and was not on it: an unlisted command falls through to the help text
+    # below, which prints and exits 0. Asking "has this mechanism ever actually
+    # run?" answered with a menu, successfully.
     run_bin "$CMD" "$@"
     ;;
 

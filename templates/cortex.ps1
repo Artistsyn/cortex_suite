@@ -101,8 +101,28 @@ $NAME          = if ($env:CORTEX_NAME) { $env:CORTEX_NAME } else { Split-Path -L
 # setup.ps1 had already written a working .mcp.json pointing at cortex_suite\ -
 # so the MCP servers ran and the launcher did not. Detect instead;
 # CORTEX_SUITE overrides for any other layout.
+#
+# There is a THIRD layout, and it is the one the Quickstart actually describes:
+# the suite cloned somewhere of its own and pointed at a workspace elsewhere
+# (`.\setup.ps1 -Workspace C:\code\my-project`). Neither probe below can find
+# it - nothing in the workspace records where it went - so setup writes the
+# path it used into .cortex\suite.env and it is read here. The environment
+# variable still wins, for any layout nobody has thought of yet.
+$suiteEnvFile = Join-Path $REPO_ROOT ".cortex\suite.env"
+$suiteFromFile = ""
+if (-not $env:CORTEX_SUITE -and (Test-Path $suiteEnvFile)) {
+    # Parsed, not executed: this file is data, and dot-sourcing it would run
+    # whatever it contained.
+    foreach ($line in (Get-Content -LiteralPath $suiteEnvFile)) {
+        if ($line -match '^\s*CORTEX_SUITE\s*=\s*"?([^"]+)"?\s*$') {
+            $suiteFromFile = $Matches[1]
+        }
+    }
+}
 $SUITE = if ($env:CORTEX_SUITE) {
     ($env:CORTEX_SUITE.TrimEnd('\', '/')) + '\'
+} elseif ($suiteFromFile) {
+    ($suiteFromFile.TrimEnd('\', '/')) + '\'
 } elseif (Test-Path (Join-Path $REPO_ROOT "cortex\Cargo.toml")) {
     ""
 } elseif (Test-Path (Join-Path $REPO_ROOT "cortex_suite\cortex\Cargo.toml")) {
@@ -320,11 +340,11 @@ function Set-McpConfig {
 $INDEX_TARGETS = Get-ConfiguredIndexTargets
 if ($INDEX_TARGETS -and $INDEX_TARGETS.Count -gt 0) {
     # Prefer the first root that actually exists, not simply the first listed.
-    # `reindex` only warns about a missing root and carries on, but quartz-ctx
-    # treats its PRIMARY source as fatal and exits before the MCP handshake -
-    # so a manifest whose first entry is a tree this machine has not checked
-    # out yet yields a server that never starts, while check-mcp passes and
-    # both config files agree. Ordering is not cosmetic here.
+    # `cortex serve` takes ONE --source, so handing it a path that is not on
+    # this machine indexes nothing. (quartz-ctx used to make this fatal as well,
+    # exiting before the MCP handshake when its first root was missing; it now
+    # skips missing roots and starts either way, so manifest order no longer
+    # decides whether a server comes up. It still decides what cortex indexes.)
     $existing = $INDEX_TARGETS | Where-Object { Test-Path ([string]$_.source) } | Select-Object -First 1
     $SOURCE = if ($existing) { [string]$existing.source } else { [string]$INDEX_TARGETS[0].source }
 }
@@ -1104,11 +1124,13 @@ switch ($Command) {
             exit 1
         }
 
+        $indexed = 0
         foreach ($t in $targets) {
             if (-not (Test-Path $t.source)) {
                 Write-Prefix "WARN: skipping missing source path $($t.source)"
                 continue
             }
+            $indexed++
 
             $args = @("run", "--quiet", "--manifest-path", $CARGO, "--", "--db", $DB, "index", "--source", $t.source, "--name", $t.name)
             if ($t.scope) {
@@ -1130,7 +1152,118 @@ switch ($Command) {
             Invoke-OrExit -BaseArgs $args
         }
 
-        Write-Prefix "Done. Indexed configured sources into $DB"
+        # A run that indexed NOTHING used to print the same success line as a run
+        # that indexed everything - and on a machine where none of the manifest's
+        # roots are checked out, that is every run.
+        if ($indexed -eq 0) {
+            Write-Prefix "None of the $($targets.Count) configured source path(s) exist here - nothing was indexed."
+            Write-Prefix "  edit $INDEX_CONFIG so its targets point at roots present in $REPO_ROOT"
+            Pop-Location
+            exit 1
+        }
+
+        Write-Prefix "Done. Indexed $indexed of $($targets.Count) configured source(s) into $DB"
+    }
+    "check-mcp" {
+        # Validate both MCP configs before a user meets the problem as a server
+        # that silently never starts.
+        #
+        # This existed only in cortex.sh, while both CLAUDE.md templates and the
+        # handoff document listed it as a command of BOTH launchers - so on
+        # Windows it fell through to the pass-through branch, became
+        # `cortex.exe check-mcp`, and failed as an unknown subcommand. A
+        # validation step that is missing on one platform is worse than one
+        # nobody documented, because it is the platform's users who are told to
+        # run it.
+        $problems = 0
+        foreach ($f in @(".mcp.json", ".vscode\mcp.json")) {
+            $path = Join-Path $REPO_ROOT $f
+            if (-not (Test-Path $path)) {
+                Write-Prefix "MISSING: $f"
+                $problems++
+                continue
+            }
+
+            $cfg = $null
+            try {
+                $cfg = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+            } catch {
+                Write-Prefix "MALFORMED JSON in ${f}: $_"
+                $problems++
+                continue
+            }
+
+            # .mcp.json calls the block mcpServers; .vscode/mcp.json calls it servers.
+            $block = if ($cfg.PSObject.Properties.Name -contains 'mcpServers') {
+                $cfg.mcpServers
+            } else {
+                $cfg.servers
+            }
+            if (-not $block) { continue }
+
+            foreach ($srv in $block.PSObject.Properties) {
+                $cmd = [string]$srv.Value.command
+                if (-not $cmd) { continue }
+
+                # What breaks a host is a command that does not RESOLVE - not
+                # one that happens to be absolute. A suite installed outside the
+                # workspace can only be named absolutely, and setup.ps1 writes
+                # exactly that.
+                if ($cmd -match '^([A-Za-z]:|\\\\|/)') {
+                    if (-not (Test-Path -LiteralPath $cmd)) {
+                        Write-Prefix "BROKEN COMMAND in $f - absolute path does not exist here:"
+                        Write-Prefix "    $cmd"
+                        Write-Prefix "    (fine when the suite lives outside the workspace, but it does"
+                        Write-Prefix "     not survive being copied to another machine - re-run setup there)"
+                        $problems++
+                    }
+                }
+                elseif ($cmd -match '[\\/]') {
+                    if (-not (Test-Path -LiteralPath (Join-Path $REPO_ROOT $cmd))) {
+                        Write-Prefix "BROKEN COMMAND in $f - not found relative to the workspace root:"
+                        Write-Prefix "    $cmd  (looked in $REPO_ROOT)"
+                        $problems++
+                    }
+                }
+                elseif (-not (Get-Command $cmd -ErrorAction SilentlyContinue)) {
+                    Write-Prefix "BROKEN COMMAND in $f - '$cmd' is not on PATH"
+                    $problems++
+                }
+            }
+        }
+
+        # Drift between the two: the same tool answering differently per editor
+        # produces no error on its own.
+        $mcpPath = Join-Path $REPO_ROOT ".mcp.json"
+        $vscPath = Join-Path $REPO_ROOT ".vscode\mcp.json"
+        if ((Test-Path $mcpPath) -and (Test-Path $vscPath)) {
+            $commandsOf = {
+                param($p)
+                try { $c = Get-Content -Raw -LiteralPath $p | ConvertFrom-Json } catch { return @() }
+                $b = if ($c.PSObject.Properties.Name -contains 'mcpServers') { $c.mcpServers } else { $c.servers }
+                if (-not $b) { return @() }
+                # Trailing .exe legitimately differs per platform.
+                $b.PSObject.Properties |
+                    ForEach-Object { ([string]$_.Value.command) -replace '\.exe$', '' } |
+                    Where-Object { $_ } | Sort-Object
+            }
+            $a = (& $commandsOf $mcpPath) -join ' '
+            $b = (& $commandsOf $vscPath) -join ' '
+            if ($a -ne $b) {
+                Write-Prefix "DRIFT: the two configs name different commands."
+                Write-Prefix "  .mcp.json:        $a"
+                Write-Prefix "  .vscode/mcp.json: $b"
+                $problems++
+            }
+        }
+
+        if ($problems -eq 0) {
+            Write-Prefix "mcp configs: every command resolves, and both hosts agree"
+        } else {
+            Write-Prefix "mcp configs: $problems problem(s)"
+            Pop-Location
+            exit 1
+        }
     }
     "doctor" {
         Write-Prefix "Running doctor preflight (unified DB)..."

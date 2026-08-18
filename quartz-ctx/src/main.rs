@@ -363,74 +363,130 @@ fn run_generate(args: GenerateArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_serve(args: ServeArgs) -> Result<()> {
-    // All diagnostic output goes to stderr so stdout stays clean for JSON-RPC.
-    // Build (path, origin-slug) pairs. The primary source may not be missing;
-    // extra sources that are missing are skipped with a warning so one absent
-    // experimental root can't take the whole server down.
-    // Explicit --source roots come first so the primary engine stays primary,
-    // then manifest roots that were not already listed.
-    // Per-root: (path, origin tag, include non-pub items).
-    // A --source root inherits the command-line --include-private; a manifest
-    // root uses its own declaration, so a library and an application can be
-    // served from one server with the correct view of each.
-    let mut requested: Vec<(PathBuf, Option<String>, bool)> = args
-        .source
-        .iter()
-        .map(|p| (p.clone(), None, args.include_private))
-        .collect();
+/// Everything `serve` was told to load, before any of it is checked against
+/// the disk.
+///
+/// Kept whole rather than resolved once and discarded, because a source root
+/// can arrive after the server does: a workspace wired up before its code is
+/// cloned, a manifest edited mid-session, a tree checked out while the editor
+/// stays open. Holding the plan lets the running server resolve it again and
+/// pick those up without a restart.
+#[derive(Clone)]
+pub struct SourcePlan {
+    /// Roots named with `--source`. First, so the primary engine stays primary.
+    explicit: Vec<PathBuf>,
+    manifest: Option<PathBuf>,
+    discover: Option<PathBuf>,
+    include_private: bool,
+}
 
-    if let Some(manifest_path) = &args.sources_from {
-        let from_manifest = load_source_manifest(manifest_path)?;
-        eprintln!(
-            "quartz-ctx serve: {} root(s) from manifest {}",
-            from_manifest.len(),
-            manifest_path.display()
-        );
-        for (path, scope, include_private) in from_manifest {
-            let already = requested.iter().any(|(p, _, _)| paths_equal(p, &path));
-            if !already {
-                requested.push((path, scope, include_private || args.include_private));
-            }
+/// A `SourcePlan` measured against what is actually on disk right now.
+pub struct Resolved {
+    /// Roots that exist: (path, origin tag, include non-pub items).
+    pub sources: Vec<(PathBuf, String, bool)>,
+    /// Roots that were configured and are not there.
+    pub missing: Vec<PathBuf>,
+    /// Why the manifest contributed nothing, when one was named.
+    pub manifest_error: Option<String>,
+}
+
+impl SourcePlan {
+    fn from_args(args: &ServeArgs) -> Self {
+        Self {
+            explicit: args.source.clone(),
+            manifest: args.sources_from.clone(),
+            discover: args.discover.clone(),
+            include_private: args.include_private,
         }
     }
 
-    if let Some(root) = &args.discover {
-        let found = discover::discover_crates(root);
-        eprintln!(
-            "quartz-ctx serve: {} crate(s) discovered under {}",
-            found.len(),
-            root.display()
-        );
-        for c in found {
-            if requested.iter().any(|(p, _, _)| paths_equal(p, &c.src)) {
-                continue;
+    /// Resolve against the disk. Never fails: a plan that resolves to nothing
+    /// is a state the server reports, not a reason to refuse to start.
+    pub fn resolve(&self) -> Resolved {
+        // Per-root: (path, origin tag, include non-pub items).
+        // A --source root inherits the command-line --include-private; a
+        // manifest root uses its own declaration, so a library and an
+        // application can be served from one server with the correct view of
+        // each.
+        let mut requested: Vec<(PathBuf, Option<String>, bool)> = self
+            .explicit
+            .iter()
+            .map(|p| (p.clone(), None, self.include_private))
+            .collect();
+
+        // A manifest that cannot be read or parsed is reported, not fatal.
+        //
+        // It used to be `?`, which took the whole server down before the MCP
+        // handshake — and the host shows that as a bare connection failure with
+        // no cause. The two ways to get there are both ordinary: a workspace
+        // set up before `.cortex/index-sources.json` was written, and a manifest
+        // someone is part-way through editing. Neither should cost you every
+        // tool on the server; the text below says exactly what is wrong.
+        let mut manifest_error = None;
+        if let Some(manifest_path) = &self.manifest {
+            match load_source_manifest(manifest_path) {
+                Ok(from_manifest) => {
+                    for (path, scope, include_private) in from_manifest {
+                        let already = requested.iter().any(|(p, _, _)| paths_equal(p, &path));
+                        if !already {
+                            requested.push((path, scope, include_private || self.include_private));
+                        }
+                    }
+                }
+                Err(e) => manifest_error = Some(format!("{e:#}")),
             }
-            requested.push((c.src, Some(c.scope), args.include_private));
         }
-    }
 
-    if requested.is_empty() {
-        requested.push((PathBuf::from("src"), None, args.include_private));
-    }
+        if let Some(root) = &self.discover {
+            for c in discover::discover_crates(root) {
+                if requested.iter().any(|(p, _, _)| paths_equal(p, &c.src)) {
+                    continue;
+                }
+                requested.push((c.src, Some(c.scope), self.include_private));
+            }
+        }
 
+        if requested.is_empty() {
+            requested.push((PathBuf::from("src"), None, self.include_private));
+        }
+
+        resolve_requested(&requested, manifest_error)
+    }
+}
+
+/// Existence-check every requested root and assign each survivor an origin tag.
+fn resolve_requested(
+    requested: &[(PathBuf, Option<String>, bool)],
+    manifest_error: Option<String>,
+) -> Resolved {
     let mut sources: Vec<(PathBuf, String, bool)> = Vec::new();
+    let mut missing: Vec<PathBuf> = Vec::new();
     for (src, scope, include_private) in requested.iter() {
-        // Every missing root warns and is skipped, wherever it sits in the list.
+        // Every missing root is recorded and skipped, wherever it sits in the
+        // list — and a plan where NONE of them exist is still a running server.
         //
         // This used to make index 0 alone fatal, which gave a manifest's ORDER a
         // meaning it does not have: a workspace part-way through a migration --
         // some trees checked out, others not yet -- got a server that exited
         // before the MCP handshake purely because an absent root happened to be
-        // listed first. The host reports that as a vague connection failure, and
-        // nothing else disagrees: `cortex reindex` warns and carries on over the
-        // same manifest, and `check-mcp` passes because both config files really
-        // are identical. Nothing on disk looks wrong; the server is simply dead.
+        // listed first. Making every root non-fatal fixed that case and left the
+        // harder one: a workspace where nothing is checked out yet, which is
+        // every FRESH INSTALL, because the shipped template manifest lists
+        // example paths (my_engine/src, ...) that exist nowhere. Setup would
+        // finish, print success, and hand over a server that could not start.
         //
-        // Being unable to serve ANYTHING is still an error -- that check is
-        // after the loop, where it can name every root it tried.
+        // The host reports either as a vague connection failure, and nothing
+        // else disagrees: `cortex reindex` warns and carries on over the same
+        // manifest, and `check-mcp` passes because both config files really are
+        // identical. Nothing on disk looks wrong; the server is simply dead.
+        //
+        // So an empty resolve is a STATE, not an error: the server starts, and
+        // every tool answers with what is missing and how to fix it (see
+        // degraded_notice). An empty index that says nothing is the one outcome
+        // worse than not starting, because "no such item" then reads as "your
+        // code does not contain that".
         if !src.exists() {
-            eprintln!("warn: skipping missing source: {}", src.display());
+            missing.push(src.clone());
             continue;
         }
         // A manifest scope is an explicit, stable origin tag. Use it verbatim
@@ -475,43 +531,101 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         sources.push((src.clone(), tag, *include_private));
     }
 
-    // Nothing left to serve is the real failure, and it is worth naming every
-    // root that was tried: the cause is almost always a working directory the
-    // MCP host resolved differently than expected, which one path alone does
-    // not make obvious.
-    if sources.is_empty() {
-        let tried = requested
-            .iter()
-            .map(|(p, _, _)| format!("  {}", p.display()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(anyhow!(
-            "no source path exists - nothing to serve\ntried:\n{tried}\n\
-             help: paths resolve against the MCP working directory, not the config file.\n\
-             help: cwd is {}",
-            std::env::current_dir()
-                .map(|d| d.display().to_string())
-                .unwrap_or_else(|_| "<unknown>".into())
-        ));
+    Resolved { sources, missing, manifest_error }
+}
+
+/// What to tell an agent when the index is empty, or `None` when it is not.
+///
+/// This is the whole reason an empty resolve is allowed to start: served as the
+/// answer to every tool call, it turns "no item named `Canvas`" — which reads as
+/// a fact about the user's code — into the configuration problem it actually is.
+/// Paths are shown next to the working directory they resolve against, because
+/// the usual cause is an MCP host whose cwd is not what the config assumed.
+pub fn degraded_notice(resolved: &Resolved, items_len: usize) -> Option<String> {
+    if items_len > 0 {
+        return None;
+    }
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+
+    let mut out = String::from(
+        "quartz-ctx is running with an EMPTY index — this answer says nothing \
+         about your code.\n\n",
+    );
+
+    if let Some(err) = &resolved.manifest_error {
+        out.push_str(&format!("The sources manifest could not be used:\n  {err}\n\n"));
     }
 
-    for (path, tag, include_private) in &sources {
+    if resolved.sources.is_empty() {
+        out.push_str("No configured source root exists. Tried:\n");
+        for p in &resolved.missing {
+            out.push_str(&format!("  {}\n", p.display()));
+        }
+        out.push_str(&format!(
+            "\nPaths resolve against the working directory, not the config file.\n\
+             Working directory: {cwd}\n\n\
+             Fix: point .cortex/index-sources.json at roots that exist here (the\n\
+             shipped template lists placeholders like my_engine/src), or pass\n\
+             --source/--discover. New roots are picked up within a few seconds;\n\
+             no restart needed.\n",
+        ));
+    } else {
+        out.push_str("These roots exist but yielded no API items:\n");
+        for (p, tag, private) in &resolved.sources {
+            let view = if *private { "project view" } else { "public API only" };
+            out.push_str(&format!("  {} (origin: {tag}, {view})\n", p.display()));
+        }
+        out.push_str(
+            "\nFix: for an application, a binary, or any non-Rust root, set\n\
+             \"include_private\": true — JavaScript and Python have no `pub`, so a\n\
+             public-API-only scan of them returns almost nothing.\n",
+        );
+    }
+    Some(out)
+}
+
+fn run_serve(args: ServeArgs) -> Result<()> {
+    // All diagnostic output goes to stderr so stdout stays clean for JSON-RPC.
+    let plan = SourcePlan::from_args(&args);
+    let resolved = plan.resolve();
+
+    if let Some(manifest_path) = &args.sources_from {
+        match &resolved.manifest_error {
+            Some(e) => eprintln!("warn: sources manifest unusable ({}): {e}", manifest_path.display()),
+            None => eprintln!("quartz-ctx serve: manifest {}", manifest_path.display()),
+        }
+    }
+    for path in &resolved.missing {
+        eprintln!("warn: skipping missing source: {}", path.display());
+    }
+    for (path, tag, include_private) in &resolved.sources {
         let view = if *include_private { " [project view: incl. non-pub]" } else { "" };
         eprintln!("quartz-ctx serve: loading {} (origin: {tag}){view}", path.display());
     }
 
-    let items = parser::load_sources_with(&sources)
-        .with_context(|| "failed to parse source dirs")?;
+    // A parse failure is per-root and already reported by the parser; an empty
+    // result is a state the notice explains, not a reason to exit.
+    let items = match parser::load_sources_with(&resolved.sources) {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!("warn: failed to parse source dirs: {e:#}");
+            Vec::new()
+        }
+    };
 
     if items.is_empty() {
-        return Err(anyhow!(
-            "no public API items found in any source\nhelp: verify --source points at engine src directories (example: quartz/src)"
-        ));
+        eprintln!("warn: empty index — serving diagnostics until a source root appears");
+    } else {
+        eprintln!(
+            "  loaded {} API items from {} source(s) — listening on stdio",
+            items.len(),
+            resolved.sources.len()
+        );
     }
 
-    eprintln!("  loaded {} API items from {} source(s) — listening on stdio", items.len(), sources.len());
-
-    mcp::serve(items, &args.name, sources)
+    mcp::serve(items, &args.name, resolved, plan)
 }
 
 fn run_selfcheck(args: SelfcheckArgs) -> Result<()> {
@@ -736,6 +850,80 @@ mod tests {
 
         let err = load_source_manifest(&path).unwrap_err().to_string();
         assert!(err.contains("broken.json"), "error should name the file: {err}");
+    }
+
+    /// Helper: a plan naming one manifest and nothing else.
+    fn plan_for(manifest: Option<PathBuf>, explicit: Vec<PathBuf>) -> SourcePlan {
+        SourcePlan { explicit, manifest, discover: None, include_private: false }
+    }
+
+    /// A workspace where nothing the manifest names is checked out — which is
+    /// every fresh install, because the shipped template lists placeholders.
+    /// It must resolve to a servable (if empty) state, never to an error.
+    #[test]
+    fn a_plan_whose_roots_all_missing_still_resolves() {
+        let dir = tmp("all-missing");
+        let path = dir.join("index-sources.json");
+        std::fs::write(
+            &path,
+            r#"{ "targets": [ { "source": "my_engine/src" }, { "source": "my_cli/src" } ] }"#,
+        )
+        .unwrap();
+
+        let resolved = plan_for(Some(path), vec![]).resolve();
+        assert!(resolved.sources.is_empty());
+        assert_eq!(resolved.missing.len(), 2, "both roots should be recorded as missing");
+        assert!(resolved.manifest_error.is_none(), "the manifest itself parsed fine");
+    }
+
+    /// An empty index must answer with what is wrong, not with silence: a bare
+    /// "no such item" reads as a fact about the user's code.
+    #[test]
+    fn an_empty_index_produces_an_actionable_notice() {
+        let resolved = Resolved {
+            sources: vec![],
+            missing: vec![PathBuf::from("my_engine/src")],
+            manifest_error: None,
+        };
+        let notice = degraded_notice(&resolved, 0).expect("empty index must explain itself");
+        assert!(notice.contains("my_engine/src"), "names the root it tried: {notice}");
+        assert!(notice.contains("EMPTY index"), "says the index is empty: {notice}");
+
+        // ...and stays out of the way as soon as there is anything to serve.
+        assert!(degraded_notice(&resolved, 1).is_none());
+    }
+
+    /// A manifest that cannot be read is reported through the notice, not by
+    /// exiting before the MCP handshake — the host shows that as a bare
+    /// connection failure with no cause.
+    #[test]
+    fn an_unreadable_manifest_is_reported_not_fatal() {
+        let dir = tmp("no-manifest");
+        let resolved = plan_for(Some(dir.join("does-not-exist.json")), vec![]).resolve();
+
+        let err = resolved.manifest_error.clone().expect("should record why");
+        assert!(err.contains("does-not-exist.json"), "names the file: {err}");
+
+        let notice = degraded_notice(&resolved, 0).expect("still degraded");
+        assert!(notice.contains("does-not-exist.json"), "surfaces it to the agent: {notice}");
+    }
+
+    /// Re-resolving picks up a root that arrives after the server started, so a
+    /// workspace wired up before its code is cloned recovers without a restart.
+    #[test]
+    fn a_root_that_appears_later_is_picked_up_on_re_resolve() {
+        let dir = tmp("late-root");
+        let src = dir.join("late_crate").join("src");
+        let plan = plan_for(None, vec![src.clone()]);
+
+        assert!(plan.resolve().sources.is_empty(), "not there yet");
+
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("lib.rs"), "pub struct Late;\n").unwrap();
+
+        let after = plan.resolve();
+        assert_eq!(after.sources.len(), 1, "the same plan now resolves the root");
+        assert!(after.missing.is_empty());
     }
 
     /// The parser must attach impls written in a different file from the type —

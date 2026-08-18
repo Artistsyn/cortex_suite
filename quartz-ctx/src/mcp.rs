@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use walkdir::WalkDir;
 
 use crate::model::{ApiItem, Confidence, ItemKind, Visibility};
-use crate::{helpers, parser};
+use crate::{helpers, parser, Resolved, SourcePlan};
 
 // ── Source auto-reload ────────────────────────────────────────────────────────
 
@@ -76,28 +76,66 @@ fn source_fingerprint(sources: &[(PathBuf, String, bool)]) -> u64 {
 /// after engine edits.
 fn maybe_reload(
     items: &mut Vec<ApiItem>,
-    sources: &[(PathBuf, String, bool)],
+    state: &mut Resolved,
+    plan: &SourcePlan,
     last_check: &mut Instant,
     fingerprint: &mut u64,
 ) {
-    if sources.is_empty() || last_check.elapsed() < RELOAD_CHECK_INTERVAL {
+    if last_check.elapsed() < RELOAD_CHECK_INTERVAL {
         return;
     }
     *last_check = Instant::now();
 
-    let fp = source_fingerprint(sources);
+    // Re-resolve the plan only while something it named is absent: a root that
+    // has not been checked out, or a manifest that could not be read.
+    //
+    // Without this, recovering from an empty start needs a server restart —
+    // and the workspace that starts empty is exactly the one where the user is
+    // about to create the thing that fixes it. Guarded on the degraded state
+    // because a full resolve re-reads the manifest and can re-walk a --discover
+    // tree, which is not work to repeat every five seconds once healthy.
+    if !state.missing.is_empty() || state.manifest_error.is_some() {
+        let fresh = plan.resolve();
+        if fresh.sources != state.sources {
+            let gained: Vec<String> = fresh
+                .sources
+                .iter()
+                .filter(|(p, _, _)| !state.sources.iter().any(|(q, _, _)| q == p))
+                .map(|(p, t, _)| format!("{} (origin: {t})", p.display()))
+                .collect();
+            if !gained.is_empty() {
+                eprintln!("quartz-ctx: source root(s) now present — {}", gained.join(", "));
+            }
+            *state = fresh;
+            *fingerprint = 0; // force the reparse below
+        } else {
+            *state = fresh;
+        }
+    }
+
+    if state.sources.is_empty() {
+        return;
+    }
+
+    let fp = source_fingerprint(&state.sources);
     if fp == *fingerprint {
         return;
     }
     *fingerprint = fp;
 
-    match parser::load_sources_with(sources) {
+    match parser::load_sources_with(&state.sources) {
         Ok(new_items) if !new_items.is_empty() => {
             eprintln!(
                 "quartz-ctx: source change detected — reloaded {} API items (was {})",
                 new_items.len(), items.len()
             );
             *items = new_items;
+        }
+        // Keeping previous data is right when there IS previous data. With an
+        // empty index there is none to keep, and staying empty silently is the
+        // failure this whole path exists to avoid.
+        Ok(_) if items.is_empty() => {
+            eprintln!("quartz-ctx: sources present but still 0 items — serving diagnostics")
         }
         Ok(_) => eprintln!("quartz-ctx: reload produced 0 items — keeping previous data"),
         Err(e) => eprintln!("quartz-ctx: reload failed ({e}) — keeping previous data"),
@@ -108,14 +146,20 @@ fn maybe_reload(
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn serve(items: Vec<ApiItem>, engine_name: &str, sources: Vec<(PathBuf, String, bool)>) -> Result<()> {
+pub fn serve(
+    items: Vec<ApiItem>,
+    engine_name: &str,
+    resolved: Resolved,
+    plan: SourcePlan,
+) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
     let mut items = items;
+    let mut state = resolved;
     let mut last_check = Instant::now();
-    let mut fingerprint = source_fingerprint(&sources);
+    let mut fingerprint = source_fingerprint(&state.sources);
 
     eprintln!("quartz-ctx MCP server ready ({} items loaded)", items.len());
 
@@ -148,13 +192,13 @@ pub fn serve(items: Vec<ApiItem>, engine_name: &str, sources: Vec<(PathBuf, Stri
 
         // Keep served data in sync with the source tree (throttled stat scan).
         if method == "tools/call" {
-            maybe_reload(&mut items, &sources, &mut last_check, &mut fingerprint);
+            maybe_reload(&mut items, &mut state, &plan, &mut last_check, &mut fingerprint);
         }
 
         let result = match method {
             "initialize"  => Ok(initialize_result(engine_name)),
             "tools/list"  => Ok(tools_list_result()),
-            "tools/call"  => tools_call(&params, &items, &sources),
+            "tools/call"  => tools_call(&params, &items, &state),
             other         => Err(format!("unknown method: {other}")),
         };
 
@@ -434,7 +478,7 @@ fn tools_list_result() -> Value {
 fn tools_call(
     params: &Value,
     items: &[ApiItem],
-    sources: &[(PathBuf, String, bool)],
+    state: &Resolved,
 ) -> Result<Value, String> {
     let tool_name = params["name"]
         .as_str()
@@ -442,6 +486,15 @@ fn tools_call(
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // An empty index answers every question the same way, and every one of
+    // those answers is misleading: "no item named X" is indistinguishable from
+    // "X is not in your code". Say what is actually wrong instead, on every
+    // tool, so it cannot be missed by asking a different one.
+    if let Some(notice) = crate::degraded_notice(state, items.len()) {
+        return Ok(json!({ "content": [{ "type": "text", "text": notice }] }));
+    }
+
+    let sources = &state.sources[..];
     let text = match tool_name {
         "get_item"                    => tool_get_item(&args, items),
         "list_items"                  => tool_list_items(&args, items),

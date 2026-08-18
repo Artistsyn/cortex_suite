@@ -48,21 +48,32 @@ $Workspace = (Resolve-Path $Workspace).Path
 Say "workspace: $Workspace"
 Say "suite:     $SuiteRoot"
 
-if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Die "cargo not found. Install Rust from https://rustup.rs and reopen the terminal."
+# Only the build needs a toolchain. -SkipBuild exists precisely for a machine
+# that already has the binaries, and it used to die here anyway on a
+# requirement it was not about to use.
+if (-not $SkipBuild) {
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        Die "cargo not found. Install Rust from https://rustup.rs and reopen the terminal (or pass -SkipBuild if the binaries are already built)."
+    }
+    Say ("rust: " + (rustc --version))
 }
-Say ("rust: " + (rustc --version))
 
 # ── Stop running servers ─────────────────────────────────────────────────────
 # A running MCP server holds an open handle on its own binary, so cargo cannot
 # replace it. The build FAILS with 'Access is denied (os error 5)' and leaves the
 # OLD binary in place - which looks like a build that succeeded but changed
 # nothing. Always stop first.
-$running = Get-Process cortex, quartz-ctx -ErrorAction SilentlyContinue
-if ($running) {
-    Say "stopping $($running.Count) running server process(es) so the binaries can be replaced"
-    $running | Stop-Process -Force
-    Start-Sleep -Milliseconds 700
+#
+# Only around a build. This ran unconditionally, including under -SkipBuild,
+# which builds nothing - so wiring up a SECOND workspace tore down the live
+# servers of the first, in a step that had no reason to touch them.
+if (-not $SkipBuild) {
+    $running = Get-Process cortex, quartz-ctx -ErrorAction SilentlyContinue
+    if ($running) {
+        Say "stopping $($running.Count) running server process(es) so the binaries can be replaced"
+        $running | Stop-Process -Force
+        Start-Sleep -Milliseconds 700
+    }
 }
 
 # ── Build ────────────────────────────────────────────────────────────────────
@@ -136,6 +147,25 @@ function WriteIfAbsent([string] $path, [string] $content, [string] $label) {
     [System.IO.File]::WriteAllText($path, $content, (New-Object System.Text.UTF8Encoding $false))
     Say "wrote $label"
 }
+
+# Where the suite lives, recorded for the launcher.
+#
+# cortex.ps1 can probe for the suite at the workspace root or in a cortex_suite\
+# subdirectory, but not for the layout this script most often produces: a suite
+# cloned somewhere of its own, pointed at a workspace elsewhere. Nothing in the
+# workspace recorded that, so the launcher's cargo-shelling commands failed and
+# reindex read its manifest through a binary it could not find.
+#
+# Always rewritten, never skipped for -Force: it describes THIS machine's
+# layout, so a stale copy from a moved or re-cloned suite is worse than none.
+$suiteEnv = Join-Path $Workspace '.cortex\suite.env'
+[System.IO.File]::WriteAllText(
+    $suiteEnv,
+    "# Written by setup.ps1 - where the cortex suite lives on this machine.`n" +
+    "# Delete this file if the suite moves and re-run setup.`n" +
+    "CORTEX_SUITE=`"$SuiteRoot`"`n",
+    (New-Object System.Text.UTF8Encoding $false))
+Say "wrote .cortex/suite.env (suite at $SuiteRoot)"
 
 $manifest = Join-Path $Workspace '.cortex\index-sources.json'
 if (-not (Test-Path $manifest) -or $Force) {

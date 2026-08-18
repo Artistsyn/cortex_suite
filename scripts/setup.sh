@@ -31,19 +31,29 @@ WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 say "workspace: $WORKSPACE"
 say "suite:     $SUITE_ROOT"
 
-command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust from https://rustup.rs and reopen the shell."
-say "rust: $(rustc --version)"
-
-# A running MCP server holds its binary open, so a rebuild silently keeps the old
-# one on some filesystems. Stop them first.
-if pgrep -x cortex >/dev/null 2>&1 || pgrep -x quartz-ctx >/dev/null 2>&1; then
-  say "stopping running server process(es)"
-  pkill -x cortex     2>/dev/null || true
-  pkill -x quartz-ctx 2>/dev/null || true
-  sleep 1
+# Only the build needs a toolchain. --skip-build exists precisely for a machine
+# that has the binaries already (a shared checkout, a second workspace) and it
+# used to die here anyway, on a requirement it was not about to use.
+if [ "$SKIP_BUILD" -eq 0 ]; then
+    command -v cargo >/dev/null 2>&1 || die "cargo not found. Install Rust from https://rustup.rs and reopen the shell (or pass --skip-build if the binaries are already built)."
+    say "rust: $(rustc --version)"
 fi
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
+  # A running MCP server holds its binary open, so a rebuild silently keeps the
+  # old one on some filesystems. Stop them first.
+  #
+  # Only around a build. This killed every running server unconditionally,
+  # including under --skip-build, which builds nothing -- so adding a SECOND
+  # workspace to a machine tore down the live servers of the first, in a step
+  # that had no reason to touch them.
+  if pgrep -x cortex >/dev/null 2>&1 || pgrep -x quartz-ctx >/dev/null 2>&1; then
+    say "stopping running server process(es) so the rebuild is not blocked"
+    pkill -x cortex     2>/dev/null || true
+    pkill -x quartz-ctx 2>/dev/null || true
+    sleep 1
+  fi
+
   say "building cortex (debug)..."
   ( cd "$SUITE_ROOT/cortex" && cargo build ) || die "cortex build failed"
   say "building quartz-ctx (release)..."
@@ -89,6 +99,21 @@ write_if_absent() {
   printf '%s\n' "$content" > "$path"
   say "wrote $label"
 }
+
+# Where the suite lives, recorded for the launcher.
+#
+# The launcher can probe for the suite at the workspace root or in a
+# cortex_suite/ subdirectory, but not for the layout this script most often
+# produces: a suite cloned somewhere of its own, pointed at a workspace
+# elsewhere. Nothing in the workspace recorded that, so `.cortex/cortex.sh
+# reindex` read its manifest through a binary it could not find, indexed
+# nothing, and reported success.
+#
+# Always rewritten, never skipped for --force: it describes THIS machine's
+# layout, so a stale copy from a moved or re-cloned suite is worse than none.
+printf '# Written by setup.sh — where the cortex suite lives on this machine.\n# Delete this file if the suite moves and re-run setup.\nCORTEX_SUITE="%s"\n' \
+    "$SUITE_ROOT" > "$WORKSPACE/.cortex/suite.env"
+say "wrote .cortex/suite.env (suite at $SUITE_ROOT)"
 
 if [ ! -e "$WORKSPACE/.cortex/index-sources.json" ] || [ "$FORCE" -eq 1 ]; then
   cp "$SUITE_ROOT/templates/index-sources.json" "$WORKSPACE/.cortex/index-sources.json"
