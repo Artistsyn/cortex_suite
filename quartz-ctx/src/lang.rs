@@ -720,7 +720,7 @@ impl<'a> Cx<'a> {
         // its properties still listed, and its data members were simply absent:
         // the shape of an answer that looks complete.
         let decl = first_child_of_kind(node, "variable_declaration").unwrap_or(node);
-        let ty = child_text(decl, "type", self.src).unwrap_or_default();
+        let ty = normalise_type_text(&child_text(decl, "type", self.src).unwrap_or_default());
         let mut out = Vec::new();
 
         // One declaration can introduce several names (`int a, b;`).
@@ -1263,6 +1263,24 @@ fn span_of(node: Node, rel_path: &str) -> Option<SourceSpan> {
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {
     node.utf8_text(src.as_bytes()).unwrap_or("")
+}
+
+/// A declared type as a reader would write it, without the syntax that attached
+/// it to a name.
+///
+/// In TypeScript the `type` field of a property is a `type_annotation` node,
+/// whose text INCLUDES the colon — so every annotated field rendered as
+/// `width: : number`. Rendering is where that shows, but the value is also what
+/// gets indexed and matched on, so it is fixed at the source.
+///
+/// A leading `::` is left alone: `::std::string` is a C++ type naming the global
+/// scope, not a separator plus a type.
+fn normalise_type_text(raw: &str) -> String {
+    let t = raw.trim();
+    match t.strip_prefix(':') {
+        Some(rest) if !rest.starts_with(':') => rest.trim().to_string(),
+        _ => t.to_string(),
+    }
 }
 
 /// First named child of a given kind. Grammars differ in how deeply they nest

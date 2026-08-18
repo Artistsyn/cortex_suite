@@ -640,7 +640,15 @@ fn tool_get_item(args: &Value, items: &[ApiItem]) -> Result<String, String> {
         out.push_str("## Fields\n\n");
         for f in &item.fields {
             let doc = if f.doc.is_empty() { String::new() } else { format!(" — {}", f.doc) };
-            out.push_str(&format!("- `{}: {}`{}\n", f.name, f.ty, doc));
+            // A field can genuinely have no declared type — `private count = 0`
+            // in TypeScript declares none — and `count: ` reads as a type that
+            // failed to extract rather than one that was never written.
+            let decl = if f.ty.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{}: {}", f.name, f.ty)
+            };
+            out.push_str(&format!("- `{decl}`{doc}\n"));
         }
         out.push('\n');
     }

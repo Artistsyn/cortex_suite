@@ -304,6 +304,32 @@ fn csharp_fields_honour_declared_visibility_in_both_views() {
     }
 }
 
+/// TypeScript's `type` field on a property is a `type_annotation`, and its text
+/// includes the colon that attached it — so every annotated field carried one:
+/// `width: : number`. The rendered form is where it shows, but the same string
+/// is what gets indexed and matched on.
+#[test]
+fn a_type_annotation_does_not_keep_the_colon_that_attached_it() {
+    let x = parse(
+        "export interface Shape { width: number; nested: Map<string, number>; }\n",
+        Language::TypeScript,
+        false,
+    );
+    let s = item(&x, "Shape");
+    let types: Vec<&str> = s.fields.iter().map(|f| f.ty.as_str()).collect();
+    assert_eq!(types, vec!["number", "Map<string, number>"], "colon kept: {types:?}");
+}
+
+/// `::std::string` names the global scope. Stripping a leading colon without
+/// looking at the next character would turn it into `:std::string`.
+#[test]
+fn a_globally_qualified_cpp_type_keeps_both_colons() {
+    assert_eq!(normalise_type_text("::std::string"), "::std::string");
+    assert_eq!(normalise_type_text(": number"), "number");
+    assert_eq!(normalise_type_text("  int  "), "int");
+    assert_eq!(normalise_type_text(""), "");
+}
+
 /// Go spells visibility by capitalising the name and says nothing else in the
 /// declaration, so a filter reading modifiers alone would pass everything.
 #[test]
