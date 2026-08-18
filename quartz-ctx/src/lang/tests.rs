@@ -90,6 +90,63 @@ fn python_classes_carry_methods_docstrings_spans_and_bases() {
     assert!(c.calls.iter().any(|e| e.to == "helper"), "no call edges: {:?}", c.calls);
 }
 
+/// Python has no field declaration, so `field_kinds()` was empty for it and
+/// every Python type came back with no data members at all — a dataclass
+/// reported as having no data. Both declaration sites count: the class body,
+/// and `self.x = ...` in a method, which is where the ordinary class puts them.
+#[test]
+fn python_data_members_are_found_in_the_body_and_in_methods() {
+    const SRC: &str = "class Oven:\n    max_temp: int = 250\n    \
+                       def __init__(self, t):\n        self.temperature = t\n        \
+                       self.cycles: int = 0\n        other = Thing()\n        \
+                       other.not_mine = 1\n    \
+                       def bake(self, item):\n        self.last_item = item\n";
+
+    let x = parse(SRC, Language::Python, false);
+    let o = item(&x, "Oven");
+
+    // Source order, not the order a tree walk happens to pop them in.
+    assert_eq!(field_names(o), vec!["max_temp", "temperature", "cycles", "last_item"]);
+
+    let typed: Vec<(&str, &str)> =
+        o.fields.iter().map(|f| (f.name.as_str(), f.ty.as_str())).collect();
+    assert!(typed.contains(&("max_temp", "int")), "annotation lost: {typed:?}");
+    assert!(typed.contains(&("cycles", "int")), "annotation lost: {typed:?}");
+    // No annotation is an empty type, not a guessed one.
+    assert!(typed.contains(&("temperature", "")), "{typed:?}");
+
+    // `other.not_mine = 1` assigns to somebody else's object.
+    assert!(!field_names(o).contains(&"not_mine"), "{:?}", field_names(o));
+}
+
+/// Python spells non-public with underscores, and it must reach fields the same
+/// way it already reached methods.
+#[test]
+fn python_field_visibility_follows_the_underscore_convention() {
+    const SRC: &str = "class Oven:\n    def __init__(self):\n        self.temp = 1\n        \
+                       self._calibration = 2\n        self.__secret = 3\n";
+
+    assert_eq!(field_names(item(&parse(SRC, Language::Python, false), "Oven")), vec!["temp"]);
+    assert_eq!(
+        field_names(item(&parse(SRC, Language::Python, true), "Oven")),
+        vec!["temp", "_calibration", "__secret"]
+    );
+}
+
+/// A dataclass is the case where the fields ARE the type.
+#[test]
+fn a_python_dataclass_publishes_its_fields() {
+    let x = parse(
+        "@dataclass\nclass Point:\n    x: int = 0\n    y: float = 0.0\n",
+        Language::Python,
+        false,
+    );
+    let p = item(&x, "Point");
+    let typed: Vec<(&str, &str)> =
+        p.fields.iter().map(|f| (f.name.as_str(), f.ty.as_str())).collect();
+    assert_eq!(typed, vec![("x", "int"), ("y", "float")]);
+}
+
 #[test]
 fn python_signatures_keep_annotations_and_drop_the_colon() {
     let x = parse(

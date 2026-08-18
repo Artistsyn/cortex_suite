@@ -454,6 +454,14 @@ impl<'a> Cx<'a> {
             }
 
             let vis_here = if implicitly_public { Visibility::Public } else { section };
+
+            // Before the method branch, which consumes a function_definition
+            // and moves on: in Python a method body is also where instance
+            // attributes are declared, so the same node has to be read twice.
+            if l == Language::Python {
+                self.python_fields(member, vis_here, item);
+            }
+
             if l.method_kinds().contains(&mk) {
                 if let Some(m) = self.method(member, vis_here, implicitly_public) {
                     // A C++ field_declaration can be a member FUNCTION
@@ -696,6 +704,101 @@ impl<'a> Cx<'a> {
             span: span_of(node, &self.rel_path),
             name,
         })
+    }
+
+    /// Python's data members, which are declared by being assigned.
+    ///
+    /// There is no `field_declaration` node to list, because the language has no
+    /// field declaration. `field_kinds()` was therefore empty for Python and
+    /// EVERY Python type came back with no fields at all — a dataclass reported
+    /// as having no data, which reads as a fact about the code.
+    ///
+    /// Two shapes, and taking only one of them would leave most real classes
+    /// empty:
+    ///
+    ///   class Point:          # class body — dataclasses, ClassVars, defaults
+    ///       x: int = 0
+    ///
+    ///   def __init__(self):   # instance attributes, the ordinary case
+    ///       self.y = 0
+    ///
+    /// A `self.y = ...` anywhere in the class IS the declaration of `y`, so
+    /// every method is scanned rather than `__init__` alone. Names are deduped
+    /// and the first one wins, which prefers the annotated class-body form when
+    /// a class has both.
+    fn python_fields(&self, member: Node, section: Visibility, item: &mut ApiItem) {
+        // (byte offset, name, type). The offset is carried so the list can be
+        // put back into source order: the body scan below is a stack, which
+        // pops in an order unrelated to how the class reads.
+        let mut found: Vec<(usize, String, String)> = Vec::new();
+
+        match member.kind() {
+            // Class-level: `x: int = 0`, `x = 0`, `x: int`.
+            "expression_statement" => {
+                for i in 0..member.named_child_count() as u32 {
+                    let Some(n) = member.named_child(i) else { continue };
+                    if !matches!(n.kind(), "assignment" | "type_alias_statement") {
+                        continue;
+                    }
+                    let Some(left) = n.child_by_field_name("left") else { continue };
+                    if left.kind() != "identifier" {
+                        continue;
+                    }
+                    found.push((
+                        left.start_byte(),
+                        text(left, self.src).trim().to_string(),
+                        normalise_type_text(&child_text(n, "type", self.src).unwrap_or_default()),
+                    ));
+                }
+            }
+            // Inside a method: `self.y = 0`, `self.y: int = 0`.
+            "function_definition" => {
+                let mut stack = vec![member];
+                while let Some(n) = stack.pop() {
+                    for i in 0..n.named_child_count() as u32 {
+                        if let Some(child) = n.named_child(i) {
+                            stack.push(child);
+                        }
+                    }
+                    if n.kind() != "assignment" {
+                        continue;
+                    }
+                    let Some(left) = n.child_by_field_name("left") else { continue };
+                    if left.kind() != "attribute" {
+                        continue;
+                    }
+                    // `self.y`, and only self: `other.y = 1` assigns to
+                    // somebody else's object, not to a member of this one.
+                    let is_self = left
+                        .child_by_field_name("object")
+                        .map(|o| text(o, self.src).trim() == "self")
+                        .unwrap_or(false);
+                    if !is_self {
+                        continue;
+                    }
+                    let Some(attr) = left.child_by_field_name("attribute") else { continue };
+                    found.push((
+                        attr.start_byte(),
+                        text(attr, self.src).trim().to_string(),
+                        normalise_type_text(&child_text(n, "type", self.src).unwrap_or_default()),
+                    ));
+                }
+            }
+            _ => return,
+        }
+
+        found.sort_by_key(|(at, _, _)| *at);
+
+        for (_, name, ty) in found {
+            if name.is_empty() || item.fields.iter().any(|f| f.name == name) {
+                continue;
+            }
+            let visibility = self.member_visibility(&name, member, section);
+            if !visibility.is_included(self.include_private) {
+                continue;
+            }
+            item.fields.push(ApiField { name, ty, doc: String::new(), visibility });
+        }
     }
 
     /// Data members of one declaration.
