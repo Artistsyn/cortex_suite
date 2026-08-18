@@ -616,10 +616,15 @@ is wrong on its own.
 
 Visibility follows each language's own convention rather than Rust's: a leading
 underscore is internal in Python and JS/TS, `#field` is genuinely private in
-modern JS, `private` / `protected` are honoured in TypeScript, and Java
-package-private and C# implicit-private are treated as narrower than public.
-Interface members are read as public even though they carry no modifier, because
-they cannot carry one.
+modern JS, `private` / `protected` are honoured in TypeScript, capitalisation is
+the whole rule in Go, and Java package-private and C# implicit-private are
+treated as narrower than public. Interface members are read as public even
+though they carry no modifier, because they cannot carry one.
+
+It applies to **methods and fields alike**. That is worth stating because it was
+not true until recently: methods were filtered and fields were not, so
+`include_private` quietly meant "methods only" for every tree-sitter language and
+a library view published its own internals.
 
 ### Known limits
 
@@ -627,9 +632,6 @@ they cannot carry one.
   languages are thinner, and `include_private` matters more for them — it is
   required for any non-Rust root, since a public-API-only scan of a language
   with no `pub` returns almost nothing.
-- **Field lists are not visibility-filtered** in the tree-sitter languages.
-  Methods are, and each field renders with its declared modifiers, but
-  `include_private` does not currently narrow the field list.
 - **Call edges are conservative.** Every call site is recorded in `call_graph`
   with its `file:line`, but a call only becomes a graph edge when the callee
   resolves unambiguously. A method call carries no receiver type, so edging it

@@ -709,6 +709,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                     name: f.ident.as_ref().map_or("_".into(), |i| i.to_string()),
                     ty: type_to_string(&f.ty),
                     doc: extract_docs(&f.attrs),
+                    visibility: visibility_of(&f.vis),
                 })
                 .collect(),
             _ => vec![],
@@ -720,7 +721,14 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             format!("pub struct {}{};", name, generics)
         } else {
             let field_strs: Vec<String> = fields.iter()
-                .map(|f| format!("    pub {}: {},", f.name, f.ty))
+                // Under --include-private the list contains non-public fields,
+                // and every one of them used to render as `pub`. A signature is
+                // the part people copy, so it must not claim a field is public
+                // when the declaration says otherwise.
+                .map(|f| match f.visibility {
+                    Visibility::Private => format!("    {}: {},", f.name, f.ty),
+                    v => format!("    {} {}: {},", v.label(), f.name, f.ty),
+                })
                 .collect();
             format!("pub struct {}{} {{\n{}\n}}", name, generics, field_strs.join("\n"))
         };
@@ -769,6 +777,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                             name: f.ident.as_ref().map_or("_".into(), |i| i.to_string()),
                             ty: type_to_string(&f.ty),
                             doc: extract_docs(&f.attrs),
+                            // An enum variant's fields carry no visibility of
+                            // their own: they are exactly as reachable as the
+                            // enum, so filtering them would hide half of a
+                            // public variant.
+                            visibility: Visibility::Public,
                         })
                         .collect(),
                     syn::Fields::Unnamed(unnamed) => unnamed
@@ -779,6 +792,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                             name: format!("_{}", i),
                             ty: type_to_string(&f.ty),
                             doc: String::new(),
+                            visibility: Visibility::Public,
                         })
                         .collect(),
                     syn::Fields::Unit => vec![],

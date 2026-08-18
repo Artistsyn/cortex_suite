@@ -27,6 +27,10 @@ fn item<'a>(x: &'a Extracted, name: &str) -> &'a ApiItem {
         .unwrap_or_else(|| panic!("no item `{name}`; got {:?}", names(x)))
 }
 
+fn field_names(i: &ApiItem) -> Vec<&str> {
+    i.fields.iter().map(|f| f.name.as_str()).collect()
+}
+
 fn method_names(i: &ApiItem) -> Vec<&str> {
     i.methods.iter().map(|m| m.name.as_str()).collect()
 }
@@ -277,6 +281,53 @@ fn csharp_plain_fields_are_extracted_not_only_properties() {
     ] {
         assert!(fields.contains(&expected), "field {expected:?} missing; got {fields:?}");
     }
+}
+
+/// Methods were filtered by declared visibility and fields were not, so
+/// `include_private` silently meant "methods only" and a library view listed
+/// its own internals. Checked in both directions: filtering that also drops
+/// public members is the same bug wearing the other mask.
+#[test]
+fn csharp_fields_honour_declared_visibility_in_both_views() {
+    const SRC: &str = "public class Box {\n  public int Open;\n  private int _shut;\n  \
+                       internal int Team;\n  protected int Kin;\n  \
+                       public int Prop { get; set; }\n  private int Hidden { get; set; }\n}\n";
+
+    let public_view = parse(SRC, Language::CSharp, false);
+    let shown = field_names(item(&public_view, "Box"));
+    assert_eq!(shown, vec!["Open", "Prop"], "library view must publish only the public surface");
+
+    let project_view = parse(SRC, Language::CSharp, true);
+    let all = field_names(item(&project_view, "Box"));
+    for expected in ["Open", "_shut", "Team", "Kin", "Prop", "Hidden"] {
+        assert!(all.contains(&expected), "project view dropped {expected}; got {all:?}");
+    }
+}
+
+/// Go spells visibility by capitalising the name and says nothing else in the
+/// declaration, so a filter reading modifiers alone would pass everything.
+#[test]
+fn go_struct_fields_are_filtered_by_their_capitalisation() {
+    const SRC: &str = "package p\ntype Canvas struct {\n\tWidth int\n\theight int\n}\n";
+
+    let public_view = parse(SRC, Language::Go, false);
+    assert_eq!(field_names(item(&public_view, "Canvas")), vec!["Width"]);
+
+    let project_view = parse(SRC, Language::Go, true);
+    assert_eq!(field_names(item(&project_view, "Canvas")), vec!["Width", "height"]);
+}
+
+/// An interface's members carry no modifier because they cannot. Reading that
+/// absence as "not public" would empty the one thing an interface exists to
+/// declare — the same trap already fixed for its methods.
+#[test]
+fn interface_members_survive_the_public_view() {
+    let x = parse(
+        "export interface Shape { width: number; height: number; }\n",
+        Language::TypeScript,
+        false,
+    );
+    assert_eq!(field_names(item(&x, "Shape")), vec!["width", "height"]);
 }
 
 /// The Java shape this used to be written against, kept beside it so a future

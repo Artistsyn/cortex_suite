@@ -360,6 +360,16 @@ pub struct ApiField {
     pub name: String,
     pub ty: String,
     pub doc: String,
+    /// As declared. Rust honoured this from the start; the tree-sitter front
+    /// ends filtered METHODS by visibility and let every field through, so
+    /// `include_private` silently meant "methods only" for nine languages and a
+    /// library view listed its own internals.
+    ///
+    /// `serde(default)` because an api-graph.json written before this field
+    /// existed must still load — it deserialises as Public, which is what an
+    /// older writer's already-filtered output was.
+    #[serde(default)]
+    pub visibility: Visibility,
 }
 
 // ── Extended Metadata for Advanced Tools ──────────────────────────────────────

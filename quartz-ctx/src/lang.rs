@@ -466,7 +466,7 @@ impl<'a> Cx<'a> {
                 }
             }
             if l.field_kinds().contains(&mk) {
-                for f in self.fields(member) {
+                for f in self.fields(member, vis_here, implicitly_public) {
                     if !item.fields.iter().any(|e| e.name == f.name) {
                         item.fields.push(f);
                     }
@@ -588,7 +588,10 @@ impl<'a> Cx<'a> {
                 "field_declaration_list" => {
                     let mut c2 = member.walk();
                     for f in member.named_children(&mut c2) {
-                        for field in self.fields(f) {
+                        // Go has no access modifiers: `member_visibility` reads
+                        // the field's own capitalisation, so the section passed
+                        // here is only a starting point it does not consult.
+                        for field in self.fields(f, Visibility::Public, false) {
                             item.fields.push(field);
                         }
                     }
@@ -695,7 +698,15 @@ impl<'a> Cx<'a> {
         })
     }
 
-    fn fields(&self, node: Node) -> Vec<ApiField> {
+    /// Data members of one declaration.
+    ///
+    /// `section` is the visibility in force here — a C++ `private:` run, a Ruby
+    /// `private` marker — and `forced` means the container makes its members
+    /// public whatever they say, which is what an interface does.
+    ///
+    /// Both are honoured per NAME, because in Go visibility is spelled by
+    /// capitalising the field and nothing else in the declaration says it.
+    fn fields(&self, node: Node, section: Visibility, forced: bool) -> Vec<ApiField> {
         // C# nests a field one level deeper than Java does:
         //
         //   Java  field_declaration -> variable_declarator
@@ -744,7 +755,15 @@ impl<'a> Cx<'a> {
             if name == ty || name.is_empty() {
                 continue;
             }
-            out.push(ApiField { ty: ty.clone(), doc: String::new(), name });
+            let visibility = if forced {
+                section
+            } else {
+                self.member_visibility(&name, node, section)
+            };
+            if !visibility.is_included(self.include_private) {
+                continue;
+            }
+            out.push(ApiField { ty: ty.clone(), doc: String::new(), name, visibility });
         }
         out
     }

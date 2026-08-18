@@ -150,22 +150,29 @@ changes or it answers confidently and wrongly.
 
 | Language | Extractor | Signal |
 |---|---|---|
-| Rust | `syn` | resolved — types, trait impls, cross-file `impl` blocks |
-| Python | tree-sitter | AST only — no type resolution |
-| TypeScript / JavaScript | tree-sitter | AST only — no type resolution |
+| Rust | `syn` | `resolved` — types, trait impls, cross-file `impl` blocks |
+| Python, TypeScript / JavaScript, Go, Java, C#, C / C++, Ruby, PHP | tree-sitter | `name_resolved` — declarations, members, bases and interfaces, linked across files by name |
 
-Rust is the strong path. The others are parsed from a concrete syntax tree, so
-there is no type resolution or cross-file linking — a genuinely weaker signal,
-and treated as one. What it buys is that a Python or TypeScript project no longer
-returns *zero items silently*, which is indistinguishable from "this project has
-no API".
+Rust is the strong path. The others are parsed from a concrete syntax tree and
+then linked by the same project-wide resolution pass, which is a real resolution
+step — but by name, not by type, so two same-named types in one project can be
+told apart wrongly. The tag says which you are reading; do not treat
+`name_resolved` as `resolved`.
+
+Visibility follows each language's own convention rather than Rust's — a leading
+underscore in Python and JS/TS, `#field` in modern JS, `private` / `protected`
+where they are spelled, capitalisation in Go, and package-private / implicit
+private in Java and C# — and it filters **methods and fields alike**. Interface
+members are read as public even though they carry no modifier, because they
+cannot carry one. Point `include_private` at applications and at every non-Rust
+root: a language with no `pub` returns almost nothing under a library view.
 
 ## Limits
 
-AST-only languages resolve no types, so relationships between their items are
-thinner than Rust's. Call edges are recorded for every call site but only become
-graph edges when the callee is unambiguous — a method call carries no receiver
-type, so edging it would invent ownership.
+Only Rust resolves types, so relationships between items in the other languages
+are thinner. Call edges are recorded for every call site but only become graph
+edges when the callee is unambiguous — a method call carries no receiver type, so
+edging it would invent ownership.
 
 ## Layout
 
