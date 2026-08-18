@@ -159,6 +159,85 @@ pub fn compress_api_graph(items: &[ApiGraphItem], scope: Option<&str>) -> Vec<Co
     items.iter().map(|i| compress_api_item(i, scope)).collect()
 }
 
+/// The `code_members` rows an api-graph implies: one per field, one per variant.
+///
+/// Ingestion produced units and NOTHING else, so members existed only for what
+/// cortex's own syn pass had already found. For a Rust crate that merely
+/// duplicated work; for anything else it meant nothing at all, because that pass
+/// reads Rust. This workspace's own scene_editor_web indexed 396 units with zero
+/// members — every Python and JavaScript type in the store had no fields,
+/// no variants, and no field-level graph edges, while quartz-ctx served the same
+/// types complete. Two stores fed by one extractor, disagreeing.
+///
+/// Kinds are `field` and `variant`, matching what the syn pass emits, because
+/// `infer_derived_edges` builds child node ids as `{unit}::{kind}:{name}` and a
+/// third spelling would be a second vocabulary in one table — the same split
+/// that `normalise_api_kind` exists to prevent.
+///
+/// Methods are deliberately absent: the syn pass does not emit them either, and
+/// a method's full signature is already in the unit's compressed text.
+pub fn api_graph_members(items: &[ApiGraphItem], scope: Option<&str>) -> Vec<CodeMember> {
+    let mut out = Vec::new();
+    for item in items {
+        // Must match compress_api_item's id exactly — a member whose parent_id
+        // names no unit is deleted by the foreign key the moment it lands.
+        let parent_id = api_item_id(item, scope);
+
+        for f in &item.fields {
+            out.push(CodeMember {
+                parent_id: parent_id.clone(),
+                kind: "field".to_string(),
+                name: f.name.clone(),
+                type_sig: f.ty.clone(),
+                doc: f.doc.clone(),
+            });
+        }
+
+        for v in &item.variants {
+            let type_sig = if v.fields.is_empty() {
+                String::new()
+            } else {
+                let inner: Vec<String> = v
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        if f.ty.is_empty() {
+                            f.name.clone()
+                        } else {
+                            format!("{}: {}", f.name, f.ty)
+                        }
+                    })
+                    .collect();
+                format!("{{ {} }}", inner.join(", "))
+            };
+            out.push(CodeMember {
+                parent_id: parent_id.clone(),
+                kind: "variant".to_string(),
+                name: v.name.clone(),
+                type_sig,
+                doc: v.doc.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// The unit id an api-graph item is stored under. One definition, used by both
+/// the unit and its members, so they cannot drift apart.
+fn api_item_id(item: &ApiGraphItem, scope: Option<&str>) -> String {
+    let raw_module = item.module_path.join("::");
+    let module_path = match scope {
+        Some(s) if raw_module.is_empty() => s.to_string(),
+        Some(s) => format!("{}::{}", s, raw_module),
+        None => raw_module,
+    };
+    if module_path.is_empty() {
+        item.name.clone()
+    } else {
+        format!("{}::{}", module_path, item.name)
+    }
+}
+
 pub fn compress_api_item(item: &ApiGraphItem, scope: Option<&str>) -> CodeUnit {
     let raw_module = item.module_path.join("::");
     let module_path = match scope {
@@ -166,6 +245,7 @@ pub fn compress_api_item(item: &ApiGraphItem, scope: Option<&str>) -> CodeUnit {
         Some(s) => format!("{}::{}", s, raw_module),
         None => raw_module,
     };
+    let id = api_item_id(item, scope);
 
     // quartz-ctx spells kinds `Struct`/`Enum`/`Trait`/`Function`/`Const`; cortex's
     // own extractor and every downstream `kind` filter use `struct`/`enum`/`trait`/
@@ -174,11 +254,6 @@ pub fn compress_api_item(item: &ApiGraphItem, scope: Option<&str>) -> CodeUnit {
 
     let compressed = render_compressed_api(item, &kind, &module_path);
     let summary = build_summary_api(item, &kind);
-    let id = if module_path.is_empty() {
-        item.name.clone()
-    } else {
-        format!("{}::{}", module_path, item.name)
-    };
 
     CodeUnit {
         id,
@@ -870,5 +945,92 @@ mod tests {
             unit.term_vector
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod api_graph_member_tests {
+    use super::*;
+    use crate::model::{ApiGraphField, ApiGraphItem, ApiGraphVariant};
+
+    fn item(kind: &str, module: &[&str], name: &str) -> ApiGraphItem {
+        ApiGraphItem {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            doc: String::new(),
+            signature: String::new(),
+            module_path: module.iter().map(|s| s.to_string()).collect(),
+            methods: vec![],
+            variants: vec![],
+            fields: vec![],
+            generics: String::new(),
+            traits_impl: vec![],
+            visibility: None,
+            span: None,
+            calls: vec![],
+        }
+    }
+
+    fn field(name: &str, ty: &str) -> ApiGraphField {
+        ApiGraphField { name: name.into(), ty: ty.into(), doc: String::new() }
+    }
+
+    /// Ingestion produced units and nothing else, so every api-graph-only type
+    /// had no fields and no variants — which for a non-Rust root is every type
+    /// it has, because cortex's own extractor reads Rust.
+    #[test]
+    fn fields_and_variants_become_members() {
+        let mut bake = item("Struct", &["bake_manager"], "BakeManager");
+        bake.fields = vec![field("cache", "dict[str, list[dict]]"), field("mode", "")];
+
+        let mut mode = item("Enum", &["types"], "Mode");
+        mode.variants = vec![
+            ApiGraphVariant { name: "Fast".into(), doc: String::new(), fields: vec![] },
+            ApiGraphVariant {
+                name: "Sized".into(),
+                doc: String::new(),
+                fields: vec![field("w", "u32")],
+            },
+        ];
+
+        let members = api_graph_members(&[bake, mode], Some("editor_web"));
+        let got: Vec<(&str, &str, &str, &str)> = members
+            .iter()
+            .map(|m| {
+                (m.parent_id.as_str(), m.kind.as_str(), m.name.as_str(), m.type_sig.as_str())
+            })
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                ("editor_web::bake_manager::BakeManager", "field", "cache", "dict[str, list[dict]]"),
+                ("editor_web::bake_manager::BakeManager", "field", "mode", ""),
+                ("editor_web::types::Mode", "variant", "Fast", ""),
+                ("editor_web::types::Mode", "variant", "Sized", "{ w: u32 }"),
+            ]
+        );
+    }
+
+    /// `parent_id` must be the id the unit is stored under. A member naming no
+    /// unit is removed by the foreign key the moment it lands, which looks
+    /// exactly like ingestion that never ran.
+    #[test]
+    fn member_parent_ids_match_the_unit_ids_exactly() {
+        for scope in [None, Some("synful")] {
+            let mut it = item("Struct", &["canvas", "core"], "Canvas");
+            it.fields = vec![field("width", "u32")];
+
+            let unit = &compress_api_graph(std::slice::from_ref(&it), scope)[0];
+            let members = api_graph_members(std::slice::from_ref(&it), scope);
+            assert_eq!(members[0].parent_id, unit.id, "scope {scope:?}");
+        }
+    }
+
+    /// A type with no data of its own contributes nothing rather than a row
+    /// with an empty name.
+    #[test]
+    fn an_item_without_data_members_contributes_none() {
+        assert!(api_graph_members(&[item("Function", &["util"], "helper")], None).is_empty());
     }
 }

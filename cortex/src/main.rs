@@ -2366,7 +2366,7 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
 
     eprintln!("cortex index: compressing {}", args.source.display());
-    let (mut units, members) = compressor::compress_dir(&args.source, args.scope.as_deref())?;
+    let (mut units, mut members) = compressor::compress_dir(&args.source, args.scope.as_deref())?;
     eprintln!("  source: {} items compressed, {} members", units.len(), members.len());
 
     let mut graph_calls: Vec<(String, Vec<model::ApiGraphCall>)> = Vec::new();
@@ -2390,6 +2390,12 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
             let id = if module_path.is_empty() { gi.name.clone() } else { format!("{}::{}", module_path, gi.name) };
             graph_calls.push((id, gi.calls.clone()));
         }
+        // Members too, not only units. Ingesting units alone left every
+        // api-graph-only type with no fields and no variants — which for a
+        // non-Rust root is every type it has, since cortex's own pass reads
+        // Rust. The store then disagreed with quartz-ctx about the same type
+        // while both were fed by the one extractor.
+        let graph_members = compressor::api_graph_members(&graph_items, args.scope.as_deref());
         let graph_units = compressor::compress_api_graph(&graph_items, args.scope.as_deref());
         // Merge: api-graph items take precedence (they carry full method
         // signatures with types, per-method docs and field docs).
@@ -2399,6 +2405,10 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
         let replaced = units.iter().filter(|u| source_ids.contains(&u.id)).count();
         units.retain(|u| !source_ids.contains(&u.id));
         units.extend(graph_units);
+        // Drop the syn pass's members for any unit the api-graph replaced, so a
+        // type does not end up with both extractors' idea of its fields.
+        members.retain(|m| !source_ids.contains(&m.parent_id));
+        members.extend(graph_members);
         eprintln!(
             "  api-graph: {} items from {} ({} replaced own extraction, {} added)",
             ingested,
