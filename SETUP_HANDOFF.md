@@ -11,9 +11,11 @@ They are deliberately split that way. quartz-ctx holds no hand-written knowledge
 cortex no longer parses Rust itself. `reindex` runs quartz-ctx and ingests its
 output, so both are fed by one extractor and cannot disagree about what a type is.
 
-Works on **Rust, Python, TypeScript and JavaScript** projects, on Windows, macOS
-and Linux, with Claude Code, VS Code + Copilot, or any MCP-capable host. Rust gets
-the strong path (`syn`, fully resolved); the rest are AST-only — see §7.
+Works on **Rust, Python, TypeScript, JavaScript, Go, Java, C#, C/C++, Ruby and
+PHP** projects, on Windows, macOS and Linux, with Claude Code, VS Code + Copilot,
+or any MCP-capable host. Rust gets the strong path (`syn`, fully resolved); the
+rest are parsed with tree-sitter and linked across files by name — a real
+resolution step, but not type inference. Read the per-item confidence tag; see §7.
 
 ---
 
@@ -590,26 +592,44 @@ wrongly until you rebuild.
 | Language | Extractor | Signal |
 |---|---|---|
 | Rust | `syn` | **resolved** — types, trait impls, cross-file `impl` blocks, full signatures |
-| Python | tree-sitter | AST only |
-| TypeScript / JavaScript | tree-sitter | AST only |
+| Python, TypeScript / JavaScript, Go, Java, **C#**, C / C++, Ruby, PHP | tree-sitter | **name_resolved** — declarations, members, bases and interfaces, linked across files by name |
 
-The distinction is real and worth respecting. `syn` understands Rust; tree-sitter
-produces a concrete syntax tree with **no type resolution and no cross-file
-linking**. An AST-only item tells you a class exists, its methods, and where —
-not what any of it resolves to.
+The distinction is real and worth respecting, and it is a distinction between
+two kinds of resolution rather than between resolution and none. `syn`
+understands Rust. The tree-sitter front ends parse a concrete syntax tree and
+then feed one project-wide attachment pass — the same pass the Rust front end
+uses — so a member declared away from its type still reaches it: a Go method on
+its receiver, a C++ member defined out of line in a `.cpp`, a C# `partial` half.
+What they do **not** do is infer types, so two same-named types in one project
+can be told apart wrongly. Items say so themselves: read the `name_resolved` tag
+rather than assuming Rust's `resolved`.
 
-That is still a large improvement on the previous behaviour, which was to return
+That is a large improvement on the original behaviour, which was to return
 **zero items silently** for a non-Rust project — an answer indistinguishable from
 "this project has no API". Measured on a real FastAPI + React tree: 0 → 192 items.
 
+Cross-language tracing works from any of them: `trace_across_languages` joins
+declared HTTP routes to the `fetch`/`axios`/`requests` calls that hit them, so an
+ASP.NET `[HttpPost("/api/bake")]` and the JavaScript `fetch('/api/bake')` are one
+boundary — and the halves that did **not** join are reported, since neither side
+is wrong on its own.
+
 Visibility follows each language's own convention rather than Rust's: a leading
 underscore is internal in Python and JS/TS, `#field` is genuinely private in
-modern JS, and `private` / `protected` are honoured in TypeScript.
+modern JS, `private` / `protected` are honoured in TypeScript, and Java
+package-private and C# implicit-private are treated as narrower than public.
+Interface members are read as public even though they carry no modifier, because
+they cannot carry one.
 
 ### Known limits
 
-- **AST-only languages resolve no types**, so relationships between their items
-  are thinner than Rust's, and `include_private` matters more for them.
+- **Only Rust resolves types**, so relationships between items in the other
+  languages are thinner, and `include_private` matters more for them — it is
+  required for any non-Rust root, since a public-API-only scan of a language
+  with no `pub` returns almost nothing.
+- **Field lists are not visibility-filtered** in the tree-sitter languages.
+  Methods are, and each field renders with its declared modifiers, but
+  `include_private` does not currently narrow the field list.
 - **Call edges are conservative.** Every call site is recorded in `call_graph`
   with its `file:line`, but a call only becomes a graph edge when the callee
   resolves unambiguously. A method call carries no receiver type, so edging it

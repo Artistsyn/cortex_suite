@@ -246,6 +246,55 @@ fn csharp_declarations_inside_a_namespace_are_found() {
     assert!(w.calls.iter().any(|e| e.to == "Helper::Log"), "{:?}", w.calls);
 }
 
+/// C# nests a field one level deeper than Java does — `field_declaration ->
+/// variable_declaration -> variable_declarator` — so reading only the direct
+/// children found neither the name nor the type, and every plain C# field was
+/// dropped. Properties still worked, which is what made it invisible: the type
+/// listed, its `{ get; set; }` members listed, and its data members were simply
+/// absent.
+#[test]
+fn csharp_plain_fields_are_extracted_not_only_properties() {
+    let x = parse(
+        "public class Box {\n  public int Width;\n  private string _name;\n  \
+         public int Counted = 0;\n  public int A, B;\n  \
+         public double Scale { get; set; }\n}\n",
+        Language::CSharp,
+        true,
+    );
+    let b = item(&x, "Box");
+    let fields: Vec<(&str, &str)> =
+        b.fields.iter().map(|f| (f.name.as_str(), f.ty.as_str())).collect();
+
+    for expected in [
+        ("Width", "int"),
+        ("_name", "string"),
+        ("Scale", "double"),
+        // An initialiser must not become part of the name ("Counted = 0"), and
+        // one declaration can introduce several names.
+        ("Counted", "int"),
+        ("A", "int"),
+        ("B", "int"),
+    ] {
+        assert!(fields.contains(&expected), "field {expected:?} missing; got {fields:?}");
+    }
+}
+
+/// The Java shape this used to be written against, kept beside it so a future
+/// change to the shared path cannot fix one and break the other.
+#[test]
+fn java_fields_still_extract_from_their_flatter_shape() {
+    let x = parse(
+        "public class Box { public int width; private String name; }\n",
+        Language::Java,
+        true,
+    );
+    let b = item(&x, "Box");
+    let fields: Vec<(&str, &str)> =
+        b.fields.iter().map(|f| (f.name.as_str(), f.ty.as_str())).collect();
+    assert!(fields.contains(&("width", "int")), "{fields:?}");
+    assert!(fields.contains(&("name", "String")), "{fields:?}");
+}
+
 /// `partial` is declared in the source, so splitting a type across files is a
 /// checkable fact rather than a guess. Merging same-named types on sight is how
 /// `editor::State` absorbs `engine::State`.

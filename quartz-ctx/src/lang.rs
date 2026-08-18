@@ -696,7 +696,20 @@ impl<'a> Cx<'a> {
     }
 
     fn fields(&self, node: Node) -> Vec<ApiField> {
-        let ty = child_text(node, "type", self.src).unwrap_or_default();
+        // C# nests a field one level deeper than Java does:
+        //
+        //   Java  field_declaration -> variable_declarator
+        //   C#    field_declaration -> variable_declaration -> variable_declarator
+        //
+        // and the `type` field sits on that inner node too. Reading only the
+        // direct children therefore found no name AND no type, so EVERY plain
+        // C# field was dropped — `public int Temperature;` extracted as nothing,
+        // while `public int Temperature { get; set; }` worked, because a
+        // property_declaration does carry both directly. The type still listed,
+        // its properties still listed, and its data members were simply absent:
+        // the shape of an answer that looks complete.
+        let decl = first_child_of_kind(node, "variable_declaration").unwrap_or(node);
+        let ty = child_text(decl, "type", self.src).unwrap_or_default();
         let mut out = Vec::new();
 
         // One declaration can introduce several names (`int a, b;`).
@@ -704,12 +717,20 @@ impl<'a> Cx<'a> {
         if let Some(n) = child_text(node, "name", self.src) {
             names.push(n);
         }
-        let mut c = node.walk();
-        for child in node.named_children(&mut c) {
+        let mut c = decl.walk();
+        for child in decl.named_children(&mut c) {
             match child.kind() {
                 "variable_declarator" | "field_identifier" | "identifier"
                 | "property_identifier" | "field_declarator" => {
+                    // A declarator may carry an initialiser (`int count = 0;`).
+                    // Prefer the `name` field, then the identifier child, and
+                    // only then the whole text — which would otherwise read as
+                    // "count = 0".
                     let n = child_text(child, "name", self.src)
+                        .or_else(|| {
+                            first_child_of_kind(child, "identifier")
+                                .map(|id| text(id, self.src).trim().to_string())
+                        })
                         .unwrap_or_else(|| text(child, self.src).trim().to_string());
                     if !n.is_empty() && !names.contains(&n) {
                         names.push(n);
@@ -1223,6 +1244,16 @@ fn span_of(node: Node, rel_path: &str) -> Option<SourceSpan> {
 
 fn text<'a>(node: Node, src: &'a str) -> &'a str {
     node.utf8_text(src.as_bytes()).unwrap_or("")
+}
+
+/// First named child of a given kind. Grammars differ in how deeply they nest
+/// the same construct, so some lookups have to be by kind rather than by field.
+fn first_child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    // Indexed rather than via named_children: the cursor that iterator borrows
+    // cannot outlive this frame, while the Node it yields must.
+    (0..node.named_child_count() as u32)
+        .filter_map(|i| node.named_child(i))
+        .find(|n| n.kind() == kind)
 }
 
 fn child_text(node: Node, field: &str, src: &str) -> Option<String> {
