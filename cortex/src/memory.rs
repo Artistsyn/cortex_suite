@@ -1581,10 +1581,17 @@ impl Store {
 
     // ── MCP call log ──────────────────────────────────────────────────────────
 
+    /// Log a tool call.
+    ///
+    /// Arguments go through `redact::redact_call_args` first. Captured command
+    /// output (`compact_output`) is replaced by a size stub and credentials are
+    /// scrubbed from what remains — see `redact` for why this has to happen at
+    /// write time rather than being cleaned up later.
     pub fn log_mcp_call(&self, tool: &str, args: &str) -> Result<i64> {
+        let safe = crate::redact::redact_call_args(tool, args);
         self.conn.execute(
             "INSERT INTO mcp_calls (tool, args, called_at) VALUES (?1, ?2, ?3)",
-            params![tool, args, chrono::Utc::now().to_rfc3339()],
+            params![tool, safe, chrono::Utc::now().to_rfc3339()],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1646,6 +1653,13 @@ pub fn command_family(command: &str) -> String {
         } else {
             1.0
         };
+        // The command line is a second capture surface, distinct from the tool
+        // arguments fixed in `log_mcp_call`: a command routinely carries its own
+        // credentials (`-H "Authorization: Bearer ..."`, `postgres://u:p@host`,
+        // `export API_KEY=`). command_family drives the analysis; the full text
+        // is kept only for forensics, so scrubbing it costs nothing.
+        let command = crate::redact::redact_command(command);
+        let command = command.as_str();
         self.conn.execute(
             "INSERT INTO compression_savings
                 (session_key, command, command_family, original_chars, filtered_chars, ratio)

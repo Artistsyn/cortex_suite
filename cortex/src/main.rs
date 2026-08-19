@@ -20,6 +20,7 @@ mod output_filter;
 mod test_signal;
 mod planner;
 mod recall_match;
+mod redact;
 mod prefs;
 mod protocol;
 mod reasoner;
@@ -3737,6 +3738,19 @@ fn run_prune_index(keep: Vec<String>, apply: bool, db_path: &Path) -> Result<()>
 
 fn run_prune(keep_calls: usize, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
+
+    // Scrub BEFORE pruning, and independently of it: the retained entries are
+    // exactly the ones a `--keep-calls` run preserves, and they carry the same
+    // captured payloads as the ones being deleted.
+    let (scrubbed, freed) = crate::redact::scrub_existing_log(store.conn())?;
+    if scrubbed > 0 {
+        println!(
+            "  scrubbed {} call log entr{} of captured output/credentials ({} removed)",
+            scrubbed,
+            if scrubbed == 1 { "y" } else { "ies" },
+            format_bytes(freed)
+        );
+    }
 
     let pruned_calls = cache::prune_call_log(store.conn(), keep_calls)?;
     println!("  pruned {} call log entries (keeping {})", pruned_calls, keep_calls);

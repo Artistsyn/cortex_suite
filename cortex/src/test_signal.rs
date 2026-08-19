@@ -125,9 +125,14 @@ pub fn error_signature(output: &str) -> Option<String> {
 ///
 /// Returns the number of patterns whose counters moved, for logging.
 pub fn observe(store: &Store, session_id: &str, command: &str, passed: bool) -> Result<usize> {
+    // Third command-capture surface, after mcp_calls.args and
+    // compression_savings.command. Only the pass/fail verdict drives anything
+    // here; the command text is context for a human reading the ledger, so it
+    // has nothing to lose by being scrubbed of credentials.
+    let command = crate::redact::redact_command(command);
     store.conn().execute(
         "INSERT INTO test_outcomes (session_id, command, passed) VALUES (?1, ?2, ?3)",
-        params![session_id, command, passed as i64],
+        params![session_id, command.as_str(), passed as i64],
     )?;
     apply_verdict(store, session_id, passed)
 }
