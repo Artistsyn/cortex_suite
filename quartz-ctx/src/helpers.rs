@@ -65,22 +65,12 @@ mod tests {
 
     fn item(name: &str, doc: &str) -> ApiItem {
         ApiItem {
-            kind: ItemKind::Struct,
-            name: name.to_string(),
             doc: doc.to_string(),
-            signature: String::new(),
             module_path: vec!["m".into()],
-            methods: vec![],
-            variants: vec![],
-            fields: vec![],
-            generics: String::new(),
-            traits_impl: vec![],
-            origin: String::new(),
             visibility: Visibility::Public,
-            span: None,
             confidence: Confidence::Resolved,
             language: "rust".to_string(),
-            calls: Vec::new(),
+            ..ApiItem::new(ItemKind::Struct, name)
         }
     }
 

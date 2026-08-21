@@ -1040,16 +1040,9 @@ impl<'a> Cx<'a> {
             _ => Visibility::Public,
         };
         ApiItem {
-            kind,
             doc: leading_doc(node, self.src, self.lang),
             signature: signature_text(node, self.src),
             module_path: self.module_path.clone(),
-            methods: vec![],
-            variants: vec![],
-            fields: vec![],
-            generics: String::new(),
-            traits_impl: vec![],
-            origin: String::new(),
             visibility,
             span: span_of(node, &self.rel_path),
             // Built in exactly one place so the tag cannot be set on one path
@@ -1057,8 +1050,7 @@ impl<'a> Cx<'a> {
             // claim spent a release as a doc comment with no field behind it.
             confidence: Confidence::NameResolved,
             language: self.lang.label().to_string(),
-            calls: vec![],
-            name,
+            ..ApiItem::new(kind, name)
         }
     }
 

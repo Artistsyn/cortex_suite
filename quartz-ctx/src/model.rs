@@ -308,6 +308,48 @@ pub enum ItemKind {
     Const,
 }
 
+impl ApiItem {
+    /// A bare item with everything optional left empty.
+    ///
+    /// Exists because adding a field to `ApiItem` used to break every literal
+    /// construction with E0063 -- six of them in `parser.rs` alone, one per
+    /// Rust item kind. That happened on `origin`, then `visibility`, then
+    /// `span`, then `confidence`, then `language`: five times, in three
+    /// separate sessions, for a struct whose whole job is to gain fields as the
+    /// index learns to record more.
+    ///
+    /// `Default` is deliberately NOT derived: `ItemKind` has no meaningful
+    /// default, and inventing one would let an item be constructed without
+    /// saying what it is. Requiring the two fields that are never optional
+    /// keeps that impossible while making the rest free.
+    ///
+    /// Use it as the base of a struct update:
+    ///
+    /// ```ignore
+    /// ApiItem { doc, signature, ..ApiItem::new(ItemKind::Struct, name) }
+    /// ```
+    pub fn new(kind: ItemKind, name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            name: name.into(),
+            doc: String::new(),
+            signature: String::new(),
+            module_path: Vec::new(),
+            methods: Vec::new(),
+            variants: Vec::new(),
+            fields: Vec::new(),
+            generics: String::new(),
+            traits_impl: Vec::new(),
+            origin: String::new(),
+            visibility: Visibility::default(),
+            span: None,
+            confidence: Confidence::default(),
+            language: String::new(),
+            calls: Vec::new(),
+        }
+    }
+}
+
 impl ItemKind {
     pub fn label(&self) -> &'static str {
         match self {

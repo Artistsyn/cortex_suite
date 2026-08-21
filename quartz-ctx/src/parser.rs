@@ -734,17 +734,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
         };
 
         self.items.push(ApiItem {
-            kind: ItemKind::Struct,
-            name,
             doc: extract_docs(&node.attrs),
             signature: sig,
             module_path: self.module_path.clone(),
-            methods: vec![],
-            variants: vec![],
             fields,
             generics,
-            traits_impl: vec![],
-            origin: String::new(),
             // Rust goes through syn, which resolves types and links impls
             // across files. That is a different kind of answer from the
             // tree-sitter path, and the difference travels with the item.
@@ -752,7 +746,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
-            calls: Vec::new(),
+            ..ApiItem::new(ItemKind::Struct, name)
         });
 
         syn::visit::visit_item_struct(self, node);
@@ -809,17 +803,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
         let generics = generics_to_string(&node.generics);
 
         self.items.push(ApiItem {
-            kind: ItemKind::Enum,
-            name,
             doc: extract_docs(&node.attrs),
             signature: format!("pub enum {}{}", node.ident, generics),
             module_path: self.module_path.clone(),
-            methods: vec![],
             variants,
-            fields: vec![],
             generics,
-            traits_impl: vec![],
-            origin: String::new(),
             // Rust goes through syn, which resolves types and links impls
             // across files. That is a different kind of answer from the
             // tree-sitter path, and the difference travels with the item.
@@ -827,7 +815,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
-            calls: Vec::new(),
+            ..ApiItem::new(ItemKind::Enum, name)
         });
 
         syn::visit::visit_item_enum(self, node);
@@ -840,17 +828,10 @@ impl<'ast> Visit<'ast> for ApiVisitor {
         }
 
         self.items.push(ApiItem {
-            kind: ItemKind::Function,
-            name: node.sig.ident.to_string(),
             doc: extract_docs(&node.attrs),
             signature: sig_to_string(&node.sig),
             module_path: self.module_path.clone(),
-            methods: vec![],
-            variants: vec![],
-            fields: vec![],
             generics: generics_to_string(&node.sig.generics),
-            traits_impl: vec![],
-            origin: String::new(),
             // Rust goes through syn, which resolves types and links impls
             // across files. That is a different kind of answer from the
             // tree-sitter path, and the difference travels with the item.
@@ -863,6 +844,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                 &node.sig.ident.to_string(),
                 &self.rel_path,
             ),
+            ..ApiItem::new(ItemKind::Function, node.sig.ident.to_string())
         });
     }
 
@@ -897,17 +879,11 @@ impl<'ast> Visit<'ast> for ApiVisitor {
         let generics = generics_to_string(&node.generics);
 
         self.items.push(ApiItem {
-            kind: ItemKind::Trait,
-            name,
             doc: extract_docs(&node.attrs),
             signature: format!("pub trait {}{}", node.ident, generics),
             module_path: self.module_path.clone(),
             methods,
-            variants: vec![],
-            fields: vec![],
             generics,
-            traits_impl: vec![],
-            origin: String::new(),
             // Rust goes through syn, which resolves types and links impls
             // across files. That is a different kind of answer from the
             // tree-sitter path, and the difference travels with the item.
@@ -915,7 +891,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
-            calls: Vec::new(),
+            ..ApiItem::new(ItemKind::Trait, name)
         });
 
         syn::visit::visit_item_trait(self, node);
@@ -994,8 +970,6 @@ impl<'ast> Visit<'ast> for ApiVisitor {
 
         let ty = &node.ty;
         self.items.push(ApiItem {
-            kind: ItemKind::TypeAlias,
-            name: node.ident.to_string(),
             doc: extract_docs(&node.attrs),
             signature: format!(
                 "pub type {} = {};",
@@ -1003,12 +977,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                 type_to_string(ty)
             ),
             module_path: self.module_path.clone(),
-            methods: vec![],
-            variants: vec![],
-            fields: vec![],
             generics: generics_to_string(&node.generics),
-            traits_impl: vec![],
-            origin: String::new(),
             // Rust goes through syn, which resolves types and links impls
             // across files. That is a different kind of answer from the
             // tree-sitter path, and the difference travels with the item.
@@ -1016,7 +985,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
-            calls: Vec::new(),
+            ..ApiItem::new(ItemKind::TypeAlias, node.ident.to_string())
         });
     }
 
@@ -1035,8 +1004,6 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             60,
         );
         self.items.push(ApiItem {
-            kind: ItemKind::Const,
-            name: node.ident.to_string(),
             doc: extract_docs(&node.attrs),
             signature: format!(
                 "pub const {}: {} = {};",
@@ -1045,12 +1012,6 @@ impl<'ast> Visit<'ast> for ApiVisitor {
                 value
             ),
             module_path: self.module_path.clone(),
-            methods: vec![],
-            variants: vec![],
-            fields: vec![],
-            generics: String::new(),
-            traits_impl: vec![],
-            origin: String::new(),
             // Rust goes through syn, which resolves types and links impls
             // across files. That is a different kind of answer from the
             // tree-sitter path, and the difference travels with the item.
@@ -1058,7 +1019,7 @@ impl<'ast> Visit<'ast> for ApiVisitor {
             language: "rust".to_string(),
             visibility: visibility_of(&node.vis),
             span: span_of(&node.ident, &self.rel_path),
-            calls: Vec::new(),
+            ..ApiItem::new(ItemKind::Const, node.ident.to_string())
         });
     }
 
