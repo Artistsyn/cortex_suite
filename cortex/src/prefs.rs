@@ -287,6 +287,27 @@ const NOTE_INDEX_CHARS: usize = 90;
 /// hidden, so the reduction stays lossless by construction.
 ///
 /// `full` returns the input untouched, which is the pre-tiering behaviour.
+/// How many notes a hint actually reached, and how many there were.
+///
+/// Separate from `tier_notes` because the caller that needs it is asking a
+/// different question: not "what do I show" but "did this hint find anything at
+/// all". A hint reaching ZERO notes is a retrieval miss on the most-called tool
+/// in the store, and until this existed there was no way to observe one.
+///
+/// `(0, 0)` when there is nothing to tier — an unstructured or single-note
+/// prefs blob is returned whole, so no hint can miss against it.
+pub fn note_match_counts(rendered: &str, hint: Option<&str>) -> (usize, usize) {
+    let Some(marker) = rendered.find("\nnotes: ") else { return (0, 0) };
+    let blob = rendered[marker + "\nnotes: ".len()..].trim_end();
+    let notes: Vec<&str> = blob.split(" | ").map(str::trim).filter(|n| !n.is_empty()).collect();
+    if notes.len() < 2 {
+        return (0, 0);
+    }
+    let terms = hint_terms(hint);
+    let matched = notes.iter().filter(|n| score_note(n, &terms) > 0).count();
+    (matched, notes.len())
+}
+
 pub fn tier_notes(rendered: &str, hint: Option<&str>, full: bool) -> String {
     if full {
         return rendered.to_string();
@@ -458,4 +479,28 @@ fn measure_real_prefs_savings() {
             100.0 * (full.len() - t.len()) as f64 / full.len() as f64
         );
     }
+    /// A hint that reaches nothing is the signal; the counts are how it is seen.
+    #[test]
+    fn note_match_counts_reports_a_hint_that_reached_nothing() {
+        let input = "style: terse\nnotes: prefer the shared helper here | naming is snake_case\n";
+        assert_eq!(note_match_counts(input, Some("shared helper")), (1, 2));
+        assert_eq!(
+            note_match_counts(input, Some("database migration rollback")),
+            (0, 2),
+            "a hint about something the prefs say nothing about must read as zero"
+        );
+    }
+
+    /// Nothing to tier means no hint can miss against it, so it must not be
+    /// reported as a gap — otherwise every call on a small prefs file is a miss.
+    #[test]
+    fn an_untierable_blob_reports_no_notes_rather_than_a_miss() {
+        assert_eq!(note_match_counts("style: terse\n", Some("anything")), (0, 0));
+        assert_eq!(
+            note_match_counts("style: terse\nnotes: only one\n", Some("anything")),
+            (0, 0),
+            "a single note is returned whole, so it cannot be missed"
+        );
+    }
+
 }

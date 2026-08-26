@@ -576,16 +576,43 @@ pub struct GapProposal {
     pub proposed_note: String,
 }
 
+/// How recently a gap must have been hit to be worth proposing.
+///
+/// The same window `meta::analyze_gap_evolution` uses, deliberately: the two
+/// functions ask the same question and disagreeing about the answer is what
+/// produced a report saying "1 persistent unresolved gap" beside a pipeline
+/// saying "0 gap proposals", permanently, with nothing able to settle it.
+const GAP_RECENCY_SECS: i64 = 30 * 86400;
+
 /// Find query gaps that have been seen >= min_count times and propose prefs notes.
+///
+/// WHY THERE IS NO "IS IT ALREADY COVERED" CHECK HERE
+///
+/// There was one, and it silenced this whole stage. It counted a gap as handled
+/// when ANY annotation contained the query as a substring -- so a symbol whose
+/// lookup had failed six times was dismissed because a dozen unrelated notes
+/// happened to mention its name somewhere in their prose. Prose about a topic
+/// does not make a lookup on it resolve, and the failure was self-reinforcing in
+/// the worst direction: the more a store knows about something, the more
+/// certainly it stops reporting that retrieval of it is failing. Success at
+/// writing notes read as success at retrieval.
+///
+/// Nothing replaces it because nothing needs to. "Have we already dealt with
+/// this gap" is answered exactly, downstream, by content_hash: `proposals` has
+/// a UNIQUE constraint on it, `verify::run_gates` rejects duplicates on it, and
+/// `verify::is_recently_rejected` skips ones a human turned down. That is a
+/// precise answer to the question the substring match was guessing at, and
+/// where the two disagreed the guess won and suppressed the precise one.
 pub fn detect_gap_proposals(store: &Store, min_count: i64) -> Result<Vec<GapProposal>> {
+    let cutoff = chrono::Utc::now().timestamp() - GAP_RECENCY_SECS;
     let mut stmt = store.conn().prepare(
         "SELECT tool_name, query_text, seen_count
          FROM query_gap_log
-         WHERE seen_count >= ?1
+         WHERE seen_count >= ?1 AND last_seen_at >= ?2
          ORDER BY seen_count DESC
          LIMIT 20"
     )?;
-    let rows = stmt.query_map(params![min_count], |row| {
+    let rows = stmt.query_map(params![min_count, cutoff], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -596,25 +623,15 @@ pub fn detect_gap_proposals(store: &Store, min_count: i64) -> Result<Vec<GapProp
     let mut proposals = Vec::new();
     for row in rows {
         let (tool, query, count) = row?;
-        // Skip if we already have a prefs note or annotation covering this query.
-        let already_covered: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM annotations
-             WHERE lower(body) LIKE lower(?1) OR lower(topic) LIKE lower(?1)",
-            params![format!("%{}%", query.chars().take(40).collect::<String>())],
-            |r| r.get(0),
-        ).unwrap_or(0);
-
-        if already_covered == 0 {
-            let note = format!(
-                "Frequent retrieval miss ({count}x): '{query}' via {tool} — consider adding a prefs note or annotation."
-            );
-            proposals.push(GapProposal {
-                query_text: query,
-                tool_name: tool,
-                seen_count: count,
-                proposed_note: note,
-            });
-        }
+        let note = format!(
+            "Frequent retrieval miss ({count}x): '{query}' via {tool} — consider adding a prefs note or annotation."
+        );
+        proposals.push(GapProposal {
+            query_text: query,
+            tool_name: tool,
+            seen_count: count,
+            proposed_note: note,
+        });
     }
 
     Ok(proposals)
@@ -733,5 +750,100 @@ mod tests {
         assert!(ptext.contains("Do the thing."));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── Gap proposal detection ───────────────────────────────────────────────
+
+    use crate::memory::Store;
+
+    /// A throwaway store on disk, NOT the live one.
+    ///
+    /// These tests insert gap rows, and `test_signal`'s helper opens the real
+    /// `.cortex/memory.db` — borrowing that here would write test fixtures into
+    /// the workspace's own memory.
+    fn store_with_gap(seen: i64, age_days: i64) -> Store {
+        let path = std::env::temp_dir().join(format!(
+            "cortex_gap_test_{}_{}_{}.db",
+            std::process::id(),
+            seen,
+            age_days
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(&path).expect("temp store");
+        let ts = chrono::Utc::now().timestamp() - age_days * 86400;
+        store
+            .conn()
+            .execute(
+                "INSERT INTO query_gap_log
+                    (tool_name, query_text, session_id, seen_count, last_reason,
+                     first_seen_at, last_seen_at)
+                 VALUES ('get_item', 'ExampleType', 's', ?1, 'no match', ?2, ?2)",
+                rusqlite::params![seen, ts],
+            )
+            .expect("insert gap");
+        store
+    }
+
+    /// The bug that silenced this stage for forty days.
+    ///
+    /// A gap was dismissed when ANY annotation contained the query as a
+    /// substring, so repeated failed lookups of a symbol were suppressed by
+    /// unrelated notes that merely mentioned its name -- and the more a store
+    /// knows about a topic, the more certainly it stops reporting that
+    /// retrieval of it is failing.
+    #[test]
+    fn prose_mentioning_the_query_does_not_count_as_covering_the_gap() {
+        let store = store_with_gap(6, 1);
+        store
+            .conn()
+            .execute(
+                "INSERT INTO annotations (topic, body, tags, added_at) VALUES
+                    ('ExampleType::do_thing', 'a note that mentions the name', '[]', '2026-01-01'),
+                    ('ExampleType overview', 'and another one', '[]', '2026-01-01')",
+                [],
+            )
+            .expect("insert annotations");
+
+        let proposals = super::detect_gap_proposals(&store, 3).expect("detect");
+        assert_eq!(
+            proposals.len(),
+            1,
+            "a hot gap must be raised even where the store is full of prose about it"
+        );
+        assert_eq!(proposals[0].query_text, "ExampleType");
+        assert_eq!(proposals[0].seen_count, 6);
+    }
+
+    #[test]
+    fn a_gap_below_the_count_is_not_raised() {
+        let store = store_with_gap(2, 1);
+        assert!(super::detect_gap_proposals(&store, 3).expect("detect").is_empty());
+    }
+
+    /// query_gap_log is never pruned, so a lookup fixed months ago sits there at
+    /// its old count forever. Without a recency bound it would be re-raised
+    /// every run and could never be got rid of except by rejecting it.
+    #[test]
+    fn a_gap_nothing_has_hit_in_a_month_is_not_raised() {
+        assert!(
+            super::detect_gap_proposals(&store_with_gap(9, 45), 3)
+                .expect("detect")
+                .is_empty(),
+            "a stale gap is history, not a proposal"
+        );
+        assert_eq!(
+            super::detect_gap_proposals(&store_with_gap(9, 20), 3)
+                .expect("detect")
+                .len(),
+            1,
+            "and one still being hit inside the window is"
+        );
+    }
+
+    /// The window has to be the one meta uses, or the report and the pipeline go
+    /// back to contradicting each other about the same row.
+    #[test]
+    fn the_recency_window_matches_the_one_meta_reports_against() {
+        assert_eq!(super::GAP_RECENCY_SECS, 30 * 86400);
     }
 }

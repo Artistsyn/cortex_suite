@@ -32,7 +32,7 @@ pub fn dispatch(
         "get_delta"            => tool_get_delta(args, repo_root),
         "query_graph"          => tool_query_graph(args, store, session_id),
         "explain_dependency_path" => tool_explain_dependency_path(args, store, session_id),
-        "get_preferences"      => tool_get_preferences(args, prefs_summary),
+        "get_preferences"      => tool_get_preferences(args, store, prefs_summary, session_id),
         "simulate_change"      => tool_simulate_change(args, store, session_id),
         "recall"               => tool_recall(args, store, units, sessions, session_id),
         "list_patterns"        => tool_list_patterns(args, store, session_id),
@@ -807,13 +807,28 @@ fn tool_query_graph(args: &Value, store: &Store, session_id: &str) -> Result<Str
     Ok(out)
 }
 
-fn tool_get_preferences(args: &Value, prefs_summary: &str) -> Result<String, String> {
+/// Preference notes, tiered by how well each matches the hint.
+///
+/// Takes `store` and `session_id` solely to report a MISS. This was the only
+/// hint-taking tool that could not: it read a pre-rendered summary string and
+/// had no database to speak to. It is also the most-called tool in the store --
+/// 284 calls against 24 gap rows total, none of them from here -- so the tool
+/// asked most often about what the project prefers was the one incapable of
+/// saying "nothing here bears on that".
+fn tool_get_preferences(
+    args: &Value,
+    store: &Store,
+    prefs_summary: &str,
+    session_id: &str,
+) -> Result<String, String> {
     let _hint = require_hint(args, "get_preferences")?;
     if prefs_summary.trim().is_empty() {
         return Ok("No preferences configured.".to_string());
     }
     let hint = args.get("hint").and_then(|v| v.as_str());
     let full = args.get("detail").and_then(|v| v.as_str()) == Some("full");
+    let (matched, total) = crate::prefs::note_match_counts(prefs_summary, hint);
+    log_expansion_miss(store, "get_preferences", args, session_id, matched, total);
     Ok(crate::prefs::tier_notes(prefs_summary, hint, full))
 }
 
@@ -1050,6 +1065,8 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
 
         out.push('\n');
     }
+    log_expansion_miss(store, "list_patterns", args, session_id, expanded, patterns.len());
+
     if detail_is_summary {
         out.push_str(&format!(
             "({} shown by name and intent only{} — pass hint=\"<what you are writing>\" \
@@ -1189,6 +1206,42 @@ fn hint_score(ap: &crate::model::AntiPattern, tokens: &[String]) -> usize {
 /// is the wrong/correct remedy pair, which matters once a trap actually
 /// applies — and anything matching `hint` is expanded in place, so the entries
 /// relevant to the task at hand arrive complete without a second call.
+/// Record that a hinted call found nothing worth expanding.
+///
+/// The highest-signal gap the store can collect, and until now the one it threw
+/// away. `get_item("Canvas")` missing is a lookup that failed; a hint expanding
+/// NOTHING is the agent stating what it is about to write and being told the
+/// store has no bearing on it. That is the question the mandatory pre-code check
+/// exists to ask, and the answer was going unrecorded.
+///
+/// Not logged when `detail="full"` was asked for, because that is a deliberate
+/// request to see everything rather than a targeted lookup, and a miss against
+/// it means nothing. Not logged for an empty store either: nothing matching when
+/// there is nothing to match is not a gap in coverage, it is an empty store, and
+/// filling the gap log with it would bury the real ones.
+fn log_expansion_miss(
+    store: &Store,
+    tool: &str,
+    args: &Value,
+    session_id: &str,
+    expanded: usize,
+    total: usize,
+) {
+    if expanded > 0 || total == 0 {
+        return;
+    }
+    if args.get("detail").and_then(|v| v.as_str()) == Some("full") {
+        return;
+    }
+    let Some(hint) = args.get("hint").and_then(|v| v.as_str()) else { return };
+    let _ = store.log_query_gap(
+        tool,
+        hint,
+        Some(session_id),
+        Some(&format!("hint matched none of {total} entries")),
+    );
+}
+
 fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
     let _hint = require_hint(args, "get_anti_patterns")?;
     let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
@@ -1270,6 +1323,8 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
             listed += 1;
         }
     }
+
+    log_expansion_miss(store, "get_anti_patterns", args, session_id, expanded, aps.len());
 
     let header = match since {
         Some(cut) => format!(
