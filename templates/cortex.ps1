@@ -4,10 +4,6 @@
 # Nothing here is specific to one machine or one project: the workspace name is
 # the directory it is installed into, and the indexed sources come from
 # .cortex/index-sources.json. The bash companion is cortex.sh.
-# Covers source roots in a single DB:
-#   quartz/src               (official, unscoped units)
-#   synful_quartz/quartz/src (experimental, scope: synful::)
-#   path_forge/src           (PathForge, scope: path_forge::)
 # DB: .cortex/memory.db
 #
 # Usage:
@@ -223,8 +219,8 @@ function Get-ApiGraphForSource {
         return $null
     }
 
-    # Key the context dir on scope: quartz\src and arty\synful_quartz\quartz\src
-    # both slugify to "quartz", so without this they would overwrite each other.
+    # Key the context dir on scope so multiple roots with the same leaf name
+    # (e.g. two crates both with a "src" subdirectory) don't overwrite each other.
     $ctxDir = if ($Scope) { $Scope } else { "primary" }
 
     try {
