@@ -757,6 +757,31 @@ impl Store {
         // Phase 0A: session tracking columns (idempotent ALTER TABLE).
         self.ensure_session_tracking_columns()?;
 
+        // Recurring-failure rows written under the old signature scheme.
+        //
+        // That scheme keyed on the Rust error CODE alone, so one row could hold
+        // thirteen unrelated symbols from four projects and report them as a
+        // single failure "hit in 6 sessions". Its stored exemplar was the first
+        // few lines of whatever had been captured and was never refreshed, so
+        // it frequently illustrated the group with text that had nothing to do
+        // with the error.
+        //
+        // Their counts are not comparable with the new ones and their exemplars
+        // are not trustworthy, so they are dropped rather than migrated -- there
+        // is nothing in them to carry forward, and left in place they sit in
+        // AWAITING YOUR REVIEW forever inviting somebody to record a trap that
+        // does not exist. Anything real re-accumulates within a few sessions.
+        //
+        // Only rows nobody has acted on: `proposed = 1` means a human already
+        // made a call, and that is theirs to keep.
+        let dropped = self.drop_legacy_failure_signatures()?;
+        if dropped > 0 {
+            eprintln!(
+                "[cortex] dropped {dropped} recurring-failure row(s) written under the old \
+                 error-code-only signature; they will re-accumulate with real identities"
+            );
+        }
+
         // Backfill legacy session-level outcome markers into per-outcome ledger.
         // This preserves prior evidence application semantics and prevents re-application.
         let migrated_outcome_rows = self.backfill_legacy_outcome_application()?;
@@ -774,6 +799,23 @@ impl Store {
         self.rebuild_fts()?;
 
         Ok(())
+    }
+
+    /// Remove `recurring_errors` rows keyed the old way. See `migrate`.
+    ///
+    /// Identified by SHAPE, not by a version stamp: a new-scheme rust signature
+    /// always carries a discriminator after the code (`rust:E0425:parse_header`),
+    /// and the old one never did. The assertion rows dropped are the ones whose
+    /// identity was the test harness's own summary line, which matched every
+    /// failing run in every project.
+    pub(crate) fn drop_legacy_failure_signatures(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM recurring_errors
+             WHERE proposed = 0
+               AND ( (signature LIKE 'rust:%' AND signature NOT LIKE 'rust:%:%')
+                  OR (signature LIKE 'assert:%' AND signature NOT LIKE '%@%') )",
+            [],
+        )?)
     }
 
     fn backfill_legacy_outcome_application(&self) -> Result<usize> {
