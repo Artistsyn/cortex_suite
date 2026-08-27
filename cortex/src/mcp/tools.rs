@@ -2448,7 +2448,8 @@ mod tests {
     }
 
     fn ap_store(name: &str) -> Store {
-        let dir = std::env::temp_dir().join("cortex-tools-test");
+        let _g = crate::test_support::TempDir::new("tools").unwrap();
+        let dir = _g.path().to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join(format!("{name}.db"));
         let _ = std::fs::remove_file(&db);
@@ -2474,7 +2475,11 @@ mod tests {
     /// trigger as its only trigger.
     #[test]
     fn closeout_runs_pipeline_only_when_stale() {
-        let tmp = std::env::temp_dir().join("cortex_stale_gate_test.db");
+        let _g = crate::test_support::TempDir::new("stale_gate").unwrap();
+        // Inside a directory, not beside it: SQLite in WAL mode leaves `-wal`
+        // and `-shm` sidecars, and a fixture that removes only the `.db` leaves
+        // two files behind every run.
+        let tmp = _g.join("memory.db");
         let _ = std::fs::remove_file(&tmp);
         let store = Store::open(&tmp).unwrap();
         let root = std::env::temp_dir().join("cortex_stale_gate_root");
@@ -2501,7 +2506,11 @@ mod tests {
     /// name the exact command when there is.
     #[test]
     fn review_queue_surfaces_only_real_approval_work() {
-        let tmp = std::env::temp_dir().join("cortex_review_queue_test.db");
+        let _g = crate::test_support::TempDir::new("review_queue").unwrap();
+        // Inside a directory, not beside it: SQLite in WAL mode leaves `-wal`
+        // and `-shm` sidecars, and a fixture that removes only the `.db` leaves
+        // two files behind every run.
+        let tmp = _g.join("memory.db");
         let _ = std::fs::remove_file(&tmp);
         let store = Store::open(&tmp).unwrap();
 

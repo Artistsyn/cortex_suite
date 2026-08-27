@@ -258,12 +258,9 @@ pub fn compact_line(store: &Store) -> String {
 mod tests {
     use super::*;
 
-    fn test_store(name: &str) -> Store {
-        let dir = std::env::temp_dir().join("cortex-scoreboard-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join(format!("{name}.db"));
-        let _ = std::fs::remove_file(&db);
-        Store::open(&db).unwrap()
+    /// A store of its own, removed when the test ends -- see test_support.
+    fn test_store(name: &str) -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new(name).unwrap()
     }
 
     #[test]

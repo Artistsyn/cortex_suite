@@ -804,12 +804,8 @@ fn prune_old_snapshots(dir: &Path, max_age_days: u64) {
 mod tests {
     use super::*;
 
-    fn test_store(name: &str) -> Store {
-        let dir = std::env::temp_dir().join("cortex-closeout-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join(format!("{name}.db"));
-        let _ = std::fs::remove_file(&db);
-        Store::open(&db).unwrap()
+    fn test_store(name: &str) -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new(name).unwrap()
     }
 
     /// Regression: closeout must COUNT what it commits. The old mark_promoted
@@ -819,7 +815,8 @@ mod tests {
     #[test]
     fn closeout_markers_text_commits_and_counts() {
         let store = test_store("counts");
-        let repo_root = std::env::temp_dir().join("cortex-closeout-test-repo");
+        let _g = crate::test_support::TempDir::new("closeout_repo").unwrap();
+        let repo_root = _g.path().to_path_buf();
         let _ = std::fs::create_dir_all(&repo_root);
 
         let markers_text = r#"

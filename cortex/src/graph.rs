@@ -452,12 +452,9 @@ mod call_edge_tests {
     use crate::memory::Store;
     use crate::model::{ApiGraphCall, ApiGraphSpan};
 
-    fn store(name: &str) -> Store {
-        let dir = std::env::temp_dir().join("cortex-call-edges");
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join(format!("{name}.db"));
-        let _ = std::fs::remove_file(&db);
-        Store::open(&db).unwrap()
+    /// A store of its own, removed when the test ends -- see test_support.
+    fn store(name: &str) -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new(name).unwrap()
     }
 
     fn node(s: &Store, id: &str, name: &str) {
@@ -559,7 +556,8 @@ mod sync_nodes_tests {
     /// each run hid this; `calls` edges did not.
     #[test]
     fn re_syncing_nodes_preserves_existing_edges() {
-        let dir = std::env::temp_dir().join("cortex-syncnodes");
+        let _g = crate::test_support::TempDir::new("syncnodes").unwrap();
+        let dir = _g.path().to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join("sync.db");
         let _ = std::fs::remove_file(&db);
@@ -591,7 +589,8 @@ mod sync_nodes_tests {
     /// It must still refresh changed metadata.
     #[test]
     fn re_syncing_updates_changed_node_fields() {
-        let dir = std::env::temp_dir().join("cortex-syncnodes");
+        let _g = crate::test_support::TempDir::new("syncnodes").unwrap();
+        let dir = _g.path().to_path_buf();
         let _ = std::fs::create_dir_all(&dir);
         let db = dir.join("sync2.db");
         let _ = std::fs::remove_file(&db);

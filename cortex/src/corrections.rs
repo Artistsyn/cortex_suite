@@ -331,16 +331,11 @@ pub fn open_count(store: &Store) -> Result<i64> {
 mod tests {
     use super::*;
 
-    fn store() -> (Store, std::path::PathBuf) {
-        let p = std::env::temp_dir().join(format!(
-            "cortex-corr-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        (Store::open(&p).unwrap(), p)
+    /// A store of its own. The path comes back only because the call sites
+    /// still bind it; cleanup is the guard's job now, not theirs.
+    /// A store of its own, removed when the test ends.
+    fn store() -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new("corrections").unwrap()
     }
 
     // ── detection ──────────────────────────────────────────────────────────
@@ -392,39 +387,36 @@ mod tests {
 
     #[test]
     fn a_challenge_is_recorded_once_per_session() {
-        let (s, p) = store();
+        let s = store();
         let msg = "are you sure that is what the field does?";
         assert!(note(&s, "sess", msg).unwrap().is_some());
         assert!(note(&s, "sess", msg).unwrap().is_none(), "duplicated a challenge");
         assert_eq!(open(&s, "sess").unwrap().len(), 1);
-        let _ = std::fs::remove_file(p);
     }
 
     #[test]
     fn a_plain_instruction_records_nothing() {
-        let (s, p) = store();
+        let s = store();
         assert!(note(&s, "sess", "commit and push it").unwrap().is_none());
         assert_eq!(open(&s, "sess").unwrap().len(), 0);
-        let _ = std::fs::remove_file(p);
     }
 
     // ── the gate ───────────────────────────────────────────────────────────
 
     #[test]
     fn a_verdict_without_evidence_is_refused() {
-        let (s, p) = store();
+        let s = store();
         let id = note(&s, "sess", "are you sure?").unwrap().unwrap();
         let err = resolve(&s, id, Verdict::UserRight, "subject", "yeah").unwrap_err();
         assert!(err.to_string().contains("evidence"), "{err}");
         // And it must stay open — a refused resolve that silently marked the
         // row settled would lose the challenge entirely.
         assert_eq!(open(&s, "sess").unwrap().len(), 1);
-        let _ = std::fs::remove_file(p);
     }
 
     #[test]
     fn unresolved_settles_the_row_and_proposes_nothing() {
-        let (s, p) = store();
+        let s = store();
         let id = note(&s, "sess", "are you sure?").unwrap().unwrap();
         // No evidence required — this is the honest exit, so it must not be
         // harder to reach than inventing a verdict.
@@ -434,12 +426,11 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM proposals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0, "an unsettled disagreement must not reach the store");
-        let _ = std::fs::remove_file(p);
     }
 
     #[test]
     fn user_right_proposes_an_anti_pattern_and_does_not_commit_it() {
-        let (s, p) = store();
+        let s = store();
         let id = note(&s, "sess", "you don't think it's the offset field?").unwrap().unwrap();
         let out = resolve(
             &s, id, Verdict::UserRight,
@@ -456,7 +447,6 @@ mod tests {
             .unwrap();
         assert_eq!(kind, "anti_pattern");
         assert_eq!(status, "pending", "nothing here may bypass human review");
-        let _ = std::fs::remove_file(p);
     }
 
     #[test]
@@ -464,7 +454,7 @@ mod tests {
         // The user's own condition: being challenged and holding up is evidence
         // FOR the verified thing. The mistaken challenge must never be stored as
         // if it were the finding.
-        let (s, p) = store();
+        let s = store();
         let id = note(&s, "sess", "are you sure the chord is spread-independent?").unwrap().unwrap();
         resolve(
             &s, id, Verdict::AgentRight,
@@ -479,16 +469,14 @@ mod tests {
         assert_eq!(kind, "pref_note", "must not be filed as a trap the agent fell into");
         assert!(text.contains("held up under checking"), "{text}");
         assert!(text.contains("spread-independent"), "the verified claim must be the subject: {text}");
-        let _ = std::fs::remove_file(p);
     }
 
     #[test]
     fn a_settled_challenge_cannot_be_settled_again() {
-        let (s, p) = store();
+        let s = store();
         let id = note(&s, "sess", "are you sure?").unwrap().unwrap();
         resolve(&s, id, Verdict::Unresolved, "x", "").unwrap();
         assert!(resolve(&s, id, Verdict::UserRight, "x", "checked the thing thoroughly").is_err());
-        let _ = std::fs::remove_file(p);
     }
 
     #[test]
@@ -504,16 +492,9 @@ mod tests {
 mod heartbeat_tests {
     use super::*;
 
-    fn store() -> (Store, std::path::PathBuf) {
-        let p = std::env::temp_dir().join(format!(
-            "cortex-hb-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        (Store::open(&p).unwrap(), p)
+    /// A store of its own, removed when the test ends.
+    fn store() -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new("corrections").unwrap()
     }
 
     /// The distinction the audit could not make before: a hook that runs and
@@ -521,7 +502,7 @@ mod heartbeat_tests {
     /// installed. Both leave `challenges` empty.
     #[test]
     fn the_hook_proves_it_ran_even_when_it_matched_nothing() {
-        let (s, p) = store();
+        let s = store();
         assert!(heartbeat(&s).is_none(), "no beat before the hook ever runs");
 
         beat(&s, false).unwrap();
@@ -533,6 +514,5 @@ mod heartbeat_tests {
         beat(&s, true).unwrap();
         let (fired, matched, _) = heartbeat(&s).unwrap();
         assert_eq!((fired, matched), (3, 1));
-        let _ = std::fs::remove_file(p);
     }
 }

@@ -502,12 +502,9 @@ mod tests {
     use super::*;
     use crate::memory::Store;
 
-    fn test_store(name: &str) -> Store {
-        let dir = std::env::temp_dir().join("cortex-meta-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join(format!("{name}.db"));
-        let _ = std::fs::remove_file(&db);
-        Store::open(&db).unwrap()
+    /// A store of its own, removed when the test ends -- see test_support.
+    fn test_store(name: &str) -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new(name).unwrap()
     }
 
     #[test]
@@ -602,12 +599,9 @@ mod threshold_window_tests {
     use super::*;
     use crate::memory::Store;
 
-    fn store(name: &str) -> Store {
-        let dir = std::env::temp_dir().join("cortex-meta-window");
-        let _ = std::fs::create_dir_all(&dir);
-        let db = dir.join(format!("{name}.db"));
-        let _ = std::fs::remove_file(&db);
-        Store::open(&db).unwrap()
+    /// A store of its own, removed when the test ends -- see test_support.
+    fn store(name: &str) -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new(name).unwrap()
     }
 
     fn add(s: &Store, ptype: &str, status: &str, age_days: i64, n: usize) {

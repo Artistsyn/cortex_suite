@@ -758,18 +758,10 @@ mod tests {
 
     /// A throwaway store on disk, NOT the live one.
     ///
-    /// These tests insert gap rows, and `test_signal`'s helper opens the real
-    /// `.cortex/memory.db` — borrowing that here would write test fixtures into
-    /// the workspace's own memory.
-    fn store_with_gap(seen: i64, age_days: i64) -> Store {
-        let path = std::env::temp_dir().join(format!(
-            "cortex_gap_test_{}_{}_{}.db",
-            std::process::id(),
-            seen,
-            age_days
-        ));
-        let _ = std::fs::remove_file(&path);
-        let store = Store::open(&path).expect("temp store");
+    /// These tests insert gap rows, so they must never touch the real store --
+    /// the guard gives them one of their own, removed when the test ends.
+    fn store_with_gap(seen: i64, age_days: i64) -> crate::test_support::TempStore {
+        let store = crate::test_support::TempStore::new("gap").expect("temp store");
         let ts = chrono::Utc::now().timestamp() - age_days * 86400;
         store
             .conn()

@@ -466,20 +466,10 @@ mod tests {
 
     // ── scoring against a real store ─────────────────────────────────────────
 
-    /// A store of this test's own, in a temp directory.
-    ///
-    /// It used to look for `<crate>/../.cortex/memory.db`, which does not exist
-    /// on either machine -- the real store is a level further up. So every
-    /// DB-backed test in this file was returning `None` and passing without
-    /// running, including the ones guarding the counters. `Store::open` builds
-    /// the schema on a fresh file, so a temp path costs nothing and the tests
-    /// become both real and hermetic: no shared state, no ordering, and no
-    /// rows left in anybody's knowledge base.
-    fn temp_store(tag: &str) -> Option<Store> {
-        let dir = std::env::temp_dir()
-            .join(format!("cortex_test_{}_{}_{tag}", std::process::id(), line!()));
-        let _ = std::fs::remove_dir_all(&dir);
-        Store::open(&dir.join("memory.db")).ok()
+    /// See `test_support::TempStore` -- one guard for the whole crate, so the
+    /// directory goes even when a test panics.
+    fn temp_store(tag: &str) -> Option<crate::test_support::TempStore> {
+        crate::test_support::TempStore::new(tag).ok()
     }
 
     /// Set up a session that consulted one pattern, and return (store, session, id).
@@ -489,7 +479,7 @@ mod tests {
     /// MUTATE `use_count` and `reverted_count` and put them back afterwards, so
     /// against a live store they were editing real survival telemetry and
     /// depending on their own cleanup to undo it.
-    fn seeded(tag: &str) -> Option<(Store, String, i64)> {
+    fn seeded(tag: &str) -> Option<(crate::test_support::TempStore, String, i64)> {
         let store = temp_store(tag)?;
         store
             .conn()

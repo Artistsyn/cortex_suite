@@ -18,6 +18,8 @@ mod miner;
 mod model;
 mod output_filter;
 mod test_signal;
+#[cfg(test)]
+mod test_support;
 mod planner;
 mod recall_match;
 mod redact;
@@ -4116,17 +4118,22 @@ fn run_correction(
 mod tests {
     use super::*;
 
-    fn temp_db_path(name: &str) -> PathBuf {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_millis();
-        std::env::temp_dir().join(format!("{}_{}.db", name, ts))
+    /// A store whose directory goes away when the guard drops.
+    ///
+    /// The path comes back too because these tests close and REOPEN the store to
+    /// prove state survives a restart -- so the guard has to outlive the first
+    /// handle. Timestamped paths in the bare temp dir left 50 databases and 45MB
+    /// behind, because a millisecond stamp collides rarely enough to look like it
+    /// works and never cleans up at all.
+    fn temp_db(name: &str) -> (crate::test_support::TempDir, PathBuf) {
+        let d = crate::test_support::TempDir::new(name).expect("temp dir");
+        let p = d.join("memory.db");
+        (d, p)
     }
 
     #[test]
     fn phase4_pattern_revert_reflects_in_status_full() {
-        let db_path = temp_db_path("cortex_phase4_status_test");
+        let (_guard, db_path) = temp_db("phase4_status");
         let store = Store::open(&db_path).expect("open store");
 
         crate::crystallizer::add_pattern(
@@ -4151,7 +4158,7 @@ mod tests {
 
     #[test]
     fn legacy_session_outcome_markers_backfill_to_per_outcome_log() {
-        let db_path = temp_db_path("cortex_outcome_backfill_test");
+        let (_guard, db_path) = temp_db("outcome_backfill");
 
         {
             let store = Store::open(&db_path).expect("open store");
