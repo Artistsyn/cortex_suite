@@ -128,14 +128,14 @@ pub fn parse_markers(text: &str) -> Vec<KnowledgeMarker> {
             let body_start = header_end_abs + 1;
             let close_pos  = find_case_insensitive(text, &close_tag, body_start);
             let (body, next_search) = if let Some(cp) = close_pos {
-                let body = text[body_start..cp].trim().to_string();
+                let body = unescape_flattened_body(text[body_start..cp].trim());
                 (body, cp + close_tag.len())
             } else {
                 // No closing tag — take the rest of the line as body.
                 let end = text[body_start..].find('\n')
                     .map(|n| body_start + n)
                     .unwrap_or(text.len());
-                (text[body_start..end].trim().to_string(), end)
+                (unescape_flattened_body(text[body_start..end].trim()), end)
             };
 
             if let Some(marker) = build_marker(mtype, &attrs, &body) {
@@ -177,16 +177,104 @@ fn find_header_end(s: &str) -> Option<usize> {
     s.find(']')
 }
 
+/// Restore the newlines in a body that arrived as a single flattened line.
+///
+/// NARROW ON PURPOSE. A body carrying literal `\n` sequences AND no real
+/// newline is one whose line breaks were escaped in transit -- for an
+/// anti-pattern that is fatal, because the `wrong:` / `correct:` split is done
+/// per line, so the whole body lands in `wrong` and the remedy becomes a
+/// placeholder. Three entries in this store are in exactly that state.
+///
+/// But a body that HAS real newlines and also mentions `\n` is almost certainly
+/// talking about escape sequences -- one of the anti-patterns here is precisely
+/// about a newline escape becoming a real newline in a heredoc. Rewriting that
+/// would destroy the thing it documents. So the flattening is only undone when
+/// there is nothing to lose: no real newline present at all.
+fn unescape_flattened_body(body: &str) -> String {
+    if body.contains('\n') || !body.contains("\\n") {
+        return body.to_string();
+    }
+    unescape(body)
+}
+
+/// Offset of the first `"` that is not escaped.
+fn closing_quote(s: &str) -> Option<usize> {
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn find_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
     let lower_h = haystack.to_lowercase();
     let lower_n = needle.to_lowercase();
     lower_h[from..].find(&lower_n).map(|p| from + p)
 }
 
+/// Undo the escaping a value picks up in transit.
+///
+/// `\"` and `\\` come back as themselves; `\n` and `\t` become real
+/// whitespace. Anything else keeps its backslash, so a Windows path or a regex
+/// in a description survives being stored.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Does this attribute string use `\"` as its delimiter rather than `"`?
+///
+/// It does when the marker crossed a JSON boundary, which is what happens on
+/// every host that passes marker text through an MCP tool argument. Every quote
+/// in the document arrives escaped, so `description=\"...\"` never matches the
+/// quoted branch below, falls through to the UNQUOTED one, and yields the first
+/// whitespace-delimited token -- after which the attributes that followed are
+/// gone too. That is how a description came to be stored as the two characters
+/// `\"A`, with its tags dropped to nothing and the tool reporting success.
+fn is_wholly_escaped(attrs: &str) -> bool {
+    if !attrs.contains("\\\"") {
+        return false;
+    }
+    // A bare quote that is not preceded by a backslash means the string mixes
+    // both forms, and guessing at that point would do more harm than leaving it.
+    let bytes = attrs.as_bytes();
+    !bytes.iter().enumerate().any(|(i, &b)| b == b'"' && (i == 0 || bytes[i - 1] != b'\\'))
+}
+
 /// Parse `key="value" key2="value2"` attribute string into a HashMap.
 /// Handles both `key="value"` and `key=value` (no quotes) forms.
 fn parse_attrs(attrs: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
+    let normalised;
+    let attrs = if is_wholly_escaped(attrs) {
+        normalised = attrs.replace("\\\"", "\"");
+        normalised.as_str()
+    } else {
+        attrs
+    };
     let mut remaining = attrs.trim();
 
     while !remaining.is_empty() {
@@ -200,10 +288,12 @@ fn parse_attrs(attrs: &str) -> HashMap<String, String> {
         remaining = &remaining[eq_pos + 1..];
 
         let value = if remaining.starts_with('"') {
-            // Quoted value — find closing quote (not escaped).
+            // Quoted value. The closing quote is the first one NOT preceded by a
+            // backslash -- a bare `find('"')` stops at an escaped quote inside
+            // the value and truncates it, taking every later attribute with it.
             let inner = &remaining[1..];
-            let end = inner.find('"').unwrap_or(inner.len());
-            let v = inner[..end].to_string();
+            let end = closing_quote(inner).unwrap_or(inner.len());
+            let v = unescape(&inner[..end]);
             remaining = if end + 1 < inner.len() { &inner[end + 1..] } else { "" };
             v
         } else {
@@ -536,5 +626,90 @@ correct: y[/CORTEX-AP]"#;
         let text = "[CORTEX-AP: description=\"oops unclosed tags=\"x\"]wrong: a\ncorrect: b[/CORTEX-AP]\nlater text";
         let markers = parse_markers(text);
         assert!(markers.len() <= 1, "must not run away past the marker");
+    }
+}
+
+#[cfg(test)]
+mod escaping_tests {
+    use super::*;
+
+    fn ap(text: &str) -> (String, Vec<String>, String, String) {
+        match parse_markers(text).into_iter().next() {
+            Some(KnowledgeMarker::AntiPattern { description, tags, wrong, correct }) => {
+                (description, tags, wrong, correct)
+            }
+            other => panic!("expected an anti-pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wholly_escaped_header_is_read_as_written() {
+        // What arrives on every host that passes marker text through an MCP
+        // tool argument: the JSON boundary escapes every quote in the document.
+        // This used to store the description as `\"A` and drop the tags, while
+        // reporting success -- so the entry reached the store meaning nothing.
+        let (d, t, w, c) = ap(
+            "[CORTEX-AP: description=\\\"A real description here\\\"              tags=\\\"alpha,beta\\\"]wrong: x\ncorrect: y[/CORTEX-AP]",
+        );
+        assert_eq!(d, "A real description here");
+        assert_eq!(t, vec!["alpha", "beta"]);
+        assert_eq!(w, "x");
+        assert_eq!(c, "y");
+    }
+
+    #[test]
+    fn a_quote_inside_a_value_does_not_end_it() {
+        // The old code's comment said "find closing quote (not escaped)" and
+        // the code was a bare find('"'), so the value stopped at the escape and
+        // every attribute after it was lost.
+        let (d, t, _, _) = ap(
+            "[CORTEX-AP: description=\"He said \\\"no\\\" loudly\"              tags=\"alpha,beta\"]wrong: x\ncorrect: y[/CORTEX-AP]",
+        );
+        assert_eq!(d, "He said \"no\" loudly");
+        assert_eq!(t, vec!["alpha", "beta"], "the attributes after the escape survived");
+    }
+
+    #[test]
+    fn a_flattened_body_gets_its_wrong_and_correct_halves_back() {
+        // Three entries in this store are stranded like this: the remedy is
+        // present but the split never ran, so `correct` is a placeholder.
+        let (_, _, w, c) = ap(
+            "[CORTEX-AP: description=\"ok\" tags=\"a\"]wrong: do the bad thing\\ncorrect: do the good thing[/CORTEX-AP]",
+        );
+        assert_eq!(w, "do the bad thing");
+        assert_eq!(c, "do the good thing");
+    }
+
+    #[test]
+    fn a_body_that_is_about_escape_sequences_is_left_alone() {
+        // THE CASE THE NARROW RULE PROTECTS. One anti-pattern here documents a
+        // newline escape becoming a real newline in a heredoc; rewriting its
+        // `\n` would destroy the thing it exists to record. A body with real
+        // newlines is never touched.
+        let (_, _, w, c) = ap(
+            "[CORTEX-AP: description=\"ok\" tags=\"a\"]wrong: writing \\n in a heredoc\ncorrect: keep \\n as two characters[/CORTEX-AP]",
+        );
+        assert!(w.contains("\\n"), "the escape was rewritten: {w:?}");
+        assert!(c.contains("\\n"), "the escape was rewritten: {c:?}");
+    }
+
+    #[test]
+    fn a_bracket_in_a_value_still_survives() {
+        // Already fixed before this change; asserted so it stays fixed.
+        let (d, t, _, _) = ap(
+            "[CORTEX-AP: description=\"regex [a-z_]+ skips digits\"              tags=\"regex,rust\"]wrong: x\ncorrect: y[/CORTEX-AP]",
+        );
+        assert_eq!(d, "regex [a-z_]+ skips digits");
+        assert_eq!(t, vec!["regex", "rust"]);
+    }
+
+    #[test]
+    fn a_windows_path_keeps_its_backslashes() {
+        // `unescape` only recognises the sequences it means to; anything else
+        // keeps its backslash, or every path in the store would be mangled.
+        let (d, _, _, _) = ap(
+            "[CORTEX-AP: description=\"fails on src\\import\\chunk.rs\"              tags=\"a\"]wrong: x\ncorrect: y[/CORTEX-AP]",
+        );
+        assert_eq!(d, "fails on src\\import\\chunk.rs");
     }
 }
