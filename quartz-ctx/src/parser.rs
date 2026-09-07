@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use quote::quote;
 use syn::visit::Visit;
 use walkdir::WalkDir;
@@ -33,12 +34,13 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
     let mut skipped_generated = 0usize;
     let mut partial_types: Vec<String> = Vec::new();
     let mut boundaries: Vec<crate::bridge::Boundary> = Vec::new();
+    let gitignore = load_gitignore(dir);
 
     for entry in WalkDir::new(dir)
         .into_iter()
         // Prune whole directories rather than filtering files, so we never
         // descend into build output or vendored dependencies at all.
-        .filter_entry(|e| !is_excluded_dir(e))
+        .filter_entry(|e| !is_excluded_dir(e) && !is_gitignored(&gitignore, e, dir))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| {
@@ -328,9 +330,10 @@ fn attach_cross_language_edges(items: &mut [ApiItem], links: &[crate::bridge::Li
 /// than requiring the whole index to carry the result around.
 pub fn scan_boundaries(dir: &Path) -> Vec<crate::bridge::Boundary> {
     let mut out = Vec::new();
+    let gitignore = load_gitignore(dir);
     for entry in WalkDir::new(dir)
         .into_iter()
-        .filter_entry(|e| !is_excluded_dir(e))
+        .filter_entry(|e| !is_excluded_dir(e) && !is_gitignored(&gitignore, e, dir))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {
@@ -469,9 +472,10 @@ pub fn looks_generated(path: &Path, content: &str) -> bool {
 /// Diagnostics must apply the same exclusions as the parser, or `selfcheck`
 /// reports a file count the parser never touches.
 pub fn count_source_files(dir: &Path) -> usize {
+    let gitignore = load_gitignore(dir);
     WalkDir::new(dir)
         .into_iter()
-        .filter_entry(|e| !is_excluded_dir(e))
+        .filter_entry(|e| !is_excluded_dir(e) && !is_gitignored(&gitignore, e, dir))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| {
@@ -498,6 +502,38 @@ fn is_excluded_dir(entry: &walkdir::DirEntry) -> bool {
         .to_str()
         .map(|n| EXCLUDED_DIRS.contains(&n) || n.starts_with(".cargo"))
         .unwrap_or(false)
+}
+
+fn load_gitignore(root: &Path) -> Option<Gitignore> {
+    let gitignore_path = root.join(".gitignore");
+    if !gitignore_path.exists() {
+        return None;
+    }
+
+    let mut builder = GitignoreBuilder::new(root);
+    if let Some(err) = builder.add(&gitignore_path) {
+        eprintln!("warn: could not read {}: {}", gitignore_path.display(), err);
+        return None;
+    }
+
+    match builder.build() {
+        Ok(gitignore) => Some(gitignore),
+        Err(err) => {
+            eprintln!("warn: could not parse {}: {}", gitignore_path.display(), err);
+            None
+        }
+    }
+}
+
+fn is_gitignored(gitignore: &Option<Gitignore>, entry: &walkdir::DirEntry, root: &Path) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    let Some(gitignore) = gitignore else {
+        return false;
+    };
+    let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+    gitignore.matched(rel, entry.file_type().is_dir()).is_ignore()
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1084,6 +1120,51 @@ mod exclusion_tests {
         assert!(
             items.iter().any(|i| i.name == "Deliberate"),
             "explicitly scanning a normally-excluded dir must still work"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repro for Issue #1: a pretty-printed bundle not matching shape heuristics
+    /// must still be skipped when it is ignored by .gitignore.
+    #[test]
+    fn gitignored_pretty_printed_bundle_does_not_create_duplicate_items() {
+        let dir = std::env::temp_dir().join("quartz-ctx-gitignore-bundle-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write(&dir, ".gitignore", "extension/dist-safari/\n");
+        write(
+            &dir,
+            "extension/src/background/transport.ts",
+            "export const configureTransport = () => { return 1; };\n",
+        );
+        // Pretty-printed enough to dodge minified-line heuristics.
+        write(
+            &dir,
+            "extension/dist-safari/background-safari.js",
+            "function configureTransport() {\n  return 2;\n}\n",
+        );
+
+        let items = parse_dir_with(&dir, ParseOptions { include_private: true }).unwrap();
+        let matches: Vec<&ApiItem> = items
+            .iter()
+            .filter(|i| i.name == "configureTransport")
+            .collect();
+
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected one configureTransport after .gitignore filtering, got {}",
+            matches.len()
+        );
+        assert!(
+            matches[0]
+                .span
+                .as_ref()
+                .is_some_and(|s| s.file.ends_with("extension/src/background/transport.ts")),
+            "expected surviving symbol to come from source file, got {:?}",
+            matches[0].span
         );
 
         let _ = std::fs::remove_dir_all(&dir);
