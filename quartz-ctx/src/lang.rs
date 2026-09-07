@@ -373,6 +373,35 @@ impl<'a> Cx<'a> {
             return;
         }
 
+        // `export const foo = (...) => {...}` / `const foo = function () {...}`.
+        // TS/JS has no `function foo()` requirement — modern style (React,
+        // Bun) writes nearly every top-level function this way, and it parses
+        // as lexical_declaration -> variable_declarator -> arrow_function,
+        // three node kinds away from anything `function_kinds()` matches. Left
+        // unhandled, the whole call was silently descended into with nothing
+        // ever matching, which under-reports these codebases as type-only.
+        if matches!(l, Language::TypeScript | Language::JavaScript)
+            && matches!(kind, "lexical_declaration" | "variable_declaration")
+        {
+            let mut c = node.walk();
+            let declarators: Vec<Node> =
+                node.named_children(&mut c).filter(|n| n.kind() == "variable_declarator").collect();
+            for declarator in declarators {
+                let Some(value) = declarator.child_by_field_name("value") else { continue };
+                if !matches!(value.kind(), "arrow_function" | "function_expression") {
+                    continue;
+                }
+                let Some(name) = child_text(declarator, "name", self.src) else { continue };
+                if let Some(item) = self.arrow_function_item(node, value, name) {
+                    self.out.items.push(item);
+                }
+                // Nested declarations inside the function body (a helper
+                // `function` defined in the closure) still get a pass.
+                self.walk(value);
+            }
+            return;
+        }
+
         // Anything unrecognised at this level may still contain declarations
         // (a Ruby `module` body, a PHP namespace block). Descending is cheap;
         // not descending is silent loss.
@@ -1033,6 +1062,23 @@ impl<'a> Cx<'a> {
         Some(item)
     }
 
+    /// `const name = (params) => body` / `const name = function (params) {}`.
+    /// `decl_node` (the whole lexical_declaration) carries doc comment and
+    /// span; `value` (the arrow_function/function_expression itself) carries
+    /// the signature and is where calls are mined from, since decl_node's
+    /// span has no `body` field for `signature_text` to cut at.
+    fn arrow_function_item(&mut self, decl_node: Node, value: Node, name: String) -> Option<ApiItem> {
+        let vis = if name.starts_with('_') { Visibility::Private } else { Visibility::Public };
+        if !vis.is_included(self.include_private) {
+            return None;
+        }
+        let mut item = self.base_item(ItemKind::Function, name.clone(), decl_node);
+        item.signature = format!("const {} = {}", name, signature_text(value, self.src));
+        item.visibility = vis;
+        item.calls = self.calls_in(value, &name);
+        Some(item)
+    }
+
     fn base_item(&self, kind: ItemKind, name: String, node: Node) -> ApiItem {
         let visibility = match self.lang {
             Language::Go => go_visibility(&name),
@@ -1327,12 +1373,35 @@ fn leading_doc(node: Node, src: &str, lang: Language) -> String {
             }
         }
     }
-    let Some(prev) = node.prev_named_sibling() else { return String::new() };
-    if !matches!(prev.kind(), "comment" | "line_comment" | "block_comment" | "doc_comment") {
+    // Walk backward through comment siblings, but only while each one is
+    // directly adjacent (zero blank lines) to what follows it. A `//` line
+    // comment is its own sibling node per line, not one node per block, so a
+    // real multi-line comment needs this loop just to be read in full. And a
+    // section-header comment sitting a blank line above the next declaration
+    // is not that declaration's doc — it is a heading for the block below,
+    // which `prev_named_sibling()` alone cannot tell apart from a doc comment
+    // directly attached to it.
+    let mut comments: Vec<Node> = Vec::new();
+    let mut boundary = node;
+    loop {
+        let Some(prev) = boundary.prev_named_sibling() else { break };
+        if !matches!(prev.kind(), "comment" | "line_comment" | "block_comment" | "doc_comment") {
+            break;
+        }
+        let gap = boundary.start_position().row.saturating_sub(prev.end_position().row);
+        if gap > 1 {
+            break;
+        }
+        comments.push(prev);
+        boundary = prev;
+    }
+    if comments.is_empty() {
         return String::new();
     }
-    text(prev, src)
-        .lines()
+    comments.reverse(); // was nearest-first; docs read top-to-bottom.
+    comments
+        .iter()
+        .flat_map(|c| text(*c, src).lines().collect::<Vec<_>>())
         .map(|l| {
             l.trim()
                 .trim_start_matches("/**")
