@@ -1,8 +1,9 @@
 # Cortex Suite — Upgrade Plan
 
-> **Source research:** Comparative analysis of `sulabhdubey/rta-smriti-brain` against
-> `Artistsyn/cortex_suite`. Every suggestion below is grounded in what rta-smriti-brain
-> does differently and what gaps exist in cortex today.
+> **Source research:** Two-pass deep analysis of `sulabhdubey/rta-smriti-brain` v1.1.0-alpha.3
+> (schema v12, ~170 KB Python) against `Artistsyn/cortex_suite` (Rust). The second pass
+> verified every claim against actual source files: `rta_brain/db.py`, `rta_brain/context.py`,
+> `rta_brain/temporal.py`, `rta_brain/ingest.py`, and `docs/ARCHITECTURE.md`.
 >
 > **How to use this document:** Pass it to your local agent as a task brief. Each section
 > is a self-contained work item with the exact files and schema objects that need changing.
@@ -21,41 +22,68 @@ context compiler (`planner.rs: build_context_packet`) cannot sort by reliability
 purely by semantic similarity.
 
 ### What rta-smriti-brain does
-Every stored fact carries a `pramana` field from a 5-tier epistemic hierarchy:
+Every stored fact carries a `pramana` field from a 5-tier epistemic hierarchy (verified
+from `rta_brain/db.py:35` and `rta_brain/context.py:PRAMANA_PRIORITY`):
 
-| Tier | Meaning | Agent behaviour |
-|---|---|---|
-| `verified` | User confirmed, or survived test + review | Highest trust; present unconditionally |
-| `operator` | Human operator typed it directly | High trust |
-| `inferred` | Agent derived it across sessions | Medium; flag for review |
-| `recalled` | Loaded from prior-session memory | Medium; may be stale |
-| `hypothesis` | Speculative / single-session | Low; suppress unless query is narrow |
+| Pramana | Priority | Sanskrit meaning | Cortex equivalent |
+|---|---|---|---|
+| `pratyaksha` | 5 | Direct observation | Test result, verified measurement |
+| `sabda` | 4 | Trusted testimony | Developer-typed annotation or prefs.toml |
+| `anumana` | 3 | Inference | Agent-derived pattern across sessions |
+| `smriti` | 2 | Memory/recall | Imported from prior session |
+| `kalpana` | 1 | Speculation | Single-session hypothesis |
 
-Context compilation scores by tier first, semantic relevance second. This cuts boot tokens
-by ~65% on large stores without dropping anything the agent will actually need.
+Context compilation sorts by `(pramana_priority DESC, priority DESC, confidence DESC)`
+before filling the token budget. `pratyaksha`/`sabda` items are always included first;
+`kalpana` items are suppressed if the budget is tight. Agent-authored memories are
+downgraded to unverified `anumana` automatically (never `pratyaksha` or `sabda`).
 
 ### Implementation plan
 
 **`cortex/src/model.rs`** — add a new enum and a field to the four memory structs:
 
 ```rust
+/// Maps directly to rta-smriti-brain's pramana hierarchy.
+/// Ordering is intentional: higher = more authoritative.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EpistemicTier {
-    Hypothesis = 1,   // agent-proposed, single-session, unverified
-    Recalled   = 2,   // from prior memory, not re-verified this session
-    Inferred   = 3,   // agent-derived across multiple sessions
-    Operator   = 4,   // typed directly by user
-    Verified   = 5,   // survived test + explicit approval
+    Kalpana    = 1,   // speculation / single-session hypothesis
+    Smriti     = 2,   // recalled from prior session memory
+    Anumana    = 3,   // agent-inferred across sessions
+    Sabda      = 4,   // operator/developer-supplied directly
+    Pratyaksha = 5,   // directly observed / survived test + review
+}
+
+impl EpistemicTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kalpana    => "kalpana",
+            Self::Smriti     => "smriti",
+            Self::Anumana    => "anumana",
+            Self::Sabda      => "sabda",
+            Self::Pratyaksha => "pratyaksha",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "pratyaksha" => Self::Pratyaksha,
+            "sabda"      => Self::Sabda,
+            "anumana"    => Self::Anumana,
+            "smriti"     => Self::Smriti,
+            _            => Self::Kalpana,
+        }
+    }
 }
 ```
 
-Add `pub tier: EpistemicTier` (default `Inferred`) to `Pattern`, `AntiPattern`,
+Add `pub tier: EpistemicTier` (default `Anumana`) to `Pattern`, `AntiPattern`,
 `Annotation`, and `SelfCorrection`.
 
-**`cortex/src/memory.rs`** — add `tier TEXT NOT NULL DEFAULT 'inferred'` column to
+**`cortex/src/memory.rs`** — add `tier TEXT NOT NULL DEFAULT 'anumana'` column to
 `patterns`, `anti_patterns`, `annotations`, `self_corrections` via `ALTER TABLE` in
-`ensure_session_tracking_columns`. Backfill: set `tier = 'operator'` for all rows seeded
-by `first_run_init`; set `tier = 'verified'` for patterns where `use_count >= 3 AND
+`ensure_session_tracking_columns`. Backfill: set `tier = 'sabda'` for all rows seeded
+by `first_run_init`; set `tier = 'pratyaksha'` for patterns where `use_count >= 3 AND
 survival_rate >= 0.8`.
 
 **`cortex/src/planner.rs: build_context_packet`** — replace the current flat iteration
@@ -120,14 +148,23 @@ inject stored text verbatim.
    `"configure"` unless the porter stemmer reduces both to the same root.
 
 ### What rta-smriti-brain does
-Uses FTS5 `MATCH` with BM25 ranking for lexical retrieval, combined with a cosine score
-via a configurable `hybrid_weight` (default 0.45):
+Uses FTS5 `MATCH` with BM25 ranking for lexical retrieval, combined with cosine similarity
+via a `hybrid_weight` (default 0.45). The exact formula (verified from `rta_brain/db.py:2855`):
 
 ```
-final_score = (1 - hybrid_weight) * bm25_rank + hybrid_weight * cosine_score
+hybrid_score = (1 - hybrid_weight) * (1 / (1 + lexical_rank)) + hybrid_weight * cosine_similarity
+             = 0.55 * reciprocal_rank  +  0.45 * cosine_similarity
 ```
 
-BM25 is the primary signal; cosine breaks ties and catches paraphrases BM25 misses.
+The **lexical component is reciprocal rank** (position in BM25 results list), not the raw
+BM25 score. This normalises the lexical signal to `[0, 1]` so it is directly comparable
+to cosine similarity. BM25 is the primary signal (55%); cosine breaks ties and catches
+paraphrases BM25 misses.
+
+Vector scan is capped at 5,000 rows with a full linear cosine pass in Python — this is a
+documented design ceiling. At >5,000 chunks, semantic recall degrades silently. The cortex
+implementation will hit this ceiling faster because term vectors are stored per-unit in
+`code_units`, not per-chunk; the equivalent is a full `all_units()` scan.
 
 ### Implementation plan
 
@@ -147,23 +184,62 @@ Add the three sync triggers (`trg_cu_fts_ins`, `trg_cu_fts_del`, `trg_cu_fts_upd
 following the existing pattern in `ensure_fts_and_new_tables`.
 
 **`cortex/src/search.rs`** — add a `fts_search` function that queries `code_unit_fts`
-via `MATCH` and returns rows with `bm25(code_unit_fts)` scores. Add a
-`hybrid_search` function that combines BM25 rank with the existing cosine score:
+via `MATCH` and returns rows with `bm25(code_unit_fts)` scores (negative — lower is
+better). Add a `hybrid_search` function combining reciprocal rank with cosine:
 
 ```rust
-pub fn hybrid_search(query: &str, conn: &Connection, units: &[CodeUnit], limit: usize)
-    -> Vec<SearchResult>
+// Matches the exact formula verified in rta-smriti-brain:db.py:2855
+// lexical_rank: 0-indexed position in BM25 results (0 = best)
+// cosine: from existing build_term_vector_str / cosine_similarity
+const HYBRID_WEIGHT: f32 = 0.45;  // expose in prefs.toml later
+
+let hybrid = (1.0 - HYBRID_WEIGHT) * (1.0 / (1.0 + lexical_rank as f32))
+           + HYBRID_WEIGHT * cosine_score;
 ```
 
-The hybrid weight (0.45 BM25, 0.55 cosine) should be a constant initially; expose in
+The hybrid weight (0.45 semantic, 0.55 lexical) should be a constant initially; expose in
 `prefs.toml` later.
 
 **`cortex/src/planner.rs`** — replace `semantic_search(hint, &all_units, 8)` with
 `hybrid_search(hint, store.conn(), &all_units, 8)`.
 
+**Query preprocessing for FTS5** — rta-smriti-brain preprocesses queries before
+passing to `MATCH`: removes stop words (including domain words like `"code"`, `"task"`,
+`"explain"`), selects up to 8 meaningful tokens, joins with ` OR `. Do the same in
+`fts_search` using the existing `recall_terms` stop list in `recall_match.rs`:
+`let fts_query = recall_terms(query).iter().take(8).join(" OR ");`
+
 **Recall in `mcp/tools.rs`** — the `tool_recall` path uses `recall_score` over
 pre-loaded strings. Replace the annotation + pattern query with a direct FTS5 `MATCH`
 on the respective virtual tables, falling back to `recall_score` when FTS returns no rows.
+
+**Binary-search hard truncation for context packs** (from `rta-smriti-brain:context.py`):
+When `render_packet` produces output that still exceeds `token_budget` after all the
+`_append_if_fits` logic (due to header size), apply a binary-search character-level
+truncation:
+
+```rust
+// In render_packet, after assembly:
+const TRUNCATION_NOTICE: &str = "\n[Content pruned to honor token budget.]\n";
+if estimate_tokens(&output) > token_budget {
+    let mut lo = 0usize;
+    let mut hi = output.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        // snap to char boundary
+        let snap = output.floor_char_boundary(mid);
+        if estimate_tokens(&output[..snap]) + estimate_tokens(TRUNCATION_NOTICE) <= token_budget {
+            lo = snap;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    output = format!("{}{}", output[..lo].trim_end(), TRUNCATION_NOTICE);
+}
+```
+
+This prevents context pack responses from silently exceeding the model's context window
+when the header grows (e.g., large git delta summaries).
 
 **Scaling benefit:** Once FTS5 is the primary path, `semantic_search` no longer needs to
 load all units into memory for every call. Change `all_units` to a `units_since(instant)`
@@ -218,6 +294,129 @@ agent can propose supersession rather than silent replacement.
 
 ---
 
+## Priority 4b — Session continuation checkpoint
+
+### Problem
+Cortex has `scratchpads` (keyed by id, stores `state_json`) and `session_snapshots`
+(session-level metadata). There is no structured record of what the agent was trying to
+accomplish, what it has verified, what it must not try again, and what the next action
+is. When a session ends or is interrupted, this context is lost.
+
+### What rta-smriti-brain does
+A dedicated `checkpoints` table (verified in `rta_brain/db.py:1543`):
+
+```sql
+checkpoints(
+    id, project_id,
+    objective TEXT NOT NULL,          -- what is being accomplished
+    verified_evidence TEXT,           -- what has been confirmed true
+    remaining_gaps TEXT,              -- what is still unknown/incomplete
+    next_action TEXT,                 -- specific next step to take
+    prohibited_repetition TEXT,       -- what must NOT be tried again
+    source TEXT DEFAULT 'operator',   -- 'operator' | 'agent'
+    trigger TEXT DEFAULT 'manual',    -- 'manual' | 'inactivity' | 'service-shutdown'
+    session_id TEXT,                  -- agent session reference
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at, updated_at
+)
+```
+
+Checkpoints are **append-only** (new INSERT per update, not UPDATE in place). The latest
+checkpoint is `ORDER BY updated_at DESC, id DESC LIMIT 1`. Optimistic concurrency:
+callers pass `expected_version`; if the current version has moved, an error is raised
+before writing. The checkpoint is emitted as the **second section** of every context pack,
+immediately after headers and before evidence.
+
+The `prohibited_repetition` field is particularly high-value: it prevents the agent from
+re-attempting approaches that already failed this task, without requiring a new anti-pattern
+entry in the permanent store.
+
+### Implementation plan
+
+**`cortex/src/model.rs`** — add:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub id: Option<i64>,
+    pub objective: String,
+    pub verified_evidence: String,
+    pub remaining_gaps: String,
+    pub next_action: String,
+    pub prohibited_repetition: String,
+    pub session_id: Option<String>,
+    pub version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+```
+
+**`cortex/src/memory.rs`** — add to `ensure_fts_and_new_tables`:
+```sql
+CREATE TABLE IF NOT EXISTS session_checkpoints (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    objective            TEXT NOT NULL,
+    verified_evidence    TEXT NOT NULL DEFAULT '',
+    remaining_gaps       TEXT NOT NULL DEFAULT '',
+    next_action          TEXT NOT NULL DEFAULT '',
+    prohibited_repetition TEXT NOT NULL DEFAULT '',
+    session_id           TEXT,
+    version              INTEGER NOT NULL DEFAULT 1,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sc_updated ON session_checkpoints(updated_at DESC);
+```
+
+Add `insert_checkpoint`, `latest_checkpoint`, and `upsert_checkpoint(expected_version)`
+methods (the last validates optimistic version before inserting a new row).
+
+**`cortex/src/planner.rs: render_packet`** — add a `## Session Checkpoint` section
+immediately after the header, before any memory content, if a checkpoint exists.
+
+**MCP tools** — add two tools:
+- `set_checkpoint(objective, verified_evidence, remaining_gaps, next_action, prohibited_repetition)` — agent calls at meaningful task milestones and at closeout
+- `get_checkpoint()` — returns latest checkpoint (already visible in context pack, but also queryable directly)
+
+---
+
+## Priority 4c — Memory deduplication via `reflect`
+
+### Problem
+The `consolidator.rs` / `consolidator2.rs` pipeline detects duplicate patterns via
+cosine similarity (`find_candidates` in `consolidator.rs`). This only runs as part of
+the consolidation pipeline (every 8 hours by default), not at insert time. Annotations
+and self_corrections have no duplicate detection at all.
+
+### What rta-smriti-brain does
+A `reflect()` function (`rta_brain/db.py:2921`) runs deduplication on demand:
+1. Normalises all memory text (lowercase, collapse non-alphanumeric to spaces)
+2. Marks lower-priority duplicates as `status='superseded'`
+3. Detects contradictions by looking for opposing poles of known binary pairs
+   (`enabled/disabled`, `allow/deny`, `required/forbidden`, etc.)
+4. Marks contradicting pairs as `status='contradicted'` with a note
+
+Importantly: **no time-based confidence decay exists in the actual implementation** —
+the architecture document describes it as a policy, not a running process. The
+dedup+contradiction marking is the entire operational memory hygiene mechanism.
+
+### Implementation plan
+
+Add a `reflect_memory(store)` function to `consolidator.rs` (or a new `reflect.rs`):
+
+1. Load all `annotations` where `superseded_by IS NULL`
+2. Normalise text (lowercase, strip punctuation)
+3. For pairs whose normalised text similarity > 0.95 (exact near-duplicate): mark the
+   older one `superseded_by = newer.id, supersession_reason = 'auto-deduplicated'`
+4. For contradicting pairs detected via keyword opposition: mark both with a `CONFLICT`
+   tag appended to their tags JSON and add a note to `remaining_gaps` in the latest
+   checkpoint if one exists
+
+Call this from the consolidation pipeline after `ensure_fts_and_new_tables` completes.
+No new table required.
+
+---
+
 ## Priority 5 — Database future-proofing (scaling to large memory stores)
 
 ### Problem
@@ -249,20 +448,48 @@ The current schema and query patterns will degrade significantly at scale:
 
 ### Implementation plan
 
-#### 5a — Schema version table
+#### 5a — Schema version via `PRAGMA user_version`
 
-Add to `migrate()` before any table creation:
+Use SQLite's built-in `PRAGMA user_version` (an integer stored in the database header
+at byte offset 60) rather than a new table. This is what rta-smriti-brain uses
+(currently at version 12, verified in `rta_brain/db.py:36`). It requires zero schema
+changes, survives `.dump`/`.restore`, and is readable without opening any table.
 
-```sql
-CREATE TABLE IF NOT EXISTS schema_version (
-    version   INTEGER NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+Add a `const SCHEMA_VERSION: u32 = 1;` constant to `memory.rs`. At the top of
+`migrate()`, before any DDL:
+
+```rust
+let current_version: u32 = self.conn
+    .query_row("PRAGMA user_version", [], |r| r.get(0))
+    .unwrap_or(0);
+if current_version > SCHEMA_VERSION {
+    anyhow::bail!(
+        "database schema version {} is newer than this binary ({}); \
+         upgrade cortex_suite before opening this database",
+        current_version, SCHEMA_VERSION
+    );
+}
 ```
 
-Insert version `1` on first run. Each subsequent migration block increments the version.
-Replace all `PRAGMA table_info` guards with `SELECT version FROM schema_version` checks.
-This is the single most important structural change for long-term maintainability.
+At the end of `migrate()`, after all DDL succeeds:
+```rust
+self.conn.execute_batch(
+    &format!("PRAGMA user_version = {SCHEMA_VERSION}")
+)?;
+```
+
+Replace every `PRAGMA table_info` guard in `ensure_*` helper functions with a
+`current_version <` check against the version that introduced that column. This makes
+migration logic linear and auditable. Bump `SCHEMA_VERSION` with each release that
+changes the schema.
+
+**Migration safety (from rta-smriti-brain pattern):** Wrap the entire `migrate()` body
+in an explicit `BEGIN IMMEDIATE … COMMIT` (or `SAVEPOINT`) with rollback on error.
+The current `execute_batch` calls do not guarantee atomicity across the multiple
+`ensure_*` calls. Before running a migration, copy the database file to
+`.cortex/cortex.db.bak-<timestamp>` using `std::fs::copy` (not a SQL backup —
+file copy is atomic for same-filesystem). Run `PRAGMA integrity_check` on the copy
+before starting migration to catch pre-existing corruption.
 
 #### 5b — Paginated / filtered `all_units` path
 
@@ -396,16 +623,18 @@ Register both in `mcp/tools.rs: dispatch`.
 
 | # | Change | Files | Effort | Impact |
 |---|---|---|---|---|
-| 1 | Epistemic tier on memory items + tier-sorted context | `model.rs`, `memory.rs`, `planner.rs`, `mcp/tools.rs` | Medium | Very high |
-| 2 | UNTRUSTED EVIDENCE BOUNDARY in context pack output | `planner.rs`, `mcp/tools.rs` | Trivial | Medium |
-| 3 | FTS5 on `code_units` + hybrid BM25+cosine recall | `memory.rs`, `search.rs`, `planner.rs`, `mcp/tools.rs` | Medium | High |
+| 1 | Epistemic tier (5-level pramana) on all memory items + tier-sorted context | `model.rs`, `memory.rs`, `planner.rs`, `mcp/tools.rs` | Medium | Very high |
+| 2 | UNTRUSTED EVIDENCE BOUNDARY in every context pack + recall response | `planner.rs`, `mcp/tools.rs` | Trivial | Medium |
+| 3 | FTS5 on `code_units` + hybrid BM25-reciprocal-rank + cosine search + binary-search context truncation | `memory.rs`, `search.rs`, `planner.rs`, `mcp/tools.rs` | Medium | High |
 | 4 | Supersession tracking on patterns + annotations | `model.rs`, `memory.rs`, `crystallizer.rs` | Low | Medium |
-| 5a | Schema version table | `memory.rs` | Low | High (maintenance) |
-| 5b | Paginated `units_for_search` (no `compressed` in search path) | `memory.rs`, `search.rs`, `planner.rs` | Low | High (scaling) |
+| 4b | Session continuation checkpoint (objective / verified / gaps / next_action / prohibited_repetition) | `model.rs`, `memory.rs`, `planner.rs`, `mcp/tools.rs` | Medium | High |
+| 4c | Memory dedup + contradiction marking via `reflect` | `consolidator.rs` or new `reflect.rs` | Low | Medium |
+| 5a | `PRAGMA user_version` schema versioning + `BEGIN IMMEDIATE` migration + pre-migration backup | `memory.rs` | Low | High (maintenance) |
+| 5b | Paginated `units_for_search` — strip `compressed` from search path | `memory.rs`, `search.rs`, `planner.rs` | Low | High (scaling) |
 | 5c | Bounded telemetry tables with row-count rotation | `memory.rs` | Low | Medium (scaling) |
 | 5d | Binary term vectors (eliminate JSON deserialise on hot path) | `memory.rs`, `compressor.rs`, `search.rs` | Medium | High (scaling) |
 | 5e | Content store GC pass after reindex | `cache.rs`, `main.rs` | Low | Low-medium |
-| 5f | WAL checkpoint + cache size PRAGMA tuning | `memory.rs` | Trivial | Medium (scaling) |
+| 5f | WAL checkpoint + cache size + mmap PRAGMA tuning | `memory.rs` | Trivial | Medium (scaling) |
 | 6 | Visibility field on all memory types | `model.rs`, `memory.rs`, `planner.rs` | Low | Low-medium |
 | 7 | Staged retrieval: `list_memory_handles` + `expand_memory` | `mcp/tools.rs` | Medium | Medium |
 
@@ -415,18 +644,21 @@ Register both in `mcp/tools.rs: dispatch`.
 
 Run these in order within a single session to avoid schema conflicts:
 
-1. **5a (schema version table)** first — every subsequent migration benefits from it.
-2. **5f (PRAGMA tuning)** — one-line change, immediate benefit.
-3. **2 (UNTRUSTED EVIDENCE BOUNDARY)** — two-line change, security improvement.
-4. **4 (supersession tracking)** — schema-only, no logic change.
-5. **1 (epistemic tier)** — the biggest quality-of-life win; do after schema is stable.
-6. **5b + 5c (scaling: paginated units, bounded telemetry)** — do together.
-7. **3 (FTS5 on code_units + hybrid search)** — depends on 5b being done first.
-8. **5d (binary term vectors)** — do after FTS5 is in place as the primary search path.
-9. **5e (content store GC)** — clean-up pass.
-10. **6 (visibility)** — additive, safe any time.
-11. **7 (staged retrieval)** — additive MCP tools, safe any time.
+1. **5a (`PRAGMA user_version` + migration safety)** — foundational; all subsequent migrations use this.
+2. **5f (PRAGMA tuning)** — two-line change, immediate I/O benefit.
+3. **2 (UNTRUSTED EVIDENCE BOUNDARY)** — trivial addition, security improvement.
+4. **4 (supersession tracking)** — schema-only, no logic change yet.
+5. **4b (session checkpoints)** — schema + two MCP tools; high value, self-contained.
+6. **1 (epistemic tier)** — the biggest quality-of-life win; do after schema is stable.
+7. **5b + 5c (scaling: paginated units, bounded telemetry)** — do together.
+8. **3 (FTS5 + hybrid search + binary-search truncation)** — depends on 5b being done first.
+9. **4c (reflect/dedup)** — runs in the consolidation pipeline; add after FTS is in place.
+10. **5d (binary term vectors)** — do after FTS5 is the primary search path.
+11. **5e (content store GC)** — clean-up pass, add to end of reindex.
+12. **6 (visibility)** — additive, safe any time.
+13. **7 (staged retrieval)** — additive MCP tools, safe any time.
 
 ---
 
-*Last updated: 2026-09-08. Based on analysis of `sulabhdubey/rta-smriti-brain` v1.1.0-alpha.3.*
+*Last updated: 2026-09-08. Based on two-pass analysis of `sulabhdubey/rta-smriti-brain` v1.1.0-alpha.3
+(schema v12, `rta_brain/db.py`, `rta_brain/context.py`, `rta_brain/temporal.py`, `docs/ARCHITECTURE.md`).*
