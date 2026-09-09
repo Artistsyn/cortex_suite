@@ -53,6 +53,10 @@ pub fn dispatch(
         "edit_guard"              => tool_edit_guard(args, store, session_id),
         "note_challenge"          => tool_note_challenge(args, store, session_id),
         "resolve_challenge"       => tool_resolve_challenge(args, store),
+        "set_checkpoint"          => tool_set_checkpoint(args, store, session_id),
+        "get_checkpoint"          => tool_get_checkpoint(args, store, session_id),
+        "list_memory_handles"     => tool_list_memory_handles(store),
+        "expand_memory"           => tool_expand_memory(args, store),
         other                  => Err(format!("unknown tool: {other}")),
     }?;
 
@@ -2350,6 +2354,110 @@ fn tool_propose_skill(
             ))
         }
         Err(e) => Err(format!("failed to draft skill '{name}': {e}")),
+    }
+}
+
+// ── Session checkpoint tools ──────────────────────────────────────────────────
+
+/// Persist the agent's current state as a checkpoint so it can resume a task
+/// after a context reset.
+fn tool_set_checkpoint(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
+    let objective = args["objective"].as_str().unwrap_or("").to_string();
+    if objective.is_empty() {
+        return Err("set_checkpoint: 'objective' is required".to_string());
+    }
+    let cp = crate::model::Checkpoint {
+        id: None,
+        objective,
+        verified_evidence:     args["verified_evidence"].as_str().unwrap_or("").to_string(),
+        remaining_gaps:        args["remaining_gaps"].as_str().unwrap_or("").to_string(),
+        next_action:           args["next_action"].as_str().unwrap_or("").to_string(),
+        prohibited_repetition: args["prohibited_repetition"].as_str().unwrap_or("").to_string(),
+        session_id: Some(session_id.to_string()),
+        version: 0, // computed by DB
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    match store.insert_checkpoint(&cp) {
+        Ok(id) => Ok(format!("Checkpoint saved (id={id}).")),
+        Err(e) => Err(format!("set_checkpoint failed: {e}")),
+    }
+}
+
+/// Retrieve the latest checkpoint, optionally scoped to the current session.
+fn tool_get_checkpoint(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
+    let scope = args["scope"].as_str().unwrap_or("session");
+    let sid = if scope == "session" { Some(session_id) } else { None };
+    match store.latest_checkpoint(sid) {
+        Ok(Some(cp)) => {
+            let mut out = format!(
+                "## Checkpoint (v{}, session: {})\n\
+                 **Objective:** {}\n\
+                 **Verified:** {}\n\
+                 **Gaps:** {}\n\
+                 **Next:** {}\n",
+                cp.version,
+                cp.session_id.as_deref().unwrap_or("—"),
+                cp.objective, cp.verified_evidence,
+                cp.remaining_gaps, cp.next_action,
+            );
+            if !cp.prohibited_repetition.is_empty() {
+                out.push_str(&format!("**DO NOT repeat:** {}\n", cp.prohibited_repetition));
+            }
+            Ok(out)
+        }
+        Ok(None) => Ok("No checkpoint found for this session.".to_string()),
+        Err(e)   => Err(format!("get_checkpoint failed: {e}")),
+    }
+}
+
+// ── Memory handle tools ───────────────────────────────────────────────────────
+
+/// Return a compact list of all pattern IDs and names, for navigation without
+/// fetching full body text.
+fn tool_list_memory_handles(store: &Store) -> Result<String, String> {
+    let patterns = store.all_patterns()
+        .map_err(|e| format!("list_memory_handles: {e}"))?;
+    if patterns.is_empty() {
+        return Ok("No patterns stored yet.".to_string());
+    }
+    let mut out = format!("{} patterns:\n", patterns.len());
+    for p in &patterns {
+        out.push_str(&format!(
+            "  [{id}] {name} [{kind}] — {intent}\n",
+            id   = p.id.unwrap_or(-1),
+            name = p.name,
+            kind = p.kind.as_str(),
+            intent = p.intent,
+        ));
+    }
+    Ok(out)
+}
+
+/// Return the full body of a specific pattern by ID, for on-demand expansion
+/// without loading the entire pattern set.
+fn tool_expand_memory(args: &Value, store: &Store) -> Result<String, String> {
+    let id = match args["id"].as_i64() {
+        Some(v) => v,
+        None    => return Err("expand_memory: 'id' (integer) is required".to_string()),
+    };
+    let patterns = store.all_patterns()
+        .map_err(|e| format!("expand_memory: {e}"))?;
+    match patterns.iter().find(|p| p.id == Some(id)) {
+        Some(p) => Ok(format!(
+            "# {} [{}] — {}\n{}\n\nUses: {}\nTags: {}\n",
+            p.name, p.kind.as_str(), p.intent, p.body,
+            p.uses.join(", "), p.tags.join(", "),
+        )),
+        None => Err(format!("No pattern with id={id}")),
     }
 }
 

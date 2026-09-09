@@ -1,6 +1,124 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+// ── Epistemic tier ────────────────────────────────────────────────────────────
+
+/// How a memory item was established. Maps to rta-smriti-brain's pramana hierarchy.
+/// Ordering: higher discriminant = more authoritative.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum EpistemicTier {
+    /// Single-session hypothesis; not yet corroborated.
+    Kalpana    = 1,
+    /// Recalled from prior session memory; no fresh confirmation.
+    Smriti     = 2,
+    /// Agent-inferred across sessions; plausible but unverified.
+    #[default]
+    Anumana    = 3,
+    /// Operator/developer-supplied directly (prefs.toml, manual annotation).
+    Sabda      = 4,
+    /// Directly observed: survived test + review or explicit developer confirmation.
+    Pratyaksha = 5,
+}
+
+impl EpistemicTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kalpana    => "kalpana",
+            Self::Smriti     => "smriti",
+            Self::Anumana    => "anumana",
+            Self::Sabda      => "sabda",
+            Self::Pratyaksha => "pratyaksha",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "pratyaksha" => Self::Pratyaksha,
+            "sabda"      => Self::Sabda,
+            "anumana"    => Self::Anumana,
+            "smriti"     => Self::Smriti,
+            _            => Self::Kalpana,
+        }
+    }
+}
+
+// ── Memory kind ───────────────────────────────────────────────────────────────
+
+/// The functional role of a memory item in the context pack.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum MemoryKind {
+    /// How-to: actionable pattern (default for patterns).
+    #[default]
+    Procedure,
+    /// Don't-do: anti-pattern or constraint.
+    Constraint,
+    /// Architectural decision or policy.
+    Policy,
+    /// General annotation or fact.
+    Fact,
+}
+
+impl MemoryKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Procedure  => "procedure",
+            Self::Constraint => "constraint",
+            Self::Policy     => "policy",
+            Self::Fact       => "fact",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "constraint" => Self::Constraint,
+            "policy"     => Self::Policy,
+            "fact"       => Self::Fact,
+            _            => Self::Procedure,
+        }
+    }
+}
+
+// ── Trust level ───────────────────────────────────────────────────────────────
+
+/// How a pattern was established — drives authority_score weighting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum TrustLevel {
+    /// Manually promoted by the developer; highest confidence.
+    Authoritative,
+    /// LLM-crystallized across ≥3 sessions; high confidence.
+    #[default]
+    Crystallized,
+    /// Auto-detected candidate; lower confidence.
+    Candidate,
+}
+
+impl TrustLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Authoritative => "authoritative",
+            Self::Crystallized  => "crystallized",
+            Self::Candidate     => "candidate",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "authoritative" => Self::Authoritative,
+            "candidate"     => Self::Candidate,
+            _               => Self::Crystallized,
+        }
+    }
+
+    /// Numeric trust weight used in authority_score.
+    pub fn weight(&self) -> f32 {
+        match self {
+            Self::Authoritative => 1.0,
+            Self::Crystallized  => 0.65,
+            Self::Candidate     => 0.25,
+        }
+    }
+}
+
 // ── Source representation ─────────────────────────────────────────────────────
 
 /// A compressed semantic unit derived from a source file item.
@@ -49,6 +167,24 @@ pub struct Pattern {
     pub use_count: i64,
     pub reverted_count: i64,
     pub survival_rate: f32,
+    /// Computed trust signal: min(use_count, 10) / 10.0
+    pub credibility: f32,
+    /// How this pattern was established (authoritative / crystallized / candidate)
+    pub trust_level: TrustLevel,
+    /// Functional role in the context pack
+    pub kind: MemoryKind,
+    /// Epistemic authority tier
+    pub tier: EpistemicTier,
+    /// MD5 hash of name + body for dedup
+    pub hash: Option<String>,
+    /// How many times this pattern was included in a context pack
+    pub included_in_context_count: i64,
+    /// How many times the agent confirmed this pattern was useful
+    pub confirmed_count: i64,
+    /// How many times the agent marked this pattern as wrong
+    pub corrected_count: i64,
+    /// Superseded by another pattern (soft delete)
+    pub superseded_by: Option<i64>,
 }
 
 /// A known bad approach — injected as negative examples so Copilot avoids them.
@@ -62,6 +198,10 @@ pub struct AntiPattern {
     pub correct: String,
     pub tags: Vec<String>,
     pub added_at: DateTime<Utc>,
+    /// MD5 hash of description + wrong for dedup
+    pub hash: Option<String>,
+    /// Superseded by another anti-pattern (soft delete)
+    pub superseded_by: Option<i64>,
 }
 
 /// A free-form annotation — facts, constraints, or notes you want Copilot to know.
@@ -72,6 +212,8 @@ pub struct Annotation {
     pub body: String,
     pub tags: Vec<String>,
     pub added_at: DateTime<Utc>,
+    /// MD5 hash of topic + body for dedup
+    pub hash: Option<String>,
 }
 
 /// A record of a Copilot MCP tool call, used to track what it reaches for.
@@ -171,6 +313,10 @@ pub struct GraphEdge {
     pub relation: RelationType,
     pub weight: f32,
     pub source: String,
+    /// Unix timestamp when this edge became true (None = always/unknown)
+    pub valid_at: Option<f64>,
+    /// Unix timestamp when this edge was superseded; None = currently true
+    pub invalid_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +356,65 @@ impl RelationType {
             _ => None,
         }
     }
+}
+
+// ── Session continuation ──────────────────────────────────────────────────────
+
+/// Structured record of what the agent is accomplishing and what to avoid this task.
+/// Append-only: every update inserts a new row; latest = ORDER BY id DESC LIMIT 1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub id: Option<i64>,
+    /// What is being accomplished in this session
+    pub objective: String,
+    /// What has been confirmed true (verified evidence)
+    pub verified_evidence: String,
+    /// What is still unknown or incomplete
+    pub remaining_gaps: String,
+    /// Specific next step to take
+    pub next_action: String,
+    /// Approaches that MUST NOT be tried again (task-scoped anti-pattern)
+    pub prohibited_repetition: String,
+    /// The MCP session key that wrote this checkpoint
+    pub session_id: Option<String>,
+    pub version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+// ── Context budget ────────────────────────────────────────────────────────────
+
+/// Per-block token budget breakdown for the assembled context pack.
+/// Returned alongside the rendered pack so the LLM can self-regulate.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextWindowOverview {
+    pub total_budget:       usize,
+    pub used_checkpoint:    usize,
+    pub used_api:           usize,
+    pub used_adrs:          usize,
+    pub used_patterns:      usize,
+    pub used_constraints:   usize,
+    pub used_annotations:   usize,
+    pub used_deltas:        usize,
+    pub total_used:         usize,
+    pub truncated:          bool,
+}
+
+// ── Pattern history ───────────────────────────────────────────────────────────
+
+/// Audit log entry for a pattern mutation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternHistoryEntry {
+    pub id: Option<i64>,
+    pub pattern_id: i64,
+    /// "ADD", "UPDATE", "SUPERSEDE", "DELETE"
+    pub event: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    /// "crystallizer", "agent", "operator"
+    pub actor_id: String,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 // ── quartz-ctx integration ────────────────────────────────────────────────────
