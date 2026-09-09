@@ -1,7 +1,7 @@
 /// Semantic search over the indexed code units using cosine similarity on TF-IDF vectors.
 /// No external ML dependencies — fast, local, good enough for codebase-scale corpora.
 use crate::compressor::{build_term_vector_str, cosine_similarity};
-use crate::memory::MemoryStore;
+use crate::memory::Store;
 use crate::model::CodeUnit;
 
 pub struct SearchResult<'a> {
@@ -40,7 +40,7 @@ pub fn semantic_search<'a>(
 /// This matches the formula verified in rta-smriti-brain and outperforms either
 /// signal alone on codebase corpora.
 pub fn hybrid_search<'a>(
-    store: &MemoryStore,
+    store: &Store,
     query: &str,
     units: &'a [CodeUnit],
     limit: usize,

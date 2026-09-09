@@ -254,7 +254,9 @@ pub fn neighbors(conn: &Connection, node_id: &str) -> Result<Vec<(GraphEdge, Gra
                 relation,
                 weight: row.get(3)?,
                 source: row.get(4)?,
-            },
+            valid_at: None,
+            invalid_at: None,
+        },
             GraphNode {
                 id: row.get(5)?,
                 kind: row.get(6)?,

@@ -2725,6 +2725,15 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
                 use_count: 0,
                 reverted_count: 0,
                 survival_rate: 1.0,
+                credibility: 0.0,
+                trust_level: model::TrustLevel::default(),
+                kind: model::MemoryKind::default(),
+                tier: model::EpistemicTier::default(),
+                hash: None,
+                included_in_context_count: 0,
+                confirmed_count: 0,
+                corrected_count: 0,
+                superseded_by: None,
             })?;
             print_json(&json!({"ok": true, "action": "add", "id": id, "name": name, "intent": intent}))
         }
@@ -2786,6 +2795,8 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
                 correct,
                 tags,
                 added_at: chrono::Utc::now(),
+                hash: None,
+                superseded_by: None,
             })?;
             print_json(&json!({"ok": true, "action": "add", "id": id, "description": description}))
         }
@@ -2854,6 +2865,7 @@ fn run_annotate(cmd: AnnotateCmd, db_path: &Path, format: OutputFormat) -> Resul
                 body,
                 tags,
                 added_at: chrono::Utc::now(),
+                hash: None,
             })?;
             print_json(&json!({"ok": true, "action": "add", "id": id, "topic": topic}))
         }
@@ -3537,6 +3549,15 @@ fn run_doctor_workflow(args: DoctorWorkflowArgs, db_path: &Path, format: OutputF
             use_count: 0,
             reverted_count: 0,
             survival_rate: 1.0,
+                credibility: 0.0,
+                trust_level: crate::model::TrustLevel::default(),
+                kind: crate::model::MemoryKind::default(),
+                tier: crate::model::EpistemicTier::default(),
+                hash: None,
+                included_in_context_count: 0,
+                confirmed_count: 0,
+                corrected_count: 0,
+                superseded_by: None,
         };
 
         let id = store.insert_pattern(&pattern)?;
