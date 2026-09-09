@@ -370,6 +370,15 @@ fn commit_marker(
                 use_count: 0,
                 reverted_count: 0,
                 survival_rate: 1.0,
+                credibility: 0.0,
+                trust_level: crate::model::TrustLevel::default(),
+                kind: crate::model::MemoryKind::default(),
+                tier: crate::model::EpistemicTier::default(),
+                hash: None,
+                included_in_context_count: 0,
+                confirmed_count: 0,
+                corrected_count: 0,
+                superseded_by: None,
             };
             store.insert_pattern(&p)?;
             mark_promoted_nonfatal(store, session_key, "pattern", name);
@@ -391,6 +400,8 @@ fn commit_marker(
                 correct: correct.clone(),
                 tags: tags.clone(),
                 added_at: Utc::now(),
+                hash: None,
+                superseded_by: None,
             };
             store.insert_anti_pattern(&ap)?;
             mark_promoted_nonfatal(store, session_key, "anti_pattern", description);
@@ -445,6 +456,7 @@ fn commit_marker(
                 body: body.clone(),
                 tags: tags.clone(),
                 added_at: Utc::now(),
+                hash: None,
             };
             store.insert_annotation(&ann)?;
             Ok(true)

@@ -76,6 +76,15 @@ pub fn crystallize_observation(
         use_count: 0,
         reverted_count: 0,
         survival_rate: 1.0,
+                credibility: 0.0,
+                trust_level: crate::model::TrustLevel::default(),
+                kind: crate::model::MemoryKind::default(),
+                tier: crate::model::EpistemicTier::default(),
+                hash: None,
+                included_in_context_count: 0,
+                confirmed_count: 0,
+                corrected_count: 0,
+                superseded_by: None,
     };
 
     let pid = store.insert_pattern(&pattern)?;
@@ -113,6 +122,15 @@ pub fn add_pattern(
         use_count: 0,
         reverted_count: 0,
         survival_rate: 1.0,
+                credibility: 0.0,
+                trust_level: crate::model::TrustLevel::default(),
+                kind: crate::model::MemoryKind::default(),
+                tier: crate::model::EpistemicTier::default(),
+                hash: None,
+                included_in_context_count: 0,
+                confirmed_count: 0,
+                corrected_count: 0,
+                superseded_by: None,
     };
     let id = store.insert_pattern(&pattern)?;
     println!("✓ Pattern `{}` added (id: {}).", name, id);
@@ -194,6 +212,8 @@ pub fn add_anti_pattern(
         correct: correct.to_string(),
         tags,
         added_at: chrono::Utc::now(),
+                hash: None,
+                superseded_by: None,
     };
     let id = store.insert_anti_pattern(&ap)?;
     println!("✓ Anti-pattern added (id: {}).", id);
@@ -232,6 +252,7 @@ pub fn add_annotation(store: &Store, topic: &str, body: &str, tags: Vec<String>)
         body: body.to_string(),
         tags,
         added_at: chrono::Utc::now(),
+        hash: None,
     };
     let id = store.insert_annotation(&a)?;
     println!("✓ Annotation added (id: {}).", id);

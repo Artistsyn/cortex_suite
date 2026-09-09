@@ -120,6 +120,8 @@ impl Store {
                 correct: (*correct).to_string(),
                 tags: tags.iter().map(|t| t.to_string()).collect(),
                 added_at: Utc::now(),
+                hash: None,
+                superseded_by: None,
             };
             self.insert_anti_pattern(&ap)?;
         }
@@ -207,6 +209,7 @@ impl Store {
                 body: (*body).to_string(),
                 tags: tags.iter().map(|t| t.to_string()).collect(),
                 added_at: Utc::now(),
+                hash: None,
             };
             self.insert_annotation(&ann)?;
         }
@@ -1171,7 +1174,7 @@ impl Store {
             }
         }
         self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_ge_current ON graph_edges(source_id) WHERE invalid_at IS NULL;"
+            "CREATE INDEX IF NOT EXISTS idx_ge_current ON graph_edges(from_id) WHERE invalid_at IS NULL;"
         )?;
 
         // --- code_units: doc_comment column ---
@@ -2332,6 +2335,8 @@ pub fn command_family(command: &str) -> String {
                 correct: sc.correction.clone(),
                 tags: sc.tags.clone(),
                 added_at: chrono::Utc::now(),
+                hash: None,
+                superseded_by: None,
             };
             let ap_id = self.insert_anti_pattern(&ap)?;
             self.conn.execute(
