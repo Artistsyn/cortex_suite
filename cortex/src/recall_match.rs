@@ -50,6 +50,28 @@ pub fn recall_score(haystacks: &[&str], phrase: &str, terms: &[String]) -> usize
     }
 }
 
+/// Combined trust signal weighting a pattern's authority tier against its
+/// observed survival rate.  Adapted from Memoripy's authority scoring.
+///
+/// `trust_weight` comes from `TrustLevel::weight()` (0.3 / 0.6 / 1.0).
+/// `survival_rate` is the pattern's rolling use_count / (use_count + reverted_count).
+#[inline]
+pub fn authority_score(trust_weight: f32, survival_rate: f32) -> f32 {
+    trust_weight * 0.7 + survival_rate * 0.3
+}
+
+/// Three-axis relevance: relevance × grounding × utility (Self-RAG style).
+///
+/// - `relevance`  — cosine similarity between query and pattern body embeddings (0–1)
+/// - `grounding`  — fraction of hint tokens found in the pattern body (0–1)
+/// - `utility`    — authority_score(trust_weight, survival_rate)
+///
+/// Final weights: 1.0 × relevance + 1.0 × grounding + 0.5 × utility, normalised to 0–1.
+#[inline]
+pub fn three_axis_score(relevance: f32, grounding: f32, utility: f32) -> f32 {
+    (1.0 * relevance + 1.0 * grounding + 0.5 * utility) / 2.5
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

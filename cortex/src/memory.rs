@@ -236,6 +236,10 @@ impl Store {
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
             PRAGMA busy_timeout = 5000;
+            PRAGMA wal_autocheckpoint = 1000;
+            PRAGMA cache_size = -32768;
+            PRAGMA mmap_size = 268435456;
+            PRAGMA synchronous = NORMAL;
 
             CREATE TABLE IF NOT EXISTS code_units (
                 id          TEXT PRIMARY KEY,
@@ -447,6 +451,12 @@ impl Store {
                 content_rowid = 'id',
                 tokenize = 'porter unicode61'
             );
+            CREATE VIRTUAL TABLE IF NOT EXISTS code_unit_fts USING fts5(
+                name, summary, compressed,
+                content = 'code_units',
+                content_rowid = 'rowid',
+                tokenize = 'porter unicode61'
+            );
         ")?;
 
         // FTS sync triggers — each trigger is its own execute_batch call.
@@ -492,6 +502,20 @@ impl Store {
                 VALUES ('delete', OLD.id, OLD.topic, OLD.body, OLD.tags);
                 INSERT INTO annotation_fts(rowid, topic, body, tags)
                 VALUES (NEW.id, NEW.topic, NEW.body, NEW.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_cu_fts_ins AFTER INSERT ON code_units BEGIN
+                INSERT INTO code_unit_fts(rowid, name, summary, compressed)
+                VALUES (NEW.rowid, NEW.name, NEW.summary, NEW.compressed);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_cu_fts_del AFTER DELETE ON code_units BEGIN
+                INSERT INTO code_unit_fts(code_unit_fts, rowid, name, summary, compressed)
+                VALUES ('delete', OLD.rowid, OLD.name, OLD.summary, OLD.compressed);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_cu_fts_upd AFTER UPDATE ON code_units BEGIN
+                INSERT INTO code_unit_fts(code_unit_fts, rowid, name, summary, compressed)
+                VALUES ('delete', OLD.rowid, OLD.name, OLD.summary, OLD.compressed);
+                INSERT INTO code_unit_fts(rowid, name, summary, compressed)
+                VALUES (NEW.rowid, NEW.name, NEW.summary, NEW.compressed);
             END",
         ];
         for t in &triggers {
@@ -648,6 +672,34 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_cg_caller ON call_graph(caller);
             CREATE INDEX IF NOT EXISTS idx_cg_callee ON call_graph(callee);
+
+            -- Session continuation checkpoints (append-only; latest = ORDER BY id DESC LIMIT 1)
+            CREATE TABLE IF NOT EXISTS session_checkpoints (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                objective             TEXT    NOT NULL,
+                verified_evidence     TEXT    NOT NULL DEFAULT '',
+                remaining_gaps        TEXT    NOT NULL DEFAULT '',
+                next_action           TEXT    NOT NULL DEFAULT '',
+                prohibited_repetition TEXT    NOT NULL DEFAULT '',
+                session_id            TEXT,
+                version               INTEGER NOT NULL DEFAULT 1,
+                created_at            TEXT    NOT NULL,
+                updated_at            TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sc_updated ON session_checkpoints(updated_at DESC);
+
+            -- Pattern mutation audit log
+            CREATE TABLE IF NOT EXISTS pattern_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern_id INTEGER NOT NULL,
+                event      TEXT    NOT NULL,
+                old_value  TEXT,
+                new_value  TEXT,
+                actor_id   TEXT    NOT NULL DEFAULT 'system',
+                session_id TEXT,
+                created_at TEXT    NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ph_pattern ON pattern_history(pattern_id, created_at DESC);
         ")?;
 
         // Phase 0A: self-learning loop tables (idempotent).
@@ -942,6 +994,7 @@ impl Store {
         self.ensure_supersession_columns()?;
         self.ensure_compression_family_column()?;
         self.ensure_edit_guard_file_column()?;
+        self.ensure_upgrade_columns()?;
 
         Ok(())
     }
@@ -1044,6 +1097,95 @@ impl Store {
         Ok(())
     }
 
+    /// Add all Phase-2 + Phase-3 upgrade columns idempotently.
+    fn ensure_upgrade_columns(&self) -> Result<()> {
+        // Read column lists once per table to avoid repeated PRAGMAs.
+        let col_info = |table: &str| -> Result<std::collections::HashSet<String>> {
+            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut set = std::collections::HashSet::new();
+            for c in rows { set.insert(c?); }
+            Ok(set)
+        };
+
+        // --- patterns ---
+        let pcols = col_info("patterns")?;
+        let pattern_adds: &[(&str, &str)] = &[
+            ("hash",                       "TEXT"),
+            ("trust_level",                "TEXT NOT NULL DEFAULT 'crystallized'"),
+            ("kind",                       "TEXT NOT NULL DEFAULT 'procedure'"),
+            ("tier",                       "TEXT NOT NULL DEFAULT 'anumana'"),
+            ("included_in_context_count",  "INTEGER NOT NULL DEFAULT 0"),
+            ("confirmed_count",            "INTEGER NOT NULL DEFAULT 0"),
+            ("corrected_count",            "INTEGER NOT NULL DEFAULT 0"),
+        ];
+        for (col, typedef) in pattern_adds {
+            if !pcols.contains(*col) {
+                self.conn.execute(
+                    &format!("ALTER TABLE patterns ADD COLUMN {col} {typedef}"),
+                    [],
+                )?;
+            }
+        }
+        // Unique index for dedup — CREATE INDEX IF NOT EXISTS is idempotent.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pat_hash ON patterns(hash) WHERE hash IS NOT NULL;"
+        )?;
+
+        // --- anti_patterns ---
+        let apcols = col_info("anti_patterns")?;
+        if !apcols.contains("hash") {
+            self.conn.execute(
+                "ALTER TABLE anti_patterns ADD COLUMN hash TEXT",
+                [],
+            )?;
+            self.conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_ap_hash ON anti_patterns(hash) WHERE hash IS NOT NULL;"
+            )?;
+        }
+
+        // --- annotations ---
+        let ancols = col_info("annotations")?;
+        if !ancols.contains("hash") {
+            self.conn.execute(
+                "ALTER TABLE annotations ADD COLUMN hash TEXT",
+                [],
+            )?;
+            self.conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_ann_hash ON annotations(hash) WHERE hash IS NOT NULL;"
+            )?;
+        }
+
+        // --- graph_edges: bi-temporal columns ---
+        let gecols = col_info("graph_edges")?;
+        let ge_adds: &[(&str, &str)] = &[
+            ("valid_at",   "REAL"),
+            ("invalid_at", "REAL"),
+        ];
+        for (col, typedef) in ge_adds {
+            if !gecols.contains(*col) {
+                self.conn.execute(
+                    &format!("ALTER TABLE graph_edges ADD COLUMN {col} {typedef}"),
+                    [],
+                )?;
+            }
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_ge_current ON graph_edges(source_id) WHERE invalid_at IS NULL;"
+        )?;
+
+        // --- code_units: doc_comment column ---
+        let cucols = col_info("code_units")?;
+        if !cucols.contains("doc_comment") {
+            self.conn.execute(
+                "ALTER TABLE code_units ADD COLUMN doc_comment TEXT",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Rebuild FTS5 indexes from source tables. Safe to call repeatedly.
     pub fn rebuild_fts(&self) -> Result<()> {
         // 'rebuild' re-reads the content table and regenerates the inverted index.
@@ -1051,6 +1193,7 @@ impl Store {
             INSERT INTO pattern_fts(pattern_fts) VALUES('rebuild');
             INSERT INTO anti_pattern_fts(anti_pattern_fts) VALUES('rebuild');
             INSERT INTO annotation_fts(annotation_fts) VALUES('rebuild');
+            INSERT INTO code_unit_fts(code_unit_fts) VALUES('rebuild');
         ")?;
         Ok(())
     }
@@ -1192,18 +1335,42 @@ impl Store {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM code_units", [], |r| r.get(0))?)
     }
 
+    /// Lean query for hybrid search — omits `compressed` blob to keep memory low.
+    pub fn units_for_search(&self) -> Result<Vec<CodeUnit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, name, module_path, summary, '' AS compressed, term_vector, indexed_at
+             FROM code_units ORDER BY kind, name"
+        )?;
+        let rows = stmt.query_map([], row_to_unit)?;
+        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(items)
+    }
+
     // ── Patterns ──────────────────────────────────────────────────────────────
 
     pub fn insert_pattern(&self, p: &Pattern) -> Result<i64> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(p.name.as_bytes());
+        hasher.update(b"|");
+        hasher.update(p.body.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
         self.conn.execute(
             "INSERT INTO patterns
-             (name, intent, body, uses, tags, approved_at, use_count, reverted_count, survival_rate)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 1.0)",
+             (name, intent, body, uses, tags, approved_at, use_count, reverted_count,
+              survival_rate, trust_level, kind, tier, hash,
+              included_in_context_count, confirmed_count, corrected_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 1.0, ?7, ?8, ?9, ?10, 0, 0, 0)",
             params![
                 p.name, p.intent, p.body,
                 serde_json::to_string(&p.uses)?,
                 serde_json::to_string(&p.tags)?,
                 p.approved_at.to_rfc3339(),
+                p.trust_level.as_str(),
+                p.kind.as_str(),
+                p.tier.as_str(),
+                hash,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1212,7 +1379,10 @@ impl Store {
     pub fn all_patterns(&self) -> Result<Vec<Pattern>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, intent, body, uses, tags, approved_at, use_count,
-                    reverted_count, survival_rate
+                    reverted_count, survival_rate,
+                    credibility, superseded_by,
+                    trust_level, kind, tier, hash,
+                    included_in_context_count, confirmed_count, corrected_count
              FROM patterns WHERE superseded_by IS NULL
              ORDER BY survival_rate DESC, use_count DESC, approved_at DESC"
         )?;
@@ -1324,13 +1494,21 @@ impl Store {
     // ── Anti-patterns ─────────────────────────────────────────────────────────
 
     pub fn insert_anti_pattern(&self, ap: &AntiPattern) -> Result<i64> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(ap.description.as_bytes());
+        hasher.update(b"|");
+        hasher.update(ap.wrong.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
         self.conn.execute(
-            "INSERT INTO anti_patterns (description, wrong, correct, tags, added_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO anti_patterns (description, wrong, correct, tags, added_at, hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 ap.description, ap.wrong, ap.correct,
                 serde_json::to_string(&ap.tags)?,
                 ap.added_at.to_rfc3339(),
+                hash,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1338,7 +1516,7 @@ impl Store {
 
     pub fn all_anti_patterns(&self) -> Result<Vec<AntiPattern>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, description, wrong, correct, tags, added_at
+            "SELECT id, description, wrong, correct, tags, added_at, hash, superseded_by
              FROM anti_patterns WHERE superseded_by IS NULL"
         )?;
         let rows = stmt.query_map([], row_to_anti_pattern)?;
@@ -1446,12 +1624,20 @@ impl Store {
     // ── Annotations ───────────────────────────────────────────────────────────
 
     pub fn insert_annotation(&self, a: &Annotation) -> Result<i64> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(a.topic.as_bytes());
+        hasher.update(b"|");
+        hasher.update(a.body.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+
         self.conn.execute(
-            "INSERT INTO annotations (topic, body, tags, added_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO annotations (topic, body, tags, added_at, hash) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 a.topic, a.body,
                 serde_json::to_string(&a.tags)?,
                 a.added_at.to_rfc3339(),
+                hash,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1459,7 +1645,7 @@ impl Store {
 
     pub fn all_annotations(&self) -> Result<Vec<Annotation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, topic, body, tags, added_at FROM annotations ORDER BY added_at DESC"
+            "SELECT id, topic, body, tags, added_at, hash FROM annotations ORDER BY added_at DESC"
         )?;
         let rows = stmt.query_map([], row_to_annotation)?;
         let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2225,6 +2411,109 @@ pub fn command_family(command: &str) -> String {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    // ── Session checkpoints ───────────────────────────────────────────────────
+
+    /// Insert a new checkpoint version (append-only).
+    pub fn insert_checkpoint(&self, cp: &crate::model::Checkpoint) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO session_checkpoints
+             (objective, verified_evidence, remaining_gaps, next_action,
+              prohibited_repetition, session_id, version, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                     COALESCE((SELECT MAX(version) + 1 FROM session_checkpoints WHERE session_id = ?6), 1),
+                     ?7, ?7)",
+            params![
+                cp.objective, cp.verified_evidence, cp.remaining_gaps,
+                cp.next_action, cp.prohibited_repetition, cp.session_id,
+                now,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Return the most recently updated checkpoint, optionally filtered by session.
+    pub fn latest_checkpoint(&self, session_id: Option<&str>) -> Result<Option<crate::model::Checkpoint>> {
+        let row = if let Some(sid) = session_id {
+            self.conn.query_row(
+                "SELECT id, objective, verified_evidence, remaining_gaps, next_action,
+                        prohibited_repetition, session_id, version, created_at, updated_at
+                 FROM session_checkpoints WHERE session_id = ?1
+                 ORDER BY id DESC LIMIT 1",
+                params![sid],
+                row_to_checkpoint,
+            )
+        } else {
+            self.conn.query_row(
+                "SELECT id, objective, verified_evidence, remaining_gaps, next_action,
+                        prohibited_repetition, session_id, version, created_at, updated_at
+                 FROM session_checkpoints ORDER BY id DESC LIMIT 1",
+                [],
+                row_to_checkpoint,
+            )
+        };
+        match row {
+            Ok(cp) => Ok(Some(cp)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    // ── Pattern history ───────────────────────────────────────────────────────
+
+    pub fn insert_pattern_history(
+        &self,
+        pattern_id: i64,
+        event: &str,
+        old_value: Option<&str>,
+        new_value: Option<&str>,
+        actor_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO pattern_history
+             (pattern_id, event, old_value, new_value, actor_id, session_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![pattern_id, event, old_value, new_value, actor_id, session_id, now],
+        )?;
+        Ok(())
+    }
+
+    // ── FTS5 hybrid search for code units ─────────────────────────────────────
+
+    /// BM25 keyword search over `code_unit_fts`.
+    /// Returns (rowid, bm25_rank) pairs ordered by relevance.
+    pub fn fts_code_units(&self, query: &str, limit: usize) -> Result<Vec<(i64, f64)>> {
+        let safe_q = sanitize_fts_query(query);
+        if safe_q.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, rank FROM code_unit_fts
+             WHERE code_unit_fts MATCH ?1
+             ORDER BY rank LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![safe_q, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ── Bounded telemetry rotation ─────────────────────────────────────────────
+
+    /// Prune telemetry tables to the 50 000 most recent rows.
+    pub fn prune_telemetry(&self) -> Result<()> {
+        let tables = ["mcp_calls", "session_retrieval_log", "outcome_log", "compression_savings"];
+        for t in tables {
+            self.conn.execute(
+                &format!("DELETE FROM {t} WHERE id < (SELECT MAX(id) - 50000 FROM {t})"),
+                [],
+            ).ok(); // table may not exist yet; ignore
+        }
+        Ok(())
+    }
+
 }
 
 /// Sanitize user input for FTS5 MATCH queries. Strips special chars, joins with spaces (AND).
@@ -2239,6 +2528,23 @@ fn sanitize_fts_query(q: &str) -> String {
 }
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
+
+fn row_to_checkpoint(row: &rusqlite::Row) -> rusqlite::Result<crate::model::Checkpoint> {
+    let created_raw: String = row.get(8)?;
+    let updated_raw: String = row.get(9)?;
+    Ok(crate::model::Checkpoint {
+        id:                    Some(row.get(0)?),
+        objective:             row.get(1)?,
+        verified_evidence:     row.get(2)?,
+        remaining_gaps:        row.get(3)?,
+        next_action:           row.get(4)?,
+        prohibited_repetition: row.get(5)?,
+        session_id:            row.get(6)?,
+        version:               row.get(7)?,
+        created_at: parse_rfc3339_or_flag(&created_raw, "session_checkpoints", None, "created_at"),
+        updated_at: parse_rfc3339_or_flag(&updated_raw, "session_checkpoints", None, "updated_at"),
+    })
+}
 
 fn row_to_adr(row: &rusqlite::Row) -> rusqlite::Result<Adr> {
     let tags_json: String = row.get(9)?;
@@ -2316,17 +2622,33 @@ fn parse_rfc3339_or_flag(
 }
 
 fn row_to_pattern(row: &rusqlite::Row) -> rusqlite::Result<Pattern> {
+    use crate::model::{TrustLevel, MemoryKind, EpistemicTier};
     let id: i64 = row.get(0)?;
     let uses: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default();
     let tags: Vec<String> = serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default();
     let approved_at_raw: String = row.get(6)?;
     let approved_at = parse_rfc3339_or_flag(&approved_at_raw, "patterns", Some(id), "approved_at");
+
+    let trust_level_str: Option<String> = row.get(12).ok();
+    let kind_str: Option<String>        = row.get(13).ok();
+    let tier_str: Option<String>        = row.get(14).ok();
+
     Ok(Pattern {
-        id: Some(id), name: row.get(1)?, intent: row.get(2)?,
+        id: Some(id),
+        name: row.get(1)?, intent: row.get(2)?,
         body: row.get(3)?, uses, tags, approved_at,
-        use_count: row.get(7)?,
+        use_count:     row.get(7)?,
         reverted_count: row.get(8)?,
         survival_rate: row.get(9)?,
+        credibility:   row.get::<_, Option<f32>>(10)?.unwrap_or(0.0),
+        superseded_by: row.get(11)?,
+        trust_level:   trust_level_str.as_deref().map(TrustLevel::from_str).unwrap_or_default(),
+        kind:          kind_str.as_deref().map(MemoryKind::from_str).unwrap_or_default(),
+        tier:          tier_str.as_deref().map(EpistemicTier::from_str).unwrap_or_default(),
+        hash:          row.get::<_, Option<String>>(15).unwrap_or(None),
+        included_in_context_count: row.get::<_, Option<i64>>(16)?.unwrap_or(0),
+        confirmed_count:           row.get::<_, Option<i64>>(17)?.unwrap_or(0),
+        corrected_count:           row.get::<_, Option<i64>>(18)?.unwrap_or(0),
     })
 }
 
@@ -2338,6 +2660,8 @@ fn row_to_anti_pattern(row: &rusqlite::Row) -> rusqlite::Result<AntiPattern> {
     Ok(AntiPattern {
         id: Some(id), description: row.get(1)?,
         wrong: row.get(2)?, correct: row.get(3)?, tags, added_at,
+        hash:          row.get::<_, Option<String>>(6).unwrap_or(None),
+        superseded_by: row.get::<_, Option<i64>>(7).unwrap_or(None),
     })
 }
 
@@ -2349,6 +2673,7 @@ fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
     Ok(Annotation {
         id: Some(id), topic: row.get(1)?,
         body: row.get(2)?, tags, added_at,
+        hash: row.get::<_, Option<String>>(5).unwrap_or(None),
     })
 }
 
