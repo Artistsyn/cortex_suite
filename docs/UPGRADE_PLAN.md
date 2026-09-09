@@ -1,13 +1,19 @@
 # Cortex Suite — Upgrade Plan
 
-> **Source research:** Two-pass deep analysis of `sulabhdubey/rta-smriti-brain` v1.1.0-alpha.3
-> (schema v12, ~170 KB Python) against `Artistsyn/cortex_suite` (Rust). The second pass
-> verified every claim against actual source files: `rta_brain/db.py`, `rta_brain/context.py`,
-> `rta_brain/temporal.py`, `rta_brain/ingest.py`, and `docs/ARCHITECTURE.md`.
+> **Source research:**
+> - **Pass 1 & 2:** Two-pass deep analysis of `sulabhdubey/rta-smriti-brain` v1.1.0-alpha.3
+>   (schema v12, ~170 KB Python). Verified against `rta_brain/db.py`, `rta_brain/context.py`,
+>   `rta_brain/temporal.py`, `rta_brain/ingest.py`, `docs/ARCHITECTURE.md`.
+> - **Pass 3:** Broad ecosystem survey of 15+ open-source systems: mem0, Memoripy, Letta/MemGPT,
+>   cognee, Graphiti/Zep, Voyager, JARVIS, AutoGen, Self-RAG, Eureka, LLMLingua-2, Selective
+>   Context, RECOMP, StreamingLLM, tree-sitter tags, rust-analyzer, Semgrep, CodeBERT/Nomic.
+>   See `docs/RESEARCH_LANDSCAPE.md` for full technical detail on each system.
 >
 > **How to use this document:** Pass it to your local agent as a task brief. Each section
 > is a self-contained work item with the exact files and schema objects that need changing.
-> Items are ordered by impact-to-effort ratio — implement from the top down.
+> Items are ordered by impact-to-effort ratio — implement from the top down. Items 1–7 (and
+> their sub-items) come from rta-smriti-brain. Items 8–17 come from the broader ecosystem
+> survey and were confirmed as must-have after curation review.
 
 ---
 
@@ -637,28 +643,469 @@ Register both in `mcp/tools.rs: dispatch`.
 | 5f | WAL checkpoint + cache size + mmap PRAGMA tuning | `memory.rs` | Trivial | Medium (scaling) |
 | 6 | Visibility field on all memory types | `model.rs`, `memory.rs`, `planner.rs` | Low | Low-medium |
 | 7 | Staged retrieval: `list_memory_handles` + `expand_memory` | `mcp/tools.rs` | Medium | Medium |
+| 8 | MD5 hash dedup before pattern/annotation insert | `memory.rs`, `crystallizer.rs` | Low | High |
+| 9 | Usage counter split on patterns: `included_in_context_count`, `confirmed_count`, `corrected_count` | `memory.rs`, `crystallizer.rs` | Low | High |
+| 10 | Memoripy `kind` column on patterns: `procedure`/`constraint`/`policy`/`fact` | `model.rs`, `memory.rs`, `planner.rs` | Low | High |
+| 11 | Two-axis authority score: `trust_score * 0.7 + survival_rate * 0.3` replaces single `credibility` | `recall_match.rs`, `planner.rs` | Low | Medium |
+| 12 | Bi-temporal `valid_at`/`invalid_at` on `graph_edges` with partial index | `memory.rs`, `model.rs` | Low | Medium |
+| 13 | `pattern_history` audit table (ADD/UPDATE/DELETE event log per pattern) | `memory.rs`, `model.rs`, `crystallizer.rs` | Medium | Medium |
+| 14 | Named char/token-limited context blocks + `ContextWindowOverview` budget metadata | `planner.rs`, `mcp/tools.rs` | Medium | High |
+| 15 | Three-axis recall scoring: relevance (cosine) + grounding (unit_refs overlap) + utility (credibility × survival) | `planner.rs`, `recall_match.rs` | Medium | High |
+| 16 | tree-sitter `tags` crate for non-Rust extraction in quartz-ctx (doc comments free) | `quartz-ctx/src/lang.rs` | Low | High |
+| 17 | LLMLingua-2 optional context pack compression sidecar at `rate=0.5` | `planner.rs`, `mcp/tools.rs` | Medium | High |
+
+---
+
+## Ecosystem items — implementation detail
+
+### Priority 8 — MD5 hash dedup before pattern/annotation insert
+
+**Source:** mem0 v3 (`mem0/memory/storage.py`, production-verified at scale)
+
+**Problem:** cortex re-inserts identical knowledge every session that hits the same
+pattern. The DB grows with duplicates silently. `consolidator.rs` catches them on the
+next consolidation run but duplicates live in the DB for hours.
+
+**Implementation:**
+
+**`cortex/src/memory.rs`** — add `hash TEXT UNIQUE` column to `patterns`,
+`anti_patterns`, `annotations`:
+
+```sql
+ALTER TABLE patterns     ADD COLUMN hash TEXT;
+ALTER TABLE anti_patterns ADD COLUMN hash TEXT;
+ALTER TABLE annotations  ADD COLUMN hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_patterns_hash     ON patterns(hash)      WHERE hash IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_anti_patterns_hash ON anti_patterns(hash) WHERE hash IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_annotations_hash  ON annotations(hash)   WHERE hash IS NOT NULL;
+```
+
+Add a helper in `memory.rs`:
+```rust
+fn memory_hash(name: &str, body: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;  // or md5 crate
+    // md5 crate: format!("{:x}", md5::compute(format!("{}\0{}", name, body)))
+    format!("{:x}", md5::compute(format!("{}\0{}", name, body)))
+}
+```
+
+At every `INSERT INTO patterns / anti_patterns / annotations`, compute the hash first
+and use `INSERT OR IGNORE` (or check for existing hash before insert) to silently skip
+exact duplicates.
+
+**`cortex/src/crystallizer.rs`** — set `hash` on every pattern/annotation it creates.
+
+---
+
+### Priority 9 — Usage counter split on patterns
+
+**Source:** Memoripy `MemoryRecord` (`memoripy/types.py` lines 387–485)
+
+**Problem:** `patterns.use_count` cannot distinguish "surfaced constantly but ignored"
+from "surfaced and acted on" from "surfaced and corrected as wrong." The crystallizer
+promotes patterns by `use_count` alone, which means popular-but-wrong patterns get
+elevated. Without this distinction, pattern curation is flying blind.
+
+**Implementation:**
+
+**`cortex/src/memory.rs`** — add three columns to `patterns`:
+```sql
+ALTER TABLE patterns ADD COLUMN included_in_context_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE patterns ADD COLUMN confirmed_count           INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE patterns ADD COLUMN corrected_count           INTEGER NOT NULL DEFAULT 0;
+```
+
+**`cortex/src/planner.rs`** — increment `included_in_context_count` for every pattern
+included in a rendered context pack (one `UPDATE patterns SET
+included_in_context_count = included_in_context_count + 1 WHERE id IN (...)` after
+assembly).
+
+**MCP tools** — add optional `confirm: bool` and `correct: bool` params to
+`suggest_pattern` / `recall` responses so the agent can signal which surfaced patterns
+were useful or wrong. When `confirm=true` for a returned pattern id, increment
+`confirmed_count`. When `correct=true`, increment `corrected_count` and downgrade
+`credibility`.
+
+**`cortex/src/crystallizer.rs`** — update `compute_credibility` to use:
+`confirmed_count / max(included_in_context_count, 1)` as the primary signal, blended
+with the existing `use_count / 10` formula.
+
+---
+
+### Priority 10 — `kind` column on patterns
+
+**Source:** Memoripy `MemoryRecord.kind` (`memoripy/types.py`), exact values verified
+
+**Problem:** Patterns, anti-patterns, and annotations are all loaded the same way by
+`planner.rs`. Context pack assembly treats "here is how to parse JSON" the same as
+"never do X in this codebase" and "decision: use async everywhere." These have
+fundamentally different roles in a context pack: procedures belong near the task,
+constraints belong as warnings, policies belong as architectural context.
+
+**Implementation:**
+
+**`cortex/src/model.rs`** — add enum and field:
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MemoryKind {
+    Procedure,   // how-to: patterns
+    Constraint,  // don't-do: anti_patterns
+    Policy,      // architectural decision: ADRs
+    Fact,        // general annotation
+}
+```
+
+**`cortex/src/memory.rs`** — add:
+```sql
+ALTER TABLE patterns ADD COLUMN kind TEXT NOT NULL DEFAULT 'procedure';
+```
+
+**`cortex/src/planner.rs: render_packet`** — when assembling the context pack, load
+patterns in kind-order:
+1. `kind = 'constraint'` items rendered in a `## Constraints (don't do)` section
+2. `kind = 'procedure'` items rendered in a `## Patterns (how-to)` section
+3. `kind = 'policy'` items rendered in a `## Architectural policies` section
+
+This restructuring of the rendered pack requires no new tables, only a `GROUP BY kind`
+in the context assembly query and separate rendering sections.
+
+---
+
+### Priority 11 — Two-axis authority score
+
+**Source:** Memoripy `retrieval.py:rank_records()`, exact formula verified:
+`trust_score * 0.7 + durability_score * 0.3`
+
+**Problem:** The single `credibility` float on patterns blends "how often was this
+seen" with "how reliable is this" without distinction. A manually-promoted pattern from
+`prefs.toml` should always rank above an auto-crystallized one, regardless of usage
+count.
+
+**Implementation:**
+
+**`cortex/src/recall_match.rs`** — add a `authority_score` function:
+```rust
+/// Trust levels (maps to how a pattern was established):
+/// manually promoted: 1.0, LLM-crystallized (≥3 sessions): 0.65,
+/// LLM-crystallized (1 session): 0.4, auto-detected candidate: 0.25
+///
+/// Durability maps to survival_rate: [0.0, 1.0]
+pub fn authority_score(trust_level: f32, survival_rate: f32) -> f32 {
+    trust_level * 0.7 + survival_rate * 0.3
+}
+```
+
+Map existing `credibility` to `trust_level` for patterns: if
+`credibility >= 0.8` → `trust=1.0` (manually confirmed); else compute from session
+origin count.
+
+Expose `trust_level TEXT` as a column added to `patterns` via ALTER TABLE:
+`'authoritative'`, `'crystallized'`, `'candidate'`. Default `'crystallized'` for
+existing rows.
+
+Use `authority_score(trust, survival_rate)` as the primary sort key in
+`build_context_packet` for pattern selection, before semantic score.
+
+---
+
+### Priority 12 — Bi-temporal `valid_at` / `invalid_at` on `graph_edges`
+
+**Source:** Graphiti/Zep (`graphiti_core/edges.py` lines 263–298), also aligned
+with rta-smriti-brain supersession model (Priority 4)
+
+**Problem:** `graph_edges` has no temporal validity. "AuthModule depends on
+LegacyUserStore" stays in the graph forever after a refactor. There is no way to
+record that a relationship stopped being true at a point in time.
+
+**Implementation:**
+
+**`cortex/src/memory.rs`** — add via ALTER TABLE:
+```sql
+ALTER TABLE graph_edges ADD COLUMN valid_at   REAL;   -- Unix timestamp when true
+ALTER TABLE graph_edges ADD COLUMN invalid_at REAL;   -- NULL = currently true
+CREATE INDEX IF NOT EXISTS idx_ge_current ON graph_edges(source_id)
+    WHERE invalid_at IS NULL;
+```
+
+**`cortex/src/model.rs`** — add `valid_at: Option<f64>`, `invalid_at: Option<f64>`
+to `GraphEdge`.
+
+When a graph edge is superseded (e.g., a dependency is removed during reindex), set
+`invalid_at = unixepoch()` rather than deleting the row. The partial index ensures
+all current-fact queries (`WHERE invalid_at IS NULL`) remain fast.
+
+All queries in `planner.rs` and `mcp/tools.rs` that read `graph_edges` add
+`AND invalid_at IS NULL` to the WHERE clause. Historical queries can omit that filter.
+
+---
+
+### Priority 13 — `pattern_history` audit table
+
+**Source:** mem0 `history` table (`mem0/memory/storage.py`, exact schema verified)
+
+**Problem:** There is no record of how a pattern changed over time. When `crystallizer.rs`
+promotes or modifies a pattern, the previous version is silently overwritten. Combined
+with Priority 4 (supersession) and Priority 8 (hash dedup), a full provenance chain
+becomes possible with this table.
+
+**Implementation:**
+
+**`cortex/src/memory.rs`** — add:
+```sql
+CREATE TABLE IF NOT EXISTS pattern_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_id  INTEGER NOT NULL,
+    event       TEXT NOT NULL,         -- 'ADD', 'UPDATE', 'SUPERSEDE', 'DELETE'
+    old_value   TEXT,                  -- previous body, NULL on ADD
+    new_value   TEXT,                  -- new body, NULL on DELETE
+    actor_id    TEXT,                  -- 'crystallizer', 'agent', 'operator'
+    session_id  TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ph_pattern ON pattern_history(pattern_id, created_at DESC);
+```
+
+**`cortex/src/crystallizer.rs`** — insert a `pattern_history` row on every pattern
+CREATE, UPDATE, and SUPERSEDE operation (add `actor_id = 'crystallizer'`).
+
+**MCP tools** — extend `suggest_pattern` to insert `actor_id = 'agent'` rows when the
+agent authors a pattern.
+
+---
+
+### Priority 14 — Named context blocks + `ContextWindowOverview`
+
+**Source:** Letta/MemGPT (`letta/schemas/memory.py`, char-limited `Block` type verified)
+
+**Problem:** `render_packet()` produces a single unstructured blob. The LLM has no
+visibility into which section is taking up how many tokens, and cannot self-regulate
+its retrieval requests based on budget.
+
+**Implementation:**
+
+**`cortex/src/planner.rs: render_packet`** — restructure the output into named,
+char-limited sections:
+
+```
+## [persona]
+<role content>
+
+## [checkpoint]           ← from Priority 4b
+<current objective / prohibited_repetition>
+
+## [patterns]             ← procedure-kind patterns
+<content, up to budget_patterns tokens>
+
+## [constraints]          ← constraint-kind patterns + anti_patterns
+<content, up to budget_constraints tokens>
+
+## [policies]             ← ADRs + policy-kind patterns
+<content, up to budget_policies tokens>
+
+## UNTRUSTED EVIDENCE BOUNDARY  ← from Priority 2
+## [context]              ← code_units + annotations
+<content, remainder of budget>
+```
+
+Add a `ContextWindowOverview` struct to `model.rs`:
+```rust
+pub struct ContextWindowOverview {
+    pub total_budget:   usize,
+    pub used_persona:   usize,
+    pub used_checkpoint: usize,
+    pub used_patterns:  usize,
+    pub used_constraints: usize,
+    pub used_policies:  usize,
+    pub used_context:   usize,
+    pub truncated:      bool,
+}
+```
+
+Return this as a JSON metadata object alongside the rendered pack in `get_context`
+tool output. The LLM can inspect it and decide whether to call `expand_memory` for
+specific handles instead of requesting another full context pack.
+
+---
+
+### Priority 15 — Three-axis recall scoring
+
+**Source:** Self-RAG (`run_short_form.py` scoring formula verified), weights from
+paper (w_rel=1.0, w_sup=1.0, w_use=0.5)
+
+**Problem:** `recall` ranks results by a single cosine/TF-IDF similarity score.
+This cannot distinguish: (a) does this result reference something in the current code?
+(b) is this result highly credible, or just coincidentally similar? The result set
+includes relevant-but-unreliable and irrelevant-but-coincidentally-matching items.
+
+**Implementation:**
+
+**`cortex/src/recall_match.rs`** — add a `three_axis_score` function:
+```rust
+/// relevance: existing cosine similarity (0–1)
+/// grounding: does the pattern reference a type/function name from the current hint?
+///            computed as: number of hint tokens that appear in pattern.body / hint_tokens.len()
+/// utility: authority_score(trust_level, survival_rate)  (from Priority 11)
+pub fn three_axis_score(relevance: f32, grounding: f32, utility: f32) -> f32 {
+    // Adapted from Self-RAG weights: w_rel=1.0, w_sup=1.0, w_use=0.5
+    const W_REL: f32 = 1.0;
+    const W_GRD: f32 = 1.0;
+    const W_UTL: f32 = 0.5;
+    (W_REL * relevance + W_GRD * grounding + W_UTL * utility) / (W_REL + W_GRD + W_UTL)
+}
+```
+
+`grounding` is computed by tokenizing the current hint query and counting how many of
+those tokens appear in `pattern.body`. This is a string intersection — no embedding
+needed.
+
+**`cortex/src/planner.rs: build_context_packet`** — use `three_axis_score` instead of
+raw cosine as the sort key for pattern/annotation selection.
+
+---
+
+### Priority 16 — tree-sitter `tags` crate in quartz-ctx
+
+**Source:** tree-sitter `crates/tags` (`crates/tags/src/tags.rs`, `Tag` struct verified)
+
+**Problem:** quartz-ctx currently uses custom tree-sitter node queries per language.
+For non-Rust files, zero doc comments are extracted — every Python/Go/JS/TS function
+in `code_units` has no documentation context for the LLM.
+
+**Implementation:**
+
+**`quartz-ctx/Cargo.toml`** — add:
+```toml
+tree-sitter-tags = "0.23"
+# Plus per-language grammar crates you want to support:
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+```
+
+**`quartz-ctx/src/lang.rs`** — replace the custom query path for non-Rust languages
+with `TagsContext::generate_tags(config, source_bytes, &AtomicBool::new(false))`.
+Map the output `Tag` struct to `ApiItem`:
+
+| `Tag` field | `ApiItem` field |
+|---|---|
+| `name_range` | `name` (slice into source) |
+| `syntax_type_id` → "function"/"method"/"class" | `kind` |
+| `span` | `SourceSpan { start_row, start_col, end_row, end_col }` |
+| `docs` | new `doc_comment: Option<String>` field on `ApiItem` |
+| `is_definition` | filter: skip references (`is_definition == false`) |
+
+Add `pub doc_comment: Option<String>` to `ApiItem` in `quartz-ctx/src/model.rs`.
+
+**`cortex/src/memory.rs`** — add `doc_comment TEXT` column to `code_units`. Populated
+by `reindex` from the `ApiItem.doc_comment` field. Included in `code_unit_fts` virtual
+table (Priority 3) so doc comments are BM25-searchable alongside names/summaries.
+
+---
+
+### Priority 17 — LLMLingua-2 optional context pack compression
+
+**Source:** Microsoft LLMLingua-2 (`llmlingua/prompt_compressor.py`, API verified)
+
+**Problem:** Every `get_context` call returns the full assembled context pack. At
+`render_packet` max sizes, this is several thousand tokens injected per call. Token
+cost compounds across every session.
+
+**Implementation:**
+
+This is an **optional** sidecar — it does not affect the lossless `cache.rs` gzip path.
+The sidecar runs independently; if unavailable, `render_packet` returns the uncompressed
+pack unchanged.
+
+**Sidecar** (`tools/llmlingua_sidecar.py`):
+```python
+from fastapi import FastAPI
+from llmlingua import PromptCompressor
+
+app = FastAPI()
+llm_lingua = PromptCompressor(
+    model_name="microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
+    use_llmlingua2=True,
+)
+
+@app.post("/compress")
+def compress(body: dict):
+    result = llm_lingua.compress_prompt(
+        context=[body["text"]],
+        rate=body.get("rate", 0.5),
+        force_tokens=body.get("force_tokens",
+            ["[CORTEX-", "[/CORTEX-", "===", "##", "UNTRUSTED"]),
+    )
+    return {"compressed": result["compressed_prompt"],
+            "ratio": result["ratio"]}
+```
+
+**`cortex/src/planner.rs`** — add an optional `compress_context: bool` prefs flag.
+When true, after `render_packet` assembles the pack:
+```rust
+if prefs.compress_context {
+    if let Ok(compressed) = call_llmlingua_sidecar(&assembled_pack, 0.5) {
+        return compressed;
+    }
+    // sidecar unavailable: return uncompressed silently
+}
+```
+
+`call_llmlingua_sidecar` is a simple HTTP POST to `http://127.0.0.1:9871/compress`.
+The sidecar is started by the user separately (`uvicorn tools.llmlingua_sidecar:app
+--port 9871`), not by cortex itself. Document this in the README.
+
+The `force_tokens` list ensures all `[CORTEX-*]` knowledge marker tag boundaries,
+section headers (`##`), and the UNTRUSTED EVIDENCE BOUNDARY string are never
+truncated.
+
+---
 
 ---
 
 ## Implementation order recommendation
 
-Run these in order within a single session to avoid schema conflicts:
+Run these in order to avoid schema conflicts and build on each prior step:
 
-1. **5a (`PRAGMA user_version` + migration safety)** — foundational; all subsequent migrations use this.
-2. **5f (PRAGMA tuning)** — two-line change, immediate I/O benefit.
-3. **2 (UNTRUSTED EVIDENCE BOUNDARY)** — trivial addition, security improvement.
-4. **4 (supersession tracking)** — schema-only, no logic change yet.
-5. **4b (session checkpoints)** — schema + two MCP tools; high value, self-contained.
-6. **1 (epistemic tier)** — the biggest quality-of-life win; do after schema is stable.
-7. **5b + 5c (scaling: paginated units, bounded telemetry)** — do together.
-8. **3 (FTS5 + hybrid search + binary-search truncation)** — depends on 5b being done first.
-9. **4c (reflect/dedup)** — runs in the consolidation pipeline; add after FTS is in place.
-10. **5d (binary term vectors)** — do after FTS5 is the primary search path.
-11. **5e (content store GC)** — clean-up pass, add to end of reindex.
-12. **6 (visibility)** — additive, safe any time.
-13. **7 (staged retrieval)** — additive MCP tools, safe any time.
+**Phase 1 — Foundation (no logic changes, immediate wins):**
+1. **5a** (`PRAGMA user_version` + migration safety) — foundational; all subsequent migrations use this.
+2. **5f** (PRAGMA tuning) — two-line change, immediate I/O benefit.
+3. **2** (UNTRUSTED EVIDENCE BOUNDARY) — trivial addition, security improvement.
+4. **8** (MD5 hash dedup) — additive `hash` columns, immediate duplicate prevention.
+5. **9** (usage counter split) — additive columns, immediate signal improvement.
+
+**Phase 2 — Schema enrichment (additive columns, no query-path changes):**
+6. **4** (supersession tracking on patterns/annotations)
+7. **10** (`kind` column on patterns)
+8. **11** (trust_level column for authority scoring)
+9. **12** (bi-temporal `valid_at`/`invalid_at` on `graph_edges`)
+10. **13** (`pattern_history` audit table — new table, no breaking changes)
+
+**Phase 3 — Context pack quality (logic changes in planner/recall, no schema):**
+11. **4b** (session checkpoints — schema + two MCP tools; high value, self-contained)
+12. **11** authority score in `recall_match.rs` (after trust_level column from step 8)
+13. **15** (three-axis recall scoring — after trust_level and kind columns are in)
+14. **14** (named context blocks + ContextWindowOverview — after checkpoint and kind)
+15. **1** (epistemic tier — the biggest quality-of-life win; do after schema is stable)
+
+**Phase 4 — Search quality (FTS + hybrid):**
+16. **5b** + **5c** (paginated units, bounded telemetry) — do together before FTS
+17. **3** (FTS5 + hybrid search + binary-search truncation — depends on 5b)
+18. **4c** (reflect/dedup — runs in consolidation pipeline; add after FTS is in place)
+
+**Phase 5 — Performance:**
+19. **5d** (binary term vectors — after FTS5 is the primary search path)
+20. **5e** (content store GC — clean-up pass, add to end of reindex)
+
+**Phase 6 — Ecosystem upgrades:**
+21. **16** (tree-sitter `tags` crate in quartz-ctx — isolated, does not touch cortex)
+22. **17** (LLMLingua-2 optional sidecar — opt-in flag, zero risk to existing path)
+
+**Phase 7 — Additive tools (safe any time, do last to avoid noise):**
+23. **6** (visibility field)
+24. **7** (staged retrieval: `list_memory_handles` + `expand_memory`)
 
 ---
 
-*Last updated: 2026-09-08. Based on two-pass analysis of `sulabhdubey/rta-smriti-brain` v1.1.0-alpha.3
-(schema v12, `rta_brain/db.py`, `rta_brain/context.py`, `rta_brain/temporal.py`, `docs/ARCHITECTURE.md`).*
+*Last updated: 2026-09-09. Sources: two-pass analysis of `sulabhdubey/rta-smriti-brain` v1.1.0-alpha.3
+(schema v12) + broad ecosystem survey of 15+ systems. Full ecosystem technical detail in `docs/RESEARCH_LANDSCAPE.md`.*
