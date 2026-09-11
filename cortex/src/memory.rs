@@ -10,7 +10,7 @@
 ///   pending_observations — file changes waiting for Syn's review
 ///   content_store        — content-addressed gzip blob store (cache layer)
 ///   response_cache       — tool response cache keyed by (tool+args+index_version)
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -72,6 +72,17 @@ impl Store {
         let conn = Connection::open(db_path)
             .with_context(|| format!("could not open db: {}", db_path.display()))?;
         let store = Self { conn };
+        if !is_new && store.has_user_tables()? {
+            if let Some(backup_path) = Self::ensure_old_version_backup(db_path)? {
+                eprintln!(
+                    "[cortex] old-version pre-migration backup created: {}",
+                    backup_path.display()
+                );
+                eprintln!(
+                    "[cortex] If corruption is detected after migration, this old-version backup can help repair or restore the database."
+                );
+            }
+        }
         store.migrate()?;
         if is_new {
             store.first_run_init(db_path)?;
@@ -232,6 +243,71 @@ impl Store {
     /// Expose the connection for cache operations.
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    fn has_user_tables(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Create one backup copy of the pre-migration database state for safety.
+    ///
+    /// The backup is written under `old-version-backups/` and includes
+    /// `old-version-pre-migration` in its name so it cannot be confused with a
+    /// current-state backup.
+    fn ensure_old_version_backup(db_path: &Path) -> Result<Option<PathBuf>> {
+        let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = db_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("memory.db");
+
+        let backup_dir = parent.join("old-version-backups");
+        std::fs::create_dir_all(&backup_dir)?;
+
+        let marker_path = backup_dir.join(format!(
+            "{file_name}.old-version-pre-migration.marker"
+        ));
+        if marker_path.exists() {
+            return Ok(None);
+        }
+
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
+        let backup_file_name = format!(
+            "{file_name}.old-version-pre-migration.{stamp}.sqlite3.bak"
+        );
+        let backup_path = backup_dir.join(backup_file_name);
+
+        std::fs::copy(db_path, &backup_path).with_context(|| {
+            format!(
+                "failed to create old-version pre-migration backup: {} -> {}",
+                db_path.display(),
+                backup_path.display()
+            )
+        })?;
+
+        let notice_path = backup_dir.join(format!(
+            "{file_name}.old-version-pre-migration.README.txt"
+        ));
+        let notice = format!(
+            "This folder stores OLD VERSION pre-migration backups.\n\nDatabase: {}\nBackup: {}\n\nDo not treat these files as current-state backups.\nIf migration corruption is detected, use this old-version backup to help repair or restore data.\n",
+            db_path.display(),
+            backup_path.display(),
+        );
+        std::fs::write(&notice_path, notice)?;
+
+        let marker = format!(
+            "old-version-pre-migration-backup={}\ncreated_at={}\n",
+            backup_path.display(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        std::fs::write(&marker_path, marker)?;
+
+        Ok(Some(backup_path))
     }
 
     fn migrate(&self) -> Result<()> {
@@ -2488,19 +2564,21 @@ pub fn command_family(command: &str) -> String {
     // ── FTS5 hybrid search for code units ─────────────────────────────────────
 
     /// BM25 keyword search over `code_unit_fts`.
-    /// Returns (rowid, bm25_rank) pairs ordered by relevance.
-    pub fn fts_code_units(&self, query: &str, limit: usize) -> Result<Vec<(i64, f64)>> {
+    /// Returns (unit_id, bm25_rank) pairs ordered by relevance.
+    pub fn fts_code_units(&self, query: &str, limit: usize) -> Result<Vec<(String, f64)>> {
         let safe_q = sanitize_fts_query(query);
         if safe_q.is_empty() {
             return Ok(vec![]);
         }
         let mut stmt = self.conn.prepare(
-            "SELECT rowid, rank FROM code_unit_fts
-             WHERE code_unit_fts MATCH ?1
-             ORDER BY rank LIMIT ?2"
+            "SELECT cu.id, f.rank
+             FROM code_unit_fts f
+             JOIN code_units cu ON cu.rowid = f.rowid
+             WHERE f.code_unit_fts MATCH ?1
+             ORDER BY f.rank LIMIT ?2"
         )?;
         let rows = stmt.query_map(params![safe_q, limit as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -2686,6 +2764,7 @@ fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
 mod prune_tests {
     use super::*;
     use crate::model::CodeUnit;
+    use crate::test_support::TempDir;
 
     /// A store of its own, removed when the test ends -- see test_support.
     fn store(name: &str) -> crate::test_support::TempStore {
@@ -2746,5 +2825,62 @@ mod prune_tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0], (Some("quartz/src".to_string()), 2));
         assert_eq!(groups[1], (None, 1));
+    }
+
+    #[test]
+    fn open_creates_old_version_pre_migration_backup_once() {
+        let temp = TempDir::new("old_version_backup_once").unwrap();
+        let db_path = temp.join("memory.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("CREATE TABLE legacy_data (id INTEGER PRIMARY KEY)", [])
+                .unwrap();
+        }
+
+        Store::open(&db_path).unwrap();
+        Store::open(&db_path).unwrap();
+
+        let backup_dir = temp.join("old-version-backups");
+        assert!(backup_dir.exists(), "backup directory should exist for old-version backup");
+
+        let mut backup_files = Vec::new();
+        for entry in std::fs::read_dir(&backup_dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name.contains("old-version-pre-migration") && name.ends_with(".sqlite3.bak") {
+                backup_files.push(path);
+            }
+        }
+        assert_eq!(backup_files.len(), 1, "only one old-version backup should be created");
+
+        let marker_path = backup_dir.join("memory.db.old-version-pre-migration.marker");
+        assert!(marker_path.exists(), "backup marker should prevent duplicate backups");
+
+        let notice_path = backup_dir.join("memory.db.old-version-pre-migration.README.txt");
+        assert!(notice_path.exists(), "recovery hint file should be present");
+        let notice = std::fs::read_to_string(notice_path).unwrap();
+        assert!(
+            notice.contains("If migration corruption is detected"),
+            "recovery hint should mention corruption-repair use"
+        );
+        assert!(
+            notice.contains("Do not treat these files as current-state backups"),
+            "notice should mark backup as old-version only"
+        );
+    }
+
+    #[test]
+    fn open_does_not_create_old_version_backup_for_brand_new_db() {
+        let temp = TempDir::new("new_db_no_old_backup").unwrap();
+        let db_path = temp.join("memory.db");
+
+        Store::open(&db_path).unwrap();
+
+        let backup_dir = temp.join("old-version-backups");
+        assert!(
+            !backup_dir.exists(),
+            "brand-new DB creation should not emit old-version pre-migration backup"
+        );
     }
 }
