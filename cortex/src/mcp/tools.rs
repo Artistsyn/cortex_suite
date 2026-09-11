@@ -10,7 +10,7 @@ use crate::graph;
 use crate::memory::Store;
 use crate::model::{CodeUnit, PendingObservation};
 use crate::planner::{build_context_packet, render_packet};
-use crate::search::{keyword_search, semantic_search};
+use crate::search::{hybrid_search, keyword_search};
 
 pub fn dispatch(
     tool: &str,
@@ -314,7 +314,7 @@ fn tool_semantic_search(
     let query = args["query"].as_str().ok_or("missing `query`")?;
     let limit = args["limit"].as_u64().unwrap_or(5) as usize;
 
-    let results = semantic_search(query, units, limit);
+    let results = hybrid_search(store, query, units, limit);
     let keyword = keyword_search(query, units);
 
     if results.is_empty() && keyword.is_empty() {
@@ -2465,6 +2465,8 @@ fn tool_expand_memory(args: &Value, store: &Store) -> Result<String, String> {
 mod tests {
     use super::{classify_risk, count_methods, parse_relation_filter, resolve_candidates,
                 tool_get_anti_patterns};
+    use crate::cache::SessionRegistry;
+    use crate::compressor::build_term_vector_str;
     use crate::model::CodeUnit;
     use crate::reasoner::simulator::RiskLevel;
     use crate::memory::Store;
@@ -2485,6 +2487,25 @@ mod tests {
             summary: String::new(),
             term_vector: vec![],
             compressed,
+            indexed_at: chrono::Utc::now(),
+        }
+    }
+
+    fn unit_with_terms(
+        id: &str,
+        name: &str,
+        compressed: &str,
+        term_vector: Vec<(String, f32)>,
+    ) -> CodeUnit {
+        let module_path = id.rsplit_once("::").map(|(m, _)| m).unwrap_or("").to_string();
+        CodeUnit {
+            id: id.to_string(),
+            kind: "struct".into(),
+            name: name.into(),
+            module_path,
+            summary: String::new(),
+            term_vector,
+            compressed: compressed.to_string(),
             indexed_at: chrono::Utc::now(),
         }
     }
@@ -2553,6 +2574,46 @@ mod tests {
         assert_eq!(count_methods("[struct: T]\nmethods: a | b | c\n"), 3);
         assert_eq!(count_methods("[struct: T]\n"), 0);
         assert_eq!(count_methods("[struct: T]\nmethods: a |  | b\n"), 2);
+    }
+
+    #[test]
+    fn semantic_search_tool_uses_hybrid_ranking() {
+        let store = crate::test_support::TempStore::new("tool_semantic_hybrid").unwrap();
+        let query = "spawn plugin";
+
+        let lexical_only = unit_with_terms(
+            "test::lexical_only",
+            "lexical_only",
+            "fn lexical_only() { // spawn plugin }",
+            build_term_vector_str(query),
+        );
+        let semantic_only = unit_with_terms(
+            "test::semantic_only",
+            "semantic_only",
+            "fn semantic_only() {}",
+            build_term_vector_str(query),
+        );
+
+        store.upsert_unit(&lexical_only).unwrap();
+        store.upsert_unit(&semantic_only).unwrap();
+        store.rebuild_fts().unwrap();
+
+        let units = vec![lexical_only, semantic_only];
+        let sessions = SessionRegistry::new();
+        let out = super::tool_semantic_search(
+            &json!({"query": query, "limit": 5}),
+            &store,
+            &units,
+            &sessions,
+            "session-1",
+        ).unwrap();
+
+        let lexical_pos = out.find("### `lexical_only`").unwrap_or(usize::MAX);
+        let semantic_pos = out.find("### `semantic_only`").unwrap_or(usize::MAX);
+        assert!(
+            lexical_pos < semantic_pos,
+            "hybrid weighting should rank lexical-only match ahead of semantic-only match"
+        );
     }
 
     fn ap_store(name: &str) -> Store {

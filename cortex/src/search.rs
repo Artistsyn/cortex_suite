@@ -45,45 +45,29 @@ pub fn hybrid_search<'a>(
     units: &'a [CodeUnit],
     limit: usize,
 ) -> Vec<SearchResult<'a>> {
-    // Build a rowid → rank map from BM25 keyword search.
+    // Build a unit-id -> rank map from BM25 keyword search.
     let fts_hits = store.fts_code_units(query, limit * 4).unwrap_or_default();
-    let mut lexical_rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for (i, (rowid, _bm25)) in fts_hits.iter().enumerate() {
-        // code_units rowid is not the same as the id string; we need to match on name via a lookup.
-        // We store rowid as a string key so we can match units by their sequential rowid index.
-        lexical_rank.insert(rowid.to_string(), i);
-    }
-
-    let query_vec = build_term_vector_str(query);
-
-    // Build a name → lexical rank map using units index position as a proxy for rowid.
-    // In SQLite, rowid for a WITHOUT ROWID-less table is insertion order 1-based.
-    // We match by name since that is stable and indexed.
-    let fts_ids: std::collections::HashMap<i64, usize> = fts_hits
+    let lexical_rank: std::collections::HashMap<&str, usize> = fts_hits
         .iter()
         .enumerate()
-        .map(|(rank, (rowid, _))| (*rowid, rank))
+        .map(|(rank, (unit_id, _))| (unit_id.as_str(), rank))
         .collect();
+
+    let query_vec = build_term_vector_str(query);
 
     let mut scored: Vec<SearchResult> = units
         .iter()
         .map(|u| {
             let cosine = cosine_similarity(&query_vec, &u.term_vector);
-            // Best-effort: match FTS rowid via unit numeric index (1-based).
-            // If the unit has no FTS hit, treat lexical_rank as very large.
-            let lex_rank = fts_ids.get(&0).copied().unwrap_or(usize::MAX);
-            // Try to find the rank by scanning fts_ids for this unit's name match.
-            let lex_rank = {
-                let name_lower = u.name.to_lowercase();
-                let _ = &name_lower; // suppress unused warning
-                lex_rank
-            };
-            let lex_weight = if lex_rank == usize::MAX {
-                0.0_f32
+            let lex_rank = lexical_rank.get(u.id.as_str()).copied().unwrap_or(usize::MAX);
+            let score = if lex_rank == usize::MAX {
+                // No lexical evidence: keep pure semantic behavior instead of
+                // suppressing match confidence by a constant factor.
+                cosine
             } else {
-                1.0 / (1.0 + lex_rank as f32)
+                let lex_weight = 1.0 / (1.0 + lex_rank as f32);
+                0.55 * lex_weight + 0.45 * cosine
             };
-            let score = 0.55 * lex_weight + 0.45 * cosine;
             SearchResult { unit: u, score }
         })
         .filter(|r| r.score > 0.0)
@@ -108,4 +92,120 @@ pub fn keyword_search<'a>(
                 || u.compressed.to_lowercase().contains(&q)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_term_vector_str, hybrid_search};
+    use crate::model::CodeUnit;
+    use crate::test_support::TempStore;
+
+    fn unit(
+        id: &str,
+        name: &str,
+        summary: &str,
+        compressed: &str,
+        term_vector: Vec<(String, f32)>,
+    ) -> CodeUnit {
+        CodeUnit {
+            id: id.to_string(),
+            kind: "fn".to_string(),
+            name: name.to_string(),
+            module_path: "test::mod".to_string(),
+            summary: summary.to_string(),
+            compressed: compressed.to_string(),
+            term_vector,
+            indexed_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn hybrid_search_uses_lexical_rank_when_cosine_is_zero() {
+        let store = TempStore::new("hybrid_lexical_only").unwrap();
+
+        let lexical_hit = unit(
+            "test::alpha_hit",
+            "alpha_hit",
+            "contains alpha token",
+            "fn alpha_hit() { let alpha = 1; }",
+            vec![],
+        );
+        let no_hit = unit(
+            "test::no_hit",
+            "no_hit",
+            "no alpha token",
+            "fn no_hit() { let beta = 2; }",
+            vec![],
+        );
+
+        store.upsert_unit(&lexical_hit).unwrap();
+        store.upsert_unit(&no_hit).unwrap();
+        store.rebuild_fts().unwrap();
+
+        let units = vec![lexical_hit.clone(), no_hit.clone()];
+        let results = hybrid_search(&store, "alpha", &units, 5);
+
+        assert!(!results.is_empty(), "lexical hit should surface even with zero cosine");
+        assert_eq!(results[0].unit.id, lexical_hit.id);
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn hybrid_search_blends_lexical_and_semantic_signals() {
+        let store = TempStore::new("hybrid_blend").unwrap();
+        let query = "spawn plugin";
+
+        let lexical_only = unit(
+            "test::lexical_only",
+            "lexical_only",
+            "contains query text for lexical match",
+            "fn lexical_only() { // spawn plugin }",
+            build_term_vector_str(query),
+        );
+        let semantic_only = unit(
+            "test::semantic_only",
+            "semantic_only",
+            "semantic vector only",
+            "fn semantic_only() { }",
+            build_term_vector_str(query),
+        );
+
+        store.upsert_unit(&lexical_only).unwrap();
+        store.upsert_unit(&semantic_only).unwrap();
+        store.rebuild_fts().unwrap();
+
+        let units = vec![lexical_only.clone(), semantic_only.clone()];
+        let results = hybrid_search(&store, query, &units, 5);
+
+        assert_eq!(results.len(), 2, "both lexical and semantic candidates should appear");
+        assert_eq!(results[0].unit.id, lexical_only.id);
+        assert!(results.iter().any(|r| r.unit.id == semantic_only.id));
+    }
+
+    #[test]
+    fn hybrid_search_preserves_semantic_score_without_lexical_hits() {
+        let store = TempStore::new("hybrid_semantic_only").unwrap();
+        let query = "Action::SetCollisionLayer";
+
+        let semantic_only = unit(
+            "test::semantic_only",
+            "semantic_only",
+            "semantic vector match only",
+            "fn semantic_only() {}",
+            build_term_vector_str(query),
+        );
+
+        store.upsert_unit(&semantic_only).unwrap();
+        store.rebuild_fts().unwrap();
+
+        let units = vec![semantic_only.clone()];
+        let results = hybrid_search(&store, query, &units, 5);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].unit.id, semantic_only.id);
+        assert!(
+            results[0].score > 0.9,
+            "semantic-only matches should retain high confidence when no lexical hit exists"
+        );
+    }
 }
