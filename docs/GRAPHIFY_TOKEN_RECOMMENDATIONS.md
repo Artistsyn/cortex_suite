@@ -20,9 +20,9 @@ Do **not** switch cortex to graphify's newer default output directory such as `g
 
 Cortex currently hardcodes the in-repo graph contract in:
 
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/closeout.rs`
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/consolidator2.rs`
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/main.rs`
+- `cortex/src/closeout.rs`
+- `cortex/src/consolidator2.rs`
+- `cortex/src/main.rs`
 
 Keeping the explicit `--output .graphify-output` contract preserves existing drift-analysis behavior and avoids silent breakage.
 
@@ -36,10 +36,10 @@ Re-check whether `--update` is still valid on the current `graphify-rs` release.
 
 If upstream has removed `--update`, update cortex_suite's rebuild command accordingly in:
 
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/closeout.rs`
-- `/home/runner/work/cortex_suite/cortex_suite/docs/GRAPHIFY.md`
-- `/home/runner/work/cortex_suite/cortex_suite/README.md`
-- `/home/runner/work/cortex_suite/cortex_suite/SETUP_HANDOFF.md`
+- `cortex/src/closeout.rs`
+- `docs/GRAPHIFY.md`
+- `README.md`
+- `SETUP_HANDOFF.md`
 
 ### Likely target command shape
 
@@ -57,9 +57,9 @@ The implementing agent should update the repository's graphify guidance only aft
 
 ### Doc areas to refresh
 
-- `/home/runner/work/cortex_suite/cortex_suite/docs/GRAPHIFY.md`
-- `/home/runner/work/cortex_suite/cortex_suite/README.md`
-- `/home/runner/work/cortex_suite/cortex_suite/SETUP_HANDOFF.md`
+- `docs/GRAPHIFY.md`
+- `README.md`
+- `SETUP_HANDOFF.md`
 
 ### What to refresh
 
@@ -90,7 +90,7 @@ Extend cortex's existing session-aware content reuse instead of replacing it.
 
 Relevant current code:
 
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/cache.rs`
+- `cortex/src/cache.rs`
 
 Target outcome:
 
@@ -103,7 +103,7 @@ Adapt this for large tool outputs, but keep it **lossless-by-default**.
 
 Relevant current code:
 
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/output_filter.rs`
+- `cortex/src/output_filter.rs`
 
 Target outcome:
 
@@ -117,8 +117,8 @@ Add reporting that identifies instructions or generated text that frequently inv
 
 Relevant likely touchpoints:
 
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/main.rs`
-- `/home/runner/work/cortex_suite/cortex_suite/cortex/src/model.rs`
+- `cortex/src/main.rs`
+- `cortex/src/model.rs`
 
 Target outcome:
 
