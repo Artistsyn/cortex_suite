@@ -4229,7 +4229,12 @@ fn run_cluster_sessions(threshold: f32, output: Option<&Path>, db_path: &Path) -
     let snapshots = miner::load_snapshots(&mined_tasks_dir)?;
     if snapshots.is_empty() {
         println!("[cortex] No session snapshots found in {}.", mined_tasks_dir.display());
-        println!("         Run closeout_session (or {}) to generate snapshots.", crate::cache::launcher_command("post-session"));
+        // post-session is a composite of the PowerShell launcher only.
+        if cfg!(windows) {
+            println!("         Run closeout_session (or {}) to generate snapshots.", crate::cache::launcher_command("post-session"));
+        } else {
+            println!("         Run closeout_session to generate snapshots.");
+        }
         return Ok(());
     }
 
@@ -4551,7 +4556,12 @@ fn run_health_report(db_path: &Path) -> Result<()> {
     println!("  unclosed sessions: {} (that did work)", orphans);
     println!("  hot gaps (7d):     {}", gaps);
 
-    if low_survival > 0 { println!("  ! {} low-survival patterns — run: {}", low_survival, crate::cache::launcher_command("quality-check")); }
+    if low_survival > 0 {
+        // quality-check exists only in the PowerShell launcher; `pattern health`
+        // is the binary's own survival audit.
+        let audit = if cfg!(windows) { "quality-check" } else { "pattern health" };
+        println!("  ! {} low-survival patterns — run: {}", low_survival, crate::cache::launcher_command(audit));
+    }
     if orphans > 0       { println!("  ! {} unclosed session(s) with work in them — run: cortex session-orphans", orphans); }
     if pending_proposals > 0 { println!("  ! {} proposals pending — run: {}", pending_proposals, crate::cache::launcher_command("review-proposals")); }
     if gaps > 0          { println!("  ! {} hot query gaps — run: {}", gaps, crate::cache::launcher_command("propose-gaps")); }
