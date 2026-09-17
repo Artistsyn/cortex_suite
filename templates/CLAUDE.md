@@ -46,6 +46,10 @@ it is never stale.
 - `recall(topic)` / `semantic_search(query)` — have we solved this before?
 - `get_context(hint)` — one compact packet of the above
 - `query_graph` / `simulate_change` — relationships and blast radius
+- `set_checkpoint(objective, ...)` / `get_checkpoint(scope)` — save and resume
+  where a long task stands across compaction; `scope="any"` after a restart
+- `list_memory_handles` / `expand_memory(id)` — every pattern as one line, then
+  only the bodies you need
 
 **Decision rule:**
 - What the code *is* → **quartz-ctx**
@@ -154,6 +158,10 @@ Embed markers in your responses as you discover things:
 [CORTEX-ADR: title="..." tags="..."]Context: ... Decision: ...[/CORTEX-ADR]
 [CORTEX-PREFS-NOTE: tags="..."]note[/CORTEX-PREFS-NOTE]
 ```
+
+A pattern takes an optional `kind="constraint|policy|fact"` (default
+`procedure`). Constraints and policies are served in their own sections ahead
+of ordinary patterns in `get_context`.
 
 When a task is **verifiably** complete (build passes, tests pass), end with:
 

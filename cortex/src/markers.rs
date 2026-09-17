@@ -2,7 +2,7 @@
 ///
 /// Parses structured XML-like tags that agents embed in their responses:
 ///
-///   [CORTEX-PATTERN: name="..." intent="..." trust="verified" uses="..."]
+///   [CORTEX-PATTERN: name="..." intent="..." trust="verified" uses="..." kind="constraint"]
 ///   body text
 ///   [/CORTEX-PATTERN]
 ///
@@ -35,6 +35,9 @@ pub enum KnowledgeMarker {
         intent:  String,
         body:    String,
         trust:   String,
+        /// procedure (default), constraint, policy or fact -- the get_context
+        /// section the pattern is served under.
+        kind:    String,
         uses:    Vec<String>,
         tags:    Vec<String>,
     },
@@ -339,6 +342,7 @@ fn build_marker(mtype: &str, attrs: &HashMap<String, String>, body: &str) -> Opt
                 intent: if intent.is_empty() { body.chars().take(80).collect() } else { intent },
                 body: body.to_string(),
                 trust: if get("trust").is_empty() { "annotated".to_string() } else { get("trust") },
+                kind: get("kind"),
                 uses,
                 tags,
             })
@@ -504,6 +508,17 @@ More text."#;
                 assert_eq!(intent, "Compose GIF delta frames");
                 assert_eq!(trust, "verified");
             }
+            _ => panic!("expected Pattern"),
+        }
+    }
+
+    /// Without this attribute nothing could ever set a pattern's kind, so the
+    /// CONSTRAINTS and POLICIES sections of get_context were unreachable.
+    #[test]
+    fn parse_pattern_marker_kind() {
+        let text = r#"[CORTEX-PATTERN: name="no-direct-db-writes" intent="i" kind="constraint"]body[/CORTEX-PATTERN]"#;
+        match &parse_markers(text)[0] {
+            KnowledgeMarker::Pattern { kind, .. } => assert_eq!(kind, "constraint"),
             _ => panic!("expected Pattern"),
         }
     }

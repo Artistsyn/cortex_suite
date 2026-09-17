@@ -540,15 +540,16 @@ impl SessionRegistry {
 
 // ── Session-aware response helper ─────────────────────────────────────────────
 
-/// Wraps a list of (hash, compressed_text) pairs into a response,
-/// substituting a short reference token for content already seen this session.
+/// Wraps (hash, text, refetch) triples into a response, substituting a short
+/// reference for content already sent this session.
 ///
-/// The reference token is:
-///   [ref: <8-char prefix of hash>]
-///
-/// Copilot treats refs as "already in context — no need to re-read."
+/// `refetch` names the call that returns the item in full. It has to: the
+/// registry lives as long as the server process, while a client can drop
+/// earlier turns from its context without restarting the server -- Claude Code's
+/// compaction does exactly that. A bare `[ref:<hash>]` then pointed at text the
+/// model no longer had, with no way to get it back.
 pub fn render_with_session(
-    items: &[(String, String)], // (hash, text)
+    items: &[(String, String, String)], // (hash, text, refetch)
     session: &SessionRegistry,
     session_id: &str,
 ) -> String {
@@ -556,9 +557,9 @@ pub fn render_with_session(
     let mut new_count = 0;
     let mut ref_count = 0;
 
-    for (hash, text) in items {
+    for (hash, text, refetch) in items {
         if session.already_sent(session_id, hash) {
-            out.push_str(&format!("[ref:{}]\n", &hash[..8]));
+            out.push_str(&format!("[sent earlier this session — {refetch}]\n"));
             ref_count += 1;
         } else {
             out.push_str(text);
@@ -570,8 +571,8 @@ pub fn render_with_session(
 
     if ref_count > 0 {
         out.push_str(&format!(
-            "\n[{} item(s) already in context this session — {} new]\n",
-            ref_count, new_count
+            "\n[{ref_count} item(s) sent earlier this session are referenced, not repeated; \
+             if one is no longer in your context, fetch it as shown — {new_count} new]\n"
         ));
     }
 

@@ -437,6 +437,10 @@ Embed markers in your responses as you discover things:
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
 ```
 
+A pattern takes an optional `kind="constraint|policy|fact"` (default
+`procedure`). Constraints and policies are served in their own sections ahead
+of ordinary patterns in `get_context`.
+
 Then at the end of a verified task, the agent presents a summary and you reply
 `KNOWLEDGE COMMITTED` to commit them.
 
@@ -659,3 +663,7 @@ cortex_suite/
 Both servers are plain Rust binaries with no runtime dependencies. Everything is
 local: no network calls, no telemetry, no API keys. `.cortex/memory.db` is yours
 and is not shared by anything here.
+
+Before a schema upgrade, cortex writes a complete copy of that database to
+`.cortex/old-version-backups/`. It holds everything `memory.db` does, so keep the
+folder out of version control.

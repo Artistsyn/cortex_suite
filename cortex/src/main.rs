@@ -643,6 +643,11 @@ enum PatternCmd {
         #[arg(long)] body: String,
         #[arg(long, value_delimiter = ',')] uses: Vec<String>,
         #[arg(long, value_delimiter = ',')] tags: Vec<String>,
+        /// Which get_context section it is served under: CONSTRAINTS and
+        /// POLICIES are rendered ahead of ordinary patterns.
+        #[arg(long, default_value = "procedure",
+              value_parser = ["procedure", "constraint", "policy", "fact"])]
+        kind: String,
     },
     /// Remove a pattern by id.
     Remove { id: i64 },
@@ -2698,8 +2703,8 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
     if format == OutputFormat::Text {
         return match cmd {
             PatternCmd::List => crystallizer::list_patterns(&store),
-            PatternCmd::Add { name, intent, body, uses, tags } =>
-                crystallizer::add_pattern(&store, &name, &intent, &body, uses, tags),
+            PatternCmd::Add { name, intent, body, uses, tags, kind } =>
+                crystallizer::add_pattern(&store, &name, &intent, &body, uses, tags, &kind),
             PatternCmd::Remove { id } => crystallizer::remove_pattern(&store, id),
             PatternCmd::Revert { id } => crystallizer::report_revert(&store, id),
             PatternCmd::Supersede { id, by } => run_supersede(&store, "patterns", id, by),
@@ -2713,8 +2718,8 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
             let patterns = store.all_patterns()?;
             print_json(&patterns)
         }
-        PatternCmd::Add { name, intent, body, uses, tags } => {
-            let id = store.insert_pattern(&model::Pattern {
+        PatternCmd::Add { name, intent, body, uses, tags, kind } => {
+            let (id, created) = store.insert_pattern_checked(&model::Pattern {
                 id: None,
                 name: name.clone(),
                 intent: intent.clone(),
@@ -2727,7 +2732,7 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
                 survival_rate: 1.0,
                 credibility: 0.0,
                 trust_level: model::TrustLevel::default(),
-                kind: model::MemoryKind::default(),
+                kind: model::MemoryKind::from_str(&kind),
                 tier: model::EpistemicTier::default(),
                 hash: None,
                 included_in_context_count: 0,
@@ -2735,7 +2740,7 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
                 corrected_count: 0,
                 superseded_by: None,
             })?;
-            print_json(&json!({"ok": true, "action": "add", "id": id, "name": name, "intent": intent}))
+            print_json(&json!({"ok": true, "action": "add", "id": id, "created": created, "name": name, "intent": intent}))
         }
         PatternCmd::Remove { id } => {
             store.delete_pattern(id)?;
@@ -2788,7 +2793,7 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
             print_json(&anti_patterns)
         }
         AntiPatternCmd::Add { description, wrong, correct, tags } => {
-            let id = store.insert_anti_pattern(&model::AntiPattern {
+            let (id, created) = store.insert_anti_pattern_checked(&model::AntiPattern {
                 id: None,
                 description: description.clone(),
                 wrong,
@@ -2798,7 +2803,7 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
                 hash: None,
                 superseded_by: None,
             })?;
-            print_json(&json!({"ok": true, "action": "add", "id": id, "description": description}))
+            print_json(&json!({"ok": true, "action": "add", "id": id, "created": created, "description": description}))
         }
         AntiPatternCmd::Remove { id } => {
             store.delete_anti_pattern(id)?;
@@ -2859,7 +2864,7 @@ fn run_annotate(cmd: AnnotateCmd, db_path: &Path, format: OutputFormat) -> Resul
             print_json(&annotations)
         }
         AnnotateCmd::Add { topic, body, tags } => {
-            let id = store.insert_annotation(&model::Annotation {
+            let (id, created) = store.insert_annotation_checked(&model::Annotation {
                 id: None,
                 topic: topic.clone(),
                 body,
@@ -2867,7 +2872,7 @@ fn run_annotate(cmd: AnnotateCmd, db_path: &Path, format: OutputFormat) -> Resul
                 added_at: chrono::Utc::now(),
                 hash: None,
             })?;
-            print_json(&json!({"ok": true, "action": "add", "id": id, "topic": topic}))
+            print_json(&json!({"ok": true, "action": "add", "id": id, "created": created, "topic": topic}))
         }
         AnnotateCmd::Remove { id } => {
             store.delete_annotation(id)?;
@@ -4164,6 +4169,7 @@ mod tests {
             "if grounded_transition { Action::PlaySound(..) }",
             vec!["Action".to_string(), "Condition".to_string()],
             vec!["audio".to_string()],
+            "procedure",
         )
         .expect("add pattern");
 

@@ -59,6 +59,13 @@ max_mirror_files = 200
 mirror_consolidation_threshold = 0.75
 "#;
 
+/// Schema version stamped into `PRAGMA user_version` once a database is migrated.
+///
+/// Bump it whenever a migration rewrites existing data or needs one-time work,
+/// and add that work to `Store::open`. A database behind this number gets a
+/// fresh pre-migration backup, so every bump is protected, not only the first.
+const SCHEMA_VERSION: i32 = 1;
+
 pub struct Store {
     conn: Connection,
 }
@@ -72,18 +79,24 @@ impl Store {
         let conn = Connection::open(db_path)
             .with_context(|| format!("could not open db: {}", db_path.display()))?;
         let store = Self { conn };
-        if !is_new && store.has_user_tables()? {
-            if let Some(backup_path) = Self::ensure_old_version_backup(db_path)? {
-                eprintln!(
-                    "[cortex] old-version pre-migration backup created: {}",
-                    backup_path.display()
-                );
-                eprintln!(
-                    "[cortex] If corruption is detected after migration, this old-version backup can help repair or restore the database."
-                );
-            }
+        // An empty file is as fresh as a missing one: nothing to protect, and
+        // nothing written under an older schema to upgrade.
+        let fresh = is_new || !store.has_user_tables()?;
+        let from_version = if fresh { SCHEMA_VERSION } else { store.schema_version()? };
+        if from_version < SCHEMA_VERSION {
+            let backup_path = store.backup_before_migration(db_path, from_version)?;
+            eprintln!(
+                "[cortex] schema v{from_version} -> v{SCHEMA_VERSION}: pre-migration backup written to {}",
+                backup_path.display()
+            );
         }
         store.migrate()?;
+        if from_version < 1 {
+            store.upgrade_to_v1()?;
+        }
+        if store.schema_version()? < SCHEMA_VERSION {
+            store.set_schema_version(SCHEMA_VERSION)?;
+        }
         if is_new {
             store.first_run_init(db_path)?;
         }
@@ -172,11 +185,6 @@ impl Store {
                 &["cortex", "mcp", "tools", "get_preferences"],
             ),
             (
-                "MCP: recurrent_think",
-                "Params: task str required, hypothesis str, loop int, depth_mode str auto/shallow/deep default=auto, max_loops int default=6 max=16. Iterative hypothesis refinement. First call: provide task only to seed. Each loop: provide refined hypothesis, get critiques plus next_prompt plus confidence. Halt at confidence>=92% or max_loops. 'shallow' forces 2 loops, 'deep' allows up to 16. Scratchpad persisted in SQLite between calls.",
-                &["cortex", "mcp", "tools", "recurrent_think"],
-            ),
-            (
                 "MCP: simulate_change",
                 "Params: item str required exact name, change str default='unspecified change', depth int default=1. Predicts impact of changing 'item'. Returns risk Low/Medium/High, affected modules, recommended actions. depth=1 direct deps, depth=2+ cascade. Use before modifying widely-used types. High risk = stop and confirm with user.",
                 &["cortex", "mcp", "tools", "simulate_change"],
@@ -254,12 +262,27 @@ impl Store {
         Ok(count > 0)
     }
 
-    /// Create one backup copy of the pre-migration database state for safety.
+    fn schema_version(&self) -> Result<i32> {
+        Ok(self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    fn set_schema_version(&self, version: i32) -> Result<()> {
+        // PRAGMA takes no bound parameters; `version` is our own constant.
+        self.conn.execute_batch(&format!("PRAGMA user_version = {version}"))?;
+        Ok(())
+    }
+
+    /// Snapshot the database before a schema migration touches it.
     ///
-    /// The backup is written under `old-version-backups/` and includes
-    /// `old-version-pre-migration` in its name so it cannot be confused with a
-    /// current-state backup.
-    fn ensure_old_version_backup(db_path: &Path) -> Result<Option<PathBuf>> {
+    /// Written with `VACUUM INTO`, which reads through SQLite: commits still in
+    /// the `-wal` file are included, and a writer in another process cannot tear
+    /// the copy. The first version copied `memory.db` with the filesystem, which
+    /// silently left out everything not yet checkpointed -- on the live store,
+    /// the last hour of work before the backup was taken.
+    ///
+    /// Named `old-version-pre-migration` with both schema versions, so it cannot
+    /// be mistaken for a current-state backup.
+    fn backup_before_migration(&self, db_path: &Path, from_version: i32) -> Result<PathBuf> {
         let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = db_path
             .file_name()
@@ -269,45 +292,71 @@ impl Store {
         let backup_dir = parent.join("old-version-backups");
         std::fs::create_dir_all(&backup_dir)?;
 
-        let marker_path = backup_dir.join(format!(
-            "{file_name}.old-version-pre-migration.marker"
-        ));
-        if marker_path.exists() {
-            return Ok(None);
-        }
-
+        // Microseconds: two processes opening the store together must not
+        // overwrite each other's snapshot.
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
-        let backup_file_name = format!(
-            "{file_name}.old-version-pre-migration.{stamp}.sqlite3.bak"
-        );
-        let backup_path = backup_dir.join(backup_file_name);
+        let backup_path = backup_dir.join(format!(
+            "{file_name}.old-version-pre-migration.v{from_version}-to-v{SCHEMA_VERSION}.{stamp}.sqlite3.bak"
+        ));
 
-        std::fs::copy(db_path, &backup_path).with_context(|| {
-            format!(
-                "failed to create old-version pre-migration backup: {} -> {}",
-                db_path.display(),
-                backup_path.display()
-            )
-        })?;
+        // `migrate` sets the busy timeout, but this runs before it.
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        self.conn
+            .execute("VACUUM INTO ?1", params![backup_path.to_string_lossy()])
+            .with_context(|| {
+                format!(
+                    "failed to write pre-migration backup: {} -> {}",
+                    db_path.display(),
+                    backup_path.display()
+                )
+            })?;
 
         let notice_path = backup_dir.join(format!(
             "{file_name}.old-version-pre-migration.README.txt"
         ));
         let notice = format!(
-            "This folder stores OLD VERSION pre-migration backups.\n\nDatabase: {}\nBackup: {}\n\nDo not treat these files as current-state backups.\nIf migration corruption is detected, use this old-version backup to help repair or restore data.\n",
+            "This folder stores OLD VERSION pre-migration backups.\n\nDatabase: {}\nLatest backup: {}\n\nEach file is the database as it was just before cortex migrated it from the schema version in its name.\nDo not treat these files as current-state backups.\nIf migration corruption is detected, use the matching old-version backup to help repair or restore data.\n",
             db_path.display(),
             backup_path.display(),
         );
         std::fs::write(&notice_path, notice)?;
 
-        let marker = format!(
-            "old-version-pre-migration-backup={}\ncreated_at={}\n",
-            backup_path.display(),
-            chrono::Utc::now().to_rfc3339(),
-        );
-        std::fs::write(&marker_path, marker)?;
+        Ok(backup_path)
+    }
 
-        Ok(Some(backup_path))
+    /// One-time work for a database last migrated before schema version 1.
+    ///
+    /// Rows stored before content hashing have no hash, so dedup could not see
+    /// them. They are backfilled with UPDATE OR IGNORE because the live store
+    /// already holds a few exact duplicates: the first copy takes the hash and a
+    /// later copy keeps NULL instead of failing the unique index. The code-unit
+    /// index is rebuilt once to purge rows orphaned by the old OR REPLACE upsert.
+    fn upgrade_to_v1(&self) -> Result<()> {
+        self.backfill_hashes("patterns", "name", "body")?;
+        self.backfill_hashes("anti_patterns", "description", "wrong")?;
+        self.backfill_hashes("annotations", "topic", "body")?;
+        self.rebuild_code_unit_fts()?;
+        Ok(())
+    }
+
+    fn backfill_hashes(&self, table: &str, first: &str, second: &str) -> Result<usize> {
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT id, {first}, {second} FROM {table} WHERE hash IS NULL ORDER BY id"
+            ))?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let mut hashed = 0;
+        for (id, a, b) in rows {
+            hashed += tx.execute(
+                &format!("UPDATE OR IGNORE {table} SET hash = ?1 WHERE id = ?2"),
+                params![content_hash(&a, &b), id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(hashed)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -1218,10 +1267,12 @@ impl Store {
                 "ALTER TABLE anti_patterns ADD COLUMN hash TEXT",
                 [],
             )?;
-            self.conn.execute_batch(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_ap_hash ON anti_patterns(hash) WHERE hash IS NOT NULL;"
-            )?;
         }
+        // Outside the `if`: the hash backfill and the ON CONFLICT inserts both
+        // rely on this index existing, not merely on the column.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ap_hash ON anti_patterns(hash) WHERE hash IS NOT NULL;"
+        )?;
 
         // --- annotations ---
         let ancols = col_info("annotations")?;
@@ -1230,10 +1281,10 @@ impl Store {
                 "ALTER TABLE annotations ADD COLUMN hash TEXT",
                 [],
             )?;
-            self.conn.execute_batch(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_ann_hash ON annotations(hash) WHERE hash IS NOT NULL;"
-            )?;
         }
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ann_hash ON annotations(hash) WHERE hash IS NOT NULL;"
+        )?;
 
         // --- graph_edges: bi-temporal columns ---
         let gecols = col_info("graph_edges")?;
@@ -1272,8 +1323,19 @@ impl Store {
             INSERT INTO pattern_fts(pattern_fts) VALUES('rebuild');
             INSERT INTO anti_pattern_fts(anti_pattern_fts) VALUES('rebuild');
             INSERT INTO annotation_fts(annotation_fts) VALUES('rebuild');
-            INSERT INTO code_unit_fts(code_unit_fts) VALUES('rebuild');
         ")?;
+        Ok(())
+    }
+
+    /// Rebuild the code-unit index.
+    ///
+    /// Deliberately not part of `rebuild_fts`, which runs on every open: re-indexing
+    /// the full text of every unit there made each `cortex` invocation -- and hooks
+    /// run one per tool call -- measurably slower. The triggers keep this index
+    /// current, so it only needs a rebuild when an older database is upgraded.
+    pub fn rebuild_code_unit_fts(&self) -> Result<()> {
+        self.conn
+            .execute_batch("INSERT INTO code_unit_fts(code_unit_fts) VALUES('rebuild');")?;
         Ok(())
     }
 
@@ -1339,11 +1401,22 @@ impl Store {
                 (None, None)
             };
 
+        // An update, not OR REPLACE. REPLACE deletes the old row without firing
+        // delete triggers (recursive_triggers is off), so every re-upsert of an
+        // unchanged unit left an orphan row in code_unit_fts.
         self.conn.execute(
-            "INSERT OR REPLACE INTO code_units
+            "INSERT INTO code_units
              (id, kind, name, module_path, summary, compressed, term_vector, indexed_at,
               previous_compressed, signature_changed_at, source_root)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind, name = excluded.name,
+                module_path = excluded.module_path, summary = excluded.summary,
+                compressed = excluded.compressed, term_vector = excluded.term_vector,
+                indexed_at = excluded.indexed_at,
+                previous_compressed = excluded.previous_compressed,
+                signature_changed_at = excluded.signature_changed_at,
+                source_root = excluded.source_root",
             params![
                 unit.id, unit.kind, unit.name, unit.module_path,
                 unit.summary, unit.compressed, tv_json, now,
@@ -1414,33 +1487,27 @@ impl Store {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM code_units", [], |r| r.get(0))?)
     }
 
-    /// Lean query for hybrid search — omits `compressed` blob to keep memory low.
-    pub fn units_for_search(&self) -> Result<Vec<CodeUnit>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, kind, name, module_path, summary, '' AS compressed, term_vector, indexed_at
-             FROM code_units ORDER BY kind, name"
-        )?;
-        let rows = stmt.query_map([], row_to_unit)?;
-        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(items)
-    }
-
     // ── Patterns ──────────────────────────────────────────────────────────────
 
     pub fn insert_pattern(&self, p: &Pattern) -> Result<i64> {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(p.name.as_bytes());
-        hasher.update(b"|");
-        hasher.update(p.body.as_bytes());
-        let hash = hex::encode(hasher.finalize());
+        Ok(self.insert_pattern_checked(p)?.0)
+    }
 
-        self.conn.execute(
+    /// Insert unless a pattern with the same name and body is already stored.
+    ///
+    /// Returns the row id and whether this call created it. A duplicate used to
+    /// fail the unique hash index with a raw constraint error; it now resolves
+    /// to the existing row, and the flag lets a caller say so instead of
+    /// reporting an add that did not happen.
+    pub fn insert_pattern_checked(&self, p: &Pattern) -> Result<(i64, bool)> {
+        let hash = content_hash(&p.name, &p.body);
+        let inserted = self.conn.execute(
             "INSERT INTO patterns
              (name, intent, body, uses, tags, approved_at, use_count, reverted_count,
               survival_rate, trust_level, kind, tier, hash,
               included_in_context_count, confirmed_count, corrected_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 1.0, ?7, ?8, ?9, ?10, 0, 0, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 1.0, ?7, ?8, ?9, ?10, 0, 0, 0)
+             ON CONFLICT(hash) WHERE hash IS NOT NULL DO NOTHING",
             params![
                 p.name, p.intent, p.body,
                 serde_json::to_string(&p.uses)?,
@@ -1452,7 +1519,28 @@ impl Store {
                 hash,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        if inserted == 0 {
+            return Ok((self.id_by_hash("patterns", &hash)?, false));
+        }
+        let id = self.conn.last_insert_rowid();
+        self.record_pattern_history(id, "ADD", None, Some(&p.name));
+        Ok((id, true))
+    }
+
+    fn id_by_hash(&self, table: &str, hash: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            &format!("SELECT id FROM {table} WHERE hash = ?1"),
+            params![hash],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Audit-log a pattern write. Never fatal: the write itself has already
+    /// happened, and failing here would report it as failed.
+    fn record_pattern_history(&self, pattern_id: i64, event: &str, old: Option<&str>, new: Option<&str>) {
+        if let Err(e) = self.insert_pattern_history(pattern_id, event, old, new, "cortex", None) {
+            eprintln!("[cortex] pattern_history {event} for #{pattern_id} not recorded: {e}");
+        }
     }
 
     pub fn all_patterns(&self) -> Result<Vec<Pattern>> {
@@ -1479,7 +1567,9 @@ impl Store {
     }
 
     pub fn delete_pattern(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM patterns WHERE id = ?1", params![id])?;
+        if self.conn.execute("DELETE FROM patterns WHERE id = ?1", params![id])? > 0 {
+            self.record_pattern_history(id, "DELETE", None, None);
+        }
         Ok(())
     }
 
@@ -1573,16 +1663,17 @@ impl Store {
     // ── Anti-patterns ─────────────────────────────────────────────────────────
 
     pub fn insert_anti_pattern(&self, ap: &AntiPattern) -> Result<i64> {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(ap.description.as_bytes());
-        hasher.update(b"|");
-        hasher.update(ap.wrong.as_bytes());
-        let hash = hex::encode(hasher.finalize());
+        Ok(self.insert_anti_pattern_checked(ap)?.0)
+    }
 
-        self.conn.execute(
+    /// Insert unless one with the same description and wrong text is already
+    /// stored; see `insert_pattern_checked`.
+    pub fn insert_anti_pattern_checked(&self, ap: &AntiPattern) -> Result<(i64, bool)> {
+        let hash = content_hash(&ap.description, &ap.wrong);
+        let inserted = self.conn.execute(
             "INSERT INTO anti_patterns (description, wrong, correct, tags, added_at, hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(hash) WHERE hash IS NOT NULL DO NOTHING",
             params![
                 ap.description, ap.wrong, ap.correct,
                 serde_json::to_string(&ap.tags)?,
@@ -1590,7 +1681,10 @@ impl Store {
                 hash,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        if inserted == 0 {
+            return Ok((self.id_by_hash("anti_patterns", &hash)?, false));
+        }
+        Ok((self.conn.last_insert_rowid(), true))
     }
 
     pub fn all_anti_patterns(&self) -> Result<Vec<AntiPattern>> {
@@ -1636,6 +1730,9 @@ impl Store {
             &format!("UPDATE {table} SET superseded_by = ?1 WHERE id = ?2 AND superseded_by IS NULL"),
             params![new_id, old_id],
         )?;
+        if table == "patterns" && n > 0 {
+            self.record_pattern_history(old_id, "SUPERSEDE", None, Some(&new_id.to_string()));
+        }
         Ok(n)
     }
 
@@ -1703,15 +1800,16 @@ impl Store {
     // ── Annotations ───────────────────────────────────────────────────────────
 
     pub fn insert_annotation(&self, a: &Annotation) -> Result<i64> {
-        use sha2::{Sha256, Digest};
-        let mut hasher = Sha256::new();
-        hasher.update(a.topic.as_bytes());
-        hasher.update(b"|");
-        hasher.update(a.body.as_bytes());
-        let hash = hex::encode(hasher.finalize());
+        Ok(self.insert_annotation_checked(a)?.0)
+    }
 
-        self.conn.execute(
-            "INSERT INTO annotations (topic, body, tags, added_at, hash) VALUES (?1, ?2, ?3, ?4, ?5)",
+    /// Insert unless one with the same topic and body is already stored; see
+    /// `insert_pattern_checked`.
+    pub fn insert_annotation_checked(&self, a: &Annotation) -> Result<(i64, bool)> {
+        let hash = content_hash(&a.topic, &a.body);
+        let inserted = self.conn.execute(
+            "INSERT INTO annotations (topic, body, tags, added_at, hash) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(hash) WHERE hash IS NOT NULL DO NOTHING",
             params![
                 a.topic, a.body,
                 serde_json::to_string(&a.tags)?,
@@ -1719,7 +1817,10 @@ impl Store {
                 hash,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        if inserted == 0 {
+            return Ok((self.id_by_hash("annotations", &hash)?, false));
+        }
+        Ok((self.conn.last_insert_rowid(), true))
     }
 
     pub fn all_annotations(&self) -> Result<Vec<Annotation>> {
@@ -2447,12 +2548,17 @@ pub fn command_family(command: &str) -> String {
     pub fn fts_search_patterns(&self, query: &str, limit: usize) -> Result<Vec<Pattern>> {
         let safe_q = sanitize_fts_query(query);
         if safe_q.is_empty() { return Ok(vec![]); }
+        // Every column row_to_pattern reads, in its order -- the same list as
+        // all_patterns. Selecting only the first ten made each row an error.
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.name, p.intent, p.body, p.uses, p.tags, p.approved_at,
-                    p.use_count, p.reverted_count, p.survival_rate
+                    p.use_count, p.reverted_count, p.survival_rate,
+                    p.credibility, p.superseded_by,
+                    p.trust_level, p.kind, p.tier, p.hash,
+                    p.included_in_context_count, p.confirmed_count, p.corrected_count
              FROM pattern_fts f
              JOIN patterns p ON p.id = f.rowid
-             WHERE pattern_fts MATCH ?1
+             WHERE pattern_fts MATCH ?1 AND p.superseded_by IS NULL
              ORDER BY rank
              LIMIT ?2"
         )?;
@@ -2563,38 +2669,30 @@ pub fn command_family(command: &str) -> String {
 
     // ── FTS5 hybrid search for code units ─────────────────────────────────────
 
-    /// BM25 keyword search over `code_unit_fts`.
-    /// Returns (unit_id, bm25_rank) pairs ordered by relevance.
+    /// BM25 keyword search over `code_unit_fts`, best match first.
+    /// Returns (unit_id, bm25 score) pairs; lower scores are better.
+    ///
+    /// Terms are OR-ed, not AND-ed: requiring every word in one unit meant only
+    /// the largest units could match a multi-word query, so a 22KB `Canvas` won
+    /// "spawn plugin". Columns are weighted name > summary > body for the same
+    /// reason -- a unit NAMED for a term should beat one that mentions it
+    /// somewhere in a hundred methods.
     pub fn fts_code_units(&self, query: &str, limit: usize) -> Result<Vec<(String, f64)>> {
-        let safe_q = sanitize_fts_query(query);
-        if safe_q.is_empty() {
+        let fts_q = fts_any_term_query(query);
+        if fts_q.is_empty() {
             return Ok(vec![]);
         }
         let mut stmt = self.conn.prepare(
-            "SELECT cu.id, f.rank
-             FROM code_unit_fts f
-             JOIN code_units cu ON cu.rowid = f.rowid
-             WHERE f.code_unit_fts MATCH ?1
-             ORDER BY f.rank LIMIT ?2"
+            "SELECT cu.id, bm25(code_unit_fts, 10.0, 4.0, 1.0) AS score
+             FROM code_unit_fts
+             JOIN code_units cu ON cu.rowid = code_unit_fts.rowid
+             WHERE code_unit_fts MATCH ?1
+             ORDER BY score LIMIT ?2"
         )?;
-        let rows = stmt.query_map(params![safe_q, limit as i64], |row| {
+        let rows = stmt.query_map(params![fts_q, limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    // ── Bounded telemetry rotation ─────────────────────────────────────────────
-
-    /// Prune telemetry tables to the 50 000 most recent rows.
-    pub fn prune_telemetry(&self) -> Result<()> {
-        let tables = ["mcp_calls", "session_retrieval_log", "outcome_log", "compression_savings"];
-        for t in tables {
-            self.conn.execute(
-                &format!("DELETE FROM {t} WHERE id < (SELECT MAX(id) - 50000 FROM {t})"),
-                [],
-            ).ok(); // table may not exist yet; ignore
-        }
-        Ok(())
     }
 
 }
@@ -2608,6 +2706,27 @@ fn sanitize_fts_query(q: &str) -> String {
         .filter(|t| t.len() >= 2)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Like `sanitize_fts_query`, but matching ANY term. Each term is quoted, so a
+/// query word like `or` or `not` is searched for rather than parsed as an operator.
+fn fts_any_term_query(q: &str) -> String {
+    sanitize_fts_query(q)
+        .split(' ')
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// SHA-256 of two fields: the identity used to recognise a duplicate memory entry.
+fn content_hash(first: &str, second: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(first.as_bytes());
+    hasher.update(b"|");
+    hasher.update(second.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
@@ -2827,47 +2946,192 @@ mod prune_tests {
         assert_eq!(groups[1], (None, 1));
     }
 
+    /// Re-indexing a source upserts every unit again, mostly unchanged. Under
+    /// INSERT OR REPLACE each of those left an orphan row in code_unit_fts.
     #[test]
-    fn open_creates_old_version_pre_migration_backup_once() {
-        let temp = TempDir::new("old_version_backup_once").unwrap();
+    fn re_upserting_an_unchanged_unit_leaves_no_orphan_in_the_code_index() {
+        let s = store("fts_orphans");
+        let u = unit("canvas::core::Canvas");
+        for _ in 0..3 {
+            s.upsert_unit_from(&u, Some("quartz/src")).unwrap();
+        }
+        let docs: i64 = s.conn
+            .query_row("SELECT COUNT(*) FROM code_unit_fts_docsize", [], |r| r.get(0)).unwrap();
+        assert_eq!(docs, 1, "each re-upsert left an orphan row in code_unit_fts");
+    }
+
+    fn backups(dir: &TempDir) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir.join("old-version-backups")) else {
+            return vec![];
+        };
+        let mut found: Vec<PathBuf> = entries
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                name.contains("old-version-pre-migration") && name.ends_with(".sqlite3.bak")
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The first version wrote a marker after its one backup and never backed
+    /// up again, so every later migration would have run unprotected.
+    #[test]
+    fn open_backs_up_before_each_schema_upgrade_not_only_the_first() {
+        let temp = TempDir::new("backup_per_version").unwrap();
         let db_path = temp.join("memory.db");
-
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute("CREATE TABLE legacy_data (id INTEGER PRIMARY KEY)", [])
-                .unwrap();
-        }
+        rusqlite::Connection::open(&db_path).unwrap()
+            .execute("CREATE TABLE legacy_data (id INTEGER PRIMARY KEY)", []).unwrap();
 
         Store::open(&db_path).unwrap();
         Store::open(&db_path).unwrap();
+        assert_eq!(backups(&temp).len(), 1, "an up-to-date database was backed up again");
+        let version: i32 = rusqlite::Connection::open(&db_path).unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
 
-        let backup_dir = temp.join("old-version-backups");
-        assert!(backup_dir.exists(), "backup directory should exist for old-version backup");
+        // A later schema bump, simulated by winding the stamp back.
+        rusqlite::Connection::open(&db_path).unwrap()
+            .execute_batch("PRAGMA user_version = 0").unwrap();
+        Store::open(&db_path).unwrap();
+        assert_eq!(backups(&temp).len(), 2, "the next migration ran without a backup");
 
-        let mut backup_files = Vec::new();
-        for entry in std::fs::read_dir(&backup_dir).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.contains("old-version-pre-migration") && name.ends_with(".sqlite3.bak") {
-                backup_files.push(path);
-            }
+        let notice = std::fs::read_to_string(
+            temp.join("old-version-backups/memory.db.old-version-pre-migration.README.txt"),
+        ).unwrap();
+        assert!(notice.contains("If migration corruption is detected"));
+        assert!(notice.contains("Do not treat these files as current-state backups"));
+    }
+
+    /// A filesystem copy of memory.db misses every commit still in the -wal
+    /// file. On the live store that was the hour before the backup was taken.
+    #[test]
+    fn pre_migration_backup_includes_commits_still_in_the_wal() {
+        let temp = TempDir::new("backup_wal").unwrap();
+        let db_path = temp.join("memory.db");
+        // Held open throughout: closing the last connection would checkpoint
+        // the WAL into memory.db and hide the difference.
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE legacy_data (id INTEGER PRIMARY KEY);
+             INSERT INTO legacy_data VALUES (1), (2), (3);",
+        ).unwrap();
+
+        Store::open(&db_path).unwrap();
+
+        let backup = backups(&temp).pop().expect("no backup was written");
+        let rows: i64 = rusqlite::Connection::open(&backup).unwrap()
+            .query_row("SELECT COUNT(*) FROM legacy_data", [], |r| r.get(0))
+            .expect("the backup lacks a table that existed only in the WAL");
+        assert_eq!(rows, 3);
+        drop(writer);
+    }
+
+    fn pattern(name: &str, body: &str) -> Pattern {
+        Pattern {
+            id: None,
+            name: name.into(),
+            intent: "intent".into(),
+            body: body.into(),
+            uses: vec![],
+            tags: vec![],
+            approved_at: Utc::now(),
+            use_count: 0,
+            reverted_count: 0,
+            survival_rate: 1.0,
+            credibility: 0.0,
+            trust_level: crate::model::TrustLevel::default(),
+            kind: crate::model::MemoryKind::default(),
+            tier: crate::model::EpistemicTier::default(),
+            hash: None,
+            included_in_context_count: 0,
+            confirmed_count: 0,
+            corrected_count: 0,
+            superseded_by: None,
         }
-        assert_eq!(backup_files.len(), 1, "only one old-version backup should be created");
+    }
 
-        let marker_path = backup_dir.join("memory.db.old-version-pre-migration.marker");
-        assert!(marker_path.exists(), "backup marker should prevent duplicate backups");
+    fn anti_pattern(description: &str, wrong: &str) -> AntiPattern {
+        AntiPattern {
+            id: None,
+            description: description.into(),
+            wrong: wrong.into(),
+            correct: "correct".into(),
+            tags: vec![],
+            added_at: Utc::now(),
+            hash: None,
+            superseded_by: None,
+        }
+    }
 
-        let notice_path = backup_dir.join("memory.db.old-version-pre-migration.README.txt");
-        assert!(notice_path.exists(), "recovery hint file should be present");
-        let notice = std::fs::read_to_string(notice_path).unwrap();
-        assert!(
-            notice.contains("If migration corruption is detected"),
-            "recovery hint should mention corruption-repair use"
-        );
-        assert!(
-            notice.contains("Do not treat these files as current-state backups"),
-            "notice should mark backup as old-version only"
-        );
+    /// A duplicate used to fail the unique hash index with a raw
+    /// "UNIQUE constraint failed" -- from the CLI, and from self-correction
+    /// promotion, which had no duplicate check of its own.
+    #[test]
+    fn a_duplicate_insert_resolves_to_the_existing_row() {
+        let s = store("dedup");
+
+        let (first, created) = s.insert_anti_pattern_checked(&anti_pattern("d", "w")).unwrap();
+        assert!(created);
+        let (again, created) = s.insert_anti_pattern_checked(&anti_pattern("d", "w")).unwrap();
+        assert!(!created, "a duplicate anti-pattern was reported as created");
+        assert_eq!(first, again);
+
+        let (pid, _) = s.insert_pattern_checked(&pattern("p", "body")).unwrap();
+        let (again, created) = s.insert_pattern_checked(&pattern("p", "body")).unwrap();
+        assert!(!created);
+        assert_eq!(pid, again);
+        let adds: i64 = s.conn.query_row(
+            "SELECT COUNT(*) FROM pattern_history WHERE pattern_id = ?1 AND event = 'ADD'",
+            params![pid], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(adds, 1, "a duplicate insert must not log a second ADD");
+
+        let ann = Annotation {
+            id: None, topic: "t".into(), body: "b".into(), tags: vec![],
+            added_at: Utc::now(), hash: None,
+        };
+        assert_eq!(s.insert_annotation(&ann).unwrap(), s.insert_annotation(&ann).unwrap());
+    }
+
+    /// Rows stored before hashing carry no hash, so dedup could not see them;
+    /// and the live store holds exact duplicates that must not fail the upgrade.
+    #[test]
+    fn upgrade_backfills_hashes_and_tolerates_existing_duplicates() {
+        let s = store("backfill");
+        for (description, wrong) in [("dup", "same"), ("dup", "same"), ("solo", "other")] {
+            s.conn.execute(
+                "INSERT INTO anti_patterns (description, wrong, correct, tags, added_at)
+                 VALUES (?1, ?2, 'c', '[]', ?3)",
+                params![description, wrong, Utc::now().to_rfc3339()],
+            ).unwrap();
+        }
+        s.conn.execute_batch("PRAGMA user_version = 0").unwrap();
+
+        let upgraded = Store::open(&s.dir().join("memory.db"))
+            .expect("an existing duplicate failed the upgrade");
+        let hashed: i64 = upgraded.conn
+            .query_row("SELECT COUNT(hash) FROM anti_patterns", [], |r| r.get(0)).unwrap();
+        assert_eq!(hashed, 2, "one hash per distinct entry; the second copy keeps NULL");
+
+        let (id, created) = upgraded.insert_anti_pattern_checked(&anti_pattern("solo", "other")).unwrap();
+        assert!(!created, "an entry stored before hashing was not recognised as a duplicate");
+        assert_eq!(id, 3);
+    }
+
+    #[test]
+    fn fts_search_patterns_selects_every_column_row_to_pattern_reads() {
+        let s = store("fts_patterns");
+        let (id, _) = s
+            .insert_pattern_checked(&pattern("shadow-map-in-group0", "fold the shadow map into bind group zero"))
+            .unwrap();
+        let found = s.fts_search_patterns("shadow map", 5)
+            .expect("the query selected fewer columns than row_to_pattern reads");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, Some(id));
     }
 
     #[test]

@@ -110,6 +110,7 @@ pub fn add_pattern(
     body: &str,
     uses: Vec<String>,
     tags: Vec<String>,
+    kind: &str,
 ) -> Result<()> {
     let pattern = Pattern {
         id: None,
@@ -122,18 +123,22 @@ pub fn add_pattern(
         use_count: 0,
         reverted_count: 0,
         survival_rate: 1.0,
-                credibility: 0.0,
-                trust_level: crate::model::TrustLevel::default(),
-                kind: crate::model::MemoryKind::default(),
-                tier: crate::model::EpistemicTier::default(),
-                hash: None,
-                included_in_context_count: 0,
-                confirmed_count: 0,
-                corrected_count: 0,
-                superseded_by: None,
+        credibility: 0.0,
+        trust_level: crate::model::TrustLevel::default(),
+        kind: crate::model::MemoryKind::from_str(kind),
+        tier: crate::model::EpistemicTier::default(),
+        hash: None,
+        included_in_context_count: 0,
+        confirmed_count: 0,
+        corrected_count: 0,
+        superseded_by: None,
     };
-    let id = store.insert_pattern(&pattern)?;
-    println!("✓ Pattern `{}` added (id: {}).", name, id);
+    let (id, created) = store.insert_pattern_checked(&pattern)?;
+    if created {
+        println!("✓ Pattern `{}` added (id: {}).", name, id);
+    } else {
+        println!("Pattern `{}` is already stored with this body (id: {}) — nothing added.", name, id);
+    }
     Ok(())
 }
 
@@ -215,8 +220,12 @@ pub fn add_anti_pattern(
                 hash: None,
                 superseded_by: None,
     };
-    let id = store.insert_anti_pattern(&ap)?;
-    println!("✓ Anti-pattern added (id: {}).", id);
+    let (id, created) = store.insert_anti_pattern_checked(&ap)?;
+    if created {
+        println!("✓ Anti-pattern added (id: {}).", id);
+    } else {
+        println!("An identical anti-pattern is already stored (id: {}) — nothing added.", id);
+    }
     Ok(())
 }
 
@@ -254,8 +263,12 @@ pub fn add_annotation(store: &Store, topic: &str, body: &str, tags: Vec<String>)
         added_at: chrono::Utc::now(),
         hash: None,
     };
-    let id = store.insert_annotation(&a)?;
-    println!("✓ Annotation added (id: {}).", id);
+    let (id, created) = store.insert_annotation_checked(&a)?;
+    if created {
+        println!("✓ Annotation added (id: {}).", id);
+    } else {
+        println!("An identical annotation is already stored (id: {}) — nothing added.", id);
+    }
     Ok(())
 }
 

@@ -329,8 +329,8 @@ fn tool_semantic_search(
 
     let mut header = format!("Search: `{query}`\n\n");
 
-    // Build (hash, text) pairs for session-aware rendering
-    let mut items: Vec<(String, String)> = Vec::new();
+    // Build (hash, text, refetch) triples for session-aware rendering
+    let mut items: Vec<(String, String, String)> = Vec::new();
 
     if !results.is_empty() {
         header.push_str("## Semantic matches\n");
@@ -340,7 +340,7 @@ fn tool_semantic_search(
                 r.unit.name, r.score * 100.0, r.unit.compressed
             );
             let hash = sha256_hex(entry.as_bytes());
-            items.push((hash, entry));
+            items.push((hash, entry, refetch_unit(r.unit)));
         }
     }
 
@@ -418,11 +418,19 @@ fn tool_get_item(
     }
 
     let hash = sha256_hex(unit.compressed.as_bytes());
-    let rendered = render_with_session(
-        &[(hash, unit.compressed.clone())],
-        sessions,
-        session_id,
-    );
+    // `resend` is how a reference becomes the item again. "Already sent" can
+    // mean "no longer visible" once the client compacts its context, and without
+    // this flag every get_item for that unit would answer with the same reference.
+    let rendered = if args.get("resend").and_then(|v| v.as_bool()).unwrap_or(false) {
+        sessions.mark_sent(session_id, &hash);
+        format!("{}\n", unit.compressed)
+    } else {
+        render_with_session(
+            &[(hash, unit.compressed.clone(), refetch_unit(unit))],
+            sessions,
+            session_id,
+        )
+    };
 
     Ok(format!("{header}{rendered}"))
 }
@@ -840,6 +848,19 @@ fn tool_get_preferences(
 
 use crate::recall_match::{recall_score, recall_terms};
 
+/// Matches per recall section printed with their full text; every further match
+/// still gets one line.
+///
+/// Replayed over the 74 real recall calls in the live store: uncapped, the
+/// median response was 41KB, one in ten passed 120KB and the largest was 220KB,
+/// far past the limit the listing tools already enforce. With five in full and
+/// the rest listed: median 17KB, p90 31KB, and no match dropped.
+const RECALL_FULL_PER_SECTION: usize = 5;
+
+/// Longest code-unit excerpt recall prints before pointing at get_item. Recall
+/// is a knowledge lookup, and one unit (`canvas::core::Canvas`) alone is 22KB.
+const RECALL_UNIT_CHARS: usize = 4_000;
+
 fn tool_recall(
     args: &Value,
     store: &Store,
@@ -855,7 +876,7 @@ fn tool_recall(
     let mut found = false;
 
     // API units
-    let mut unit_items: Vec<(String, String)> = Vec::new();
+    let mut unit_items: Vec<(String, String, String)> = Vec::new();
     let mut scored_units: Vec<(usize, &CodeUnit)> = units
         .iter()
         .map(|u| (recall_score(&[&u.name, &u.compressed], &topic_lower, &terms), u))
@@ -863,8 +884,9 @@ fn tool_recall(
         .collect();
     scored_units.sort_by(|a, b| b.0.cmp(&a.0));
     for u in scored_units.into_iter().take(4).map(|(_, u)| u) {
-        let hash = sha256_hex(u.compressed.as_bytes());
-        unit_items.push((hash, u.compressed.clone()));
+        let text = cap_unit_text(u, RECALL_UNIT_CHARS);
+        let hash = sha256_hex(text.as_bytes());
+        unit_items.push((hash, text, refetch_unit(u)));
         found = true;
     }
 
@@ -896,15 +918,25 @@ fn tool_recall(
     if !matched_patterns.is_empty() {
         found = true;
         out.push_str("## Patterns\n");
-        for p in &matched_patterns {
-            out.push_str(&format!("### {} — {}\n", p.name, p.intent));
-            out.push_str(&p.body);
-            out.push('\n');
+        for (rank, p) in matched_patterns.iter().enumerate() {
+            if rank < RECALL_FULL_PER_SECTION {
+                out.push_str(&format!("### {} — {}\n", p.name, p.intent));
+                out.push_str(&p.body);
+                out.push('\n');
+            } else {
+                out.push_str(&format!(
+                    "- {} — {} (expand_memory id={})\n",
+                    p.name, p.intent, p.id.unwrap_or(-1)
+                ));
+            }
+            // Telemetry is unchanged for the one-line matches: survival scoring
+            // must not shift because the response got shorter.
             if let Some(id) = p.id {
                 let _ = store.pattern_used(id);
                 let _ = store.log_session_retrieval(session_id, "patterns", id, "recall");
             }
         }
+        push_more_matched(&mut out, matched_patterns.len());
     }
 
     // Anti-patterns
@@ -929,13 +961,18 @@ fn tool_recall(
     if !matched_aps.is_empty() {
         found = true;
         out.push_str("## ⚠ Anti-patterns\n");
-        for ap in &matched_aps {
-            out.push_str(&format!("✗ {}\n  wrong:   {}\n  correct: {}\n\n",
-                ap.description, ap.wrong, ap.correct));
+        for (rank, ap) in matched_aps.iter().enumerate() {
+            if rank < RECALL_FULL_PER_SECTION {
+                out.push_str(&format!("✗ {}\n  wrong:   {}\n  correct: {}\n\n",
+                    ap.description, ap.wrong, ap.correct));
+            } else {
+                out.push_str(&format!("- ✗ {}\n", ap.description));
+            }
             if let Some(id) = ap.id {
                 let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "recall");
             }
         }
+        push_more_matched(&mut out, matched_aps.len());
     }
 
     // Annotations
@@ -953,12 +990,17 @@ fn tool_recall(
     if !matched_annotations.is_empty() {
         found = true;
         out.push_str("## Notes\n");
-        for a in &matched_annotations {
-            out.push_str(&format!("[{}] {}\n", a.topic, a.body));
+        for (rank, a) in matched_annotations.iter().enumerate() {
+            if rank < RECALL_FULL_PER_SECTION {
+                out.push_str(&format!("[{}] {}\n", a.topic, a.body));
+            } else {
+                out.push_str(&format!("- [{}] {}\n", a.topic, opening_clause(&a.body, 90).0));
+            }
             if let Some(id) = a.id {
                 let _ = store.log_session_retrieval(session_id, "annotations", id, "recall");
             }
         }
+        push_more_matched(&mut out, matched_annotations.len());
     }
 
     if !found {
@@ -971,7 +1013,44 @@ fn tool_recall(
         out.push_str("Nothing found. Consider adding an annotation.\n");
     }
 
+    cap_response(&mut out, "Narrow the topic to see the rest.");
     Ok(out)
+}
+
+/// Say how a section was shortened, when it was.
+fn push_more_matched(out: &mut String, matched: usize) {
+    if matched > RECALL_FULL_PER_SECTION {
+        out.push_str(&format!(
+            "({} more matched and are listed on one line each, closest first; \
+             narrow the topic to see them in full)\n\n",
+            matched - RECALL_FULL_PER_SECTION
+        ));
+    }
+}
+
+/// How to get a code unit back in full once a response has referenced or
+/// shortened it.
+fn refetch_unit(u: &CodeUnit) -> String {
+    format!("`{}`: get_item name=\"{}\" resend=true", u.name, u.id)
+}
+
+/// A unit's compressed text, cut at a line boundary past `max` bytes with a
+/// pointer to the whole thing.
+fn cap_unit_text(u: &CodeUnit, max: usize) -> String {
+    if u.compressed.len() <= max {
+        return u.compressed.clone();
+    }
+    let mut end = max;
+    while !u.compressed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let end = u.compressed[..end].rfind('\n').unwrap_or(end);
+    format!(
+        "{}\n… {} more characters: {}\n",
+        &u.compressed[..end],
+        u.compressed.len() - end,
+        refetch_unit(u),
+    )
 }
 
 // ── list_patterns ─────────────────────────────────────────────────────────────
@@ -993,14 +1072,18 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
     // error rather than an answer. An unbounded response is not a large
     // response; it is an absent one.
     let threshold = hint_expand_threshold(&tokens);
-    let mut ranked: Vec<(usize, usize)> = patterns
+    let scores: Vec<usize> = patterns
         .iter()
-        .enumerate()
-        .map(|(i, p)| {
+        .map(|p| {
             let hay =
                 format!("{} {} {} {}", p.name, p.intent, p.body, p.uses.join(" ")).to_lowercase();
-            (i, text_hint_score(&hay, &tokens))
+            text_hint_score(&hay, &tokens)
         })
+        .collect();
+    let mut ranked: Vec<(usize, usize)> = scores
+        .iter()
+        .copied()
+        .enumerate()
         .filter(|(_, s)| *s >= threshold)
         .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1010,6 +1093,7 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
 
     let mut out = format!("{} approved pattern(s):\n\n", patterns.len());
     let mut expanded = 0usize;
+    let mut compact = 0usize;
     for (idx, p) in patterns.iter().enumerate() {
         // A pattern relevant to the stated task gets its body preview even at
         // the summary tier — the saving should come from the ones you are not
@@ -1023,6 +1107,21 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
         } else {
             "✓"
         };
+
+        // A pattern sharing no word with the hint gets one line: still listed,
+        // survival marker kept, usage figures and the rest of the intent dropped.
+        // Replayed over the 23 real hinted summary calls in the live store:
+        // median 50.6KB -> 39.7KB. Listing only hint-related patterns would save
+        // more, but every entry being listed is this call's contract.
+        if detail == "summary" && !tokens.is_empty() && scores[idx] == 0 {
+            if let Some(id) = p.id {
+                let _ = store.log_session_retrieval(session_id, "patterns", id, "list_patterns");
+            }
+            out.push_str(&format!("- {marker} {} — {}\n", p.name, opening_clause(&p.intent, 80).0));
+            compact += 1;
+            continue;
+        }
+
         out.push_str(&format!(
             "## {} {} (used {}x, reverted {}, survival {:.0}%)\nIntent: {}\n",
             marker,
@@ -1079,6 +1178,12 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
             if expanded > 0 { format!(", {expanded} expanded as relevant") } else { String::new() },
         ));
     }
+    if compact > 0 {
+        out.push_str(&format!(
+            "({compact} of them share no word with your hint and are shown on one line, \
+             intent cut where it ends in …)\n"
+        ));
+    }
     if over_cap > 0 {
         out.push_str(&format!(
             "({over_cap} further patterns also matched but were not expanded — the \
@@ -1089,19 +1194,7 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
     // Last line of defence. The ranking and the cap should already keep this
     // well under the limit, but a `detail=full` call over a store that keeps
     // growing must degrade to a shorter answer rather than to a transport error.
-    if out.len() > MAX_RESPONSE_CHARS {
-        let keep = out
-            .char_indices()
-            .take_while(|(i, _)| *i < MAX_RESPONSE_CHARS)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        out.truncate(keep);
-        out.push_str(
-            "\n\n[truncated: this response hit the size limit. Pass a narrower hint, \
-             or detail=\"summary\", to see the rest.]\n",
-        );
-    }
+    cap_response(&mut out, "Pass a narrower hint, or detail=\"summary\", to see the rest.");
 
     // A hint is mandatory now, so it can no longer be absent — but it can still
     // tokenise to nothing (all stop-words, or terms no pattern uses). Say which
@@ -1178,6 +1271,46 @@ fn text_hint_score(haystack: &str, tokens: &[String]) -> usize {
                 || (t.len() >= 6 && words.iter().any(|w| w.len() >= t.len() && w.starts_with(t.as_str())))
         })
         .count()
+}
+
+/// The opening clause of a one-line entry, for listing it without its detail.
+/// Returns the text and whether it was shortened.
+///
+/// Cut at the first clause break (` — `, ` - `, `; `, `: `, `. `) between 30
+/// and `limit` bytes, else at the last space before `limit`. By project
+/// convention a description opens with what goes wrong, so the cut keeps the
+/// part that lets a reader recognise the entry.
+fn opening_clause(s: &str, limit: usize) -> (String, bool) {
+    let s = s.trim();
+    if s.len() <= limit {
+        return (s.to_string(), false);
+    }
+    let mut boundary = limit;
+    while !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let cut = [" — ", " - ", "; ", ": ", ". "]
+        .iter()
+        .filter_map(|sep| s.find(sep))
+        .filter(|i| (30..=boundary).contains(i))
+        .min()
+        .or_else(|| s[..boundary].rfind(' ').filter(|&i| i > 30))
+        .unwrap_or(boundary);
+    (format!("{} …", &s[..cut]), true)
+}
+
+/// Last line of defence against a response the transport would reject: cut at
+/// `MAX_RESPONSE_CHARS` on a char boundary and say what to narrow.
+fn cap_response(out: &mut String, advice: &str) {
+    if out.len() <= MAX_RESPONSE_CHARS {
+        return;
+    }
+    let mut keep = MAX_RESPONSE_CHARS;
+    while !out.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    out.truncate(keep);
+    out.push_str(&format!("\n\n[truncated: this response hit the size limit. {advice}]\n"));
 }
 
 /// The score at which an entry is worth expanding.
@@ -1275,10 +1408,11 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
     // at 71,633 characters measured on list_patterns, one the transport rejects
     // outright, which turns the mandatory pre-code check into an error.
     let threshold = hint_expand_threshold(&tokens);
-    let mut ranked: Vec<(usize, usize)> = aps
+    let scores: Vec<usize> = aps.iter().map(|ap| hint_score(ap, &tokens)).collect();
+    let mut ranked: Vec<(usize, usize)> = scores
         .iter()
+        .copied()
         .enumerate()
-        .map(|(i, ap)| (i, hint_score(ap, &tokens)))
         .filter(|(_, s)| *s >= threshold)
         .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1291,6 +1425,7 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
     let mut expanded = 0usize;
     let mut listed = 0usize;
     let mut unchanged = 0usize;
+    let mut shortened = 0usize;
 
     for (idx, ap) in aps.iter().enumerate() {
         // Telemetry is recorded for EVERY entry, shown or not. Only targeted
@@ -1322,8 +1457,23 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
                 ap.description, ap.wrong, ap.correct));
             expanded += 1;
         } else {
-            out.push_str(&format!("- {}
-", ap.description));
+            // Every trap stays listed -- that is this call's safety function, and
+            // it earns it: of 43 real edit-guard firings with a hinted call in
+            // the three hours before, 20 were traps sharing no word with that
+            // hint. So nothing is dropped; a trap unrelated to the hint is cut
+            // to its opening clause, which by convention says what goes wrong.
+            // Replayed over 49 real first calls: median 56.8KB -> 42.4KB.
+            // A delta (`since`) lists only new entries, and those stay whole.
+            let text = if since.is_none() && !tokens.is_empty() && scores[idx] == 0 {
+                let (clause, cut) = opening_clause(&ap.description, 90);
+                if cut {
+                    shortened += 1;
+                }
+                clause
+            } else {
+                ap.description.clone()
+            };
+            out.push_str(&format!("- {text}\n"));
             listed += 1;
         }
     }
@@ -1349,6 +1499,12 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
             "
 ({listed} listed by description only — their wrong/correct text is one call away:              get_anti_patterns with hint=\"<what you are writing>\", or detail=\"full\" for all of them.)
 "
+        ));
+    }
+    if shortened > 0 {
+        body.push_str(&format!(
+            "({shortened} of them share no word with your hint and are cut to their opening \
+             clause, ending in …; name the API or behaviour to see one whole.)\n"
         ));
     }
     if over_cap > 0 {
@@ -2581,24 +2737,25 @@ mod tests {
         let store = crate::test_support::TempStore::new("tool_semantic_hybrid").unwrap();
         let query = "spawn plugin";
 
+        // Identical PARTIAL vectors, so only the keyword hit can separate them.
+        // With full vectors both scored 1.0 and the test passed on input order.
         let lexical_only = unit_with_terms(
             "test::lexical_only",
             "lexical_only",
             "fn lexical_only() { // spawn plugin }",
-            build_term_vector_str(query),
+            build_term_vector_str("spawn"),
         );
         let semantic_only = unit_with_terms(
             "test::semantic_only",
             "semantic_only",
             "fn semantic_only() {}",
-            build_term_vector_str(query),
+            build_term_vector_str("spawn"),
         );
 
         store.upsert_unit(&lexical_only).unwrap();
         store.upsert_unit(&semantic_only).unwrap();
-        store.rebuild_fts().unwrap();
 
-        let units = vec![lexical_only, semantic_only];
+        let units = vec![semantic_only, lexical_only];
         let sessions = SessionRegistry::new();
         let out = super::tool_semantic_search(
             &json!({"query": query, "limit": 5}),
@@ -2852,6 +3009,107 @@ mod tests {
         let n = store.all_anti_patterns().unwrap().len();
         assert!(out.contains(&format!("{n} listed by description only")),
             "with no matches, every entry stays indexed: {out}");
+    }
+
+    /// Shortening an unrelated trap must never hide it.
+    #[test]
+    fn an_unrelated_trap_is_shortened_but_still_listed() {
+        let store = ap_store("ap_shorten");
+        let long = "Using collision layer 0 for objects silently disables dynamic-to-dynamic \
+                    collision detection, because the solver treats layer 0 as unassigned";
+        crate::crystallizer::add_anti_pattern(&store, long, "layer 0", "use layer 1+", vec![]).unwrap();
+
+        let out = tool_get_anti_patterns(
+            &json!({"hint": "slint flickable preferred height layout"}), &store, "s1").unwrap();
+        assert!(!out.contains(long), "an unrelated long description should be cut: {out}");
+        assert!(out.contains("Using collision layer 0 for objects silently disables"),
+            "...but its opening must still be listed: {out}");
+        assert!(out.contains("Pool objects accumulate gravity between uses"),
+            "a short unrelated entry is listed whole: {out}");
+        assert!(out.contains("give it an explicit height"), "the related trap still expands: {out}");
+    }
+
+    #[test]
+    fn an_unrelated_pattern_gets_one_line_but_is_still_listed() {
+        let store = crate::test_support::TempStore::new("lp_compact").unwrap();
+        crate::crystallizer::add_pattern(&store, "shadow-map-in-group0",
+            "Add a sun shadow map without exceeding max_bind_groups", "fold it into group 0",
+            vec![], vec![], "procedure").unwrap();
+        crate::crystallizer::add_pattern(&store, "slint-zero-size-children",
+            "Diagnose invisible Slint UI as a layout fault", "check preferred height",
+            vec![], vec![], "procedure").unwrap();
+
+        let out = super::tool_list_patterns(&json!({"hint": "shadow map bind group"}), &store, "s").unwrap();
+        assert!(out.contains("slint-zero-size-children — Diagnose invisible Slint UI"), "{out}");
+        assert!(out.contains("## ✓ shadow-map-in-group0"), "the related pattern keeps its full entry: {out}");
+    }
+
+    #[test]
+    fn recall_lists_every_match_but_prints_only_the_closest_in_full() {
+        let store = crate::test_support::TempStore::new("recall_cap").unwrap();
+        for i in 0..8 {
+            crate::crystallizer::add_pattern(&store, &format!("shadow-pattern-{i}"),
+                "shadow map intent", &format!("body {i} about the shadow map"),
+                vec![], vec![], "procedure").unwrap();
+        }
+        let sessions = SessionRegistry::new();
+        let out = super::tool_recall(&json!({"topic": "shadow map"}), &store, &[], &sessions, "s").unwrap();
+
+        for i in 0..8 {
+            assert!(out.contains(&format!("shadow-pattern-{i}")), "match {i} was dropped: {out}");
+        }
+        assert_eq!(out.matches("### shadow-pattern-").count(), super::RECALL_FULL_PER_SECTION);
+        assert!(out.contains("expand_memory id="), "{out}");
+    }
+
+    /// The session registry outlives the client's context, so a reference must
+    /// name the call that turns it back into the item -- and that call must work.
+    #[test]
+    fn a_session_reference_can_be_turned_back_into_the_item() {
+        let store = crate::test_support::TempStore::new("refetch").unwrap();
+        let units = canvases();
+        let id = units[0].id.clone();
+        let sessions = SessionRegistry::new();
+        let args = json!({"name": id});
+
+        let first = super::tool_get_item(&args, &store, &units, &sessions, "s").unwrap();
+        let again = super::tool_get_item(&args, &store, &units, &sessions, "s").unwrap();
+        assert!(again.contains(&format!("get_item name=\"{id}\" resend=true")), "{again}");
+
+        let resent = super::tool_get_item(
+            &json!({"name": id, "resend": true}), &store, &units, &sessions, "s").unwrap();
+        let body = units[0].compressed.as_str();
+        assert!(first.contains(body), "the first call returns the unit");
+        assert!(resent.contains(body), "resend must return the whole unit again: {resent}");
+    }
+
+    #[test]
+    fn a_large_unit_is_capped_at_a_line_break_with_a_pointer_to_the_whole() {
+        let mut big = unit("canvas::core::Canvas", "Canvas", &[]);
+        big.compressed = (0..600).map(|i| format!("method_{i}(é) -> Frame\n")).collect();
+        assert!(big.compressed.len() > 10_000);
+
+        let capped = super::cap_unit_text(&big, 4_000);
+        let (kept, pointer) = capped.split_once("\n… ").expect("a pointer line");
+        assert!(kept.len() <= 4_000 && big.compressed.starts_with(kept), "cut mid-line or past the cap");
+        assert!(kept.ends_with("-> Frame"), "the cut must fall on a line break: {:?}", &kept[kept.len() - 20..]);
+        assert!(pointer.contains("get_item name=\"canvas::core::Canvas\" resend=true"), "{pointer}");
+
+        let small = unit("m::Small", "Small", &["a"]);
+        assert_eq!(super::cap_unit_text(&small, 4_000), small.compressed, "a small unit is untouched");
+    }
+
+    #[test]
+    fn opening_clause_cuts_at_a_clause_break_on_a_char_boundary() {
+        let s = "A cached staleness warning outlives the condition it warns about — worse than \
+                 no warning, because it teaches the reader to ignore the next one";
+        assert_eq!(
+            super::opening_clause(s, 90).0,
+            "A cached staleness warning outlives the condition it warns about …"
+        );
+        let (cut, shortened) = super::opening_clause(&"é".repeat(60), 90);
+        assert!(shortened && cut.ends_with(" …"), "{cut}");
+        assert_eq!(super::opening_clause("short", 90), ("short".to_string(), false));
     }
 
     #[test]

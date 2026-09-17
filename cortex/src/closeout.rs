@@ -195,7 +195,7 @@ pub fn run_closeout(
                         // this advice literally would leave the user in exactly
                         // the state the message is asking them to fix.
                         "graph snapshot SKIPPED — {reason}, and rebuild failed: {}. \
-                         Run: graphify-rs build --path . --code-only --update --output .graphify-output",
+                         Run: graphify-rs build --path . --code-only --format json --no-llm --update --output .graphify-output",
                         crate::closeout::one_line(&e.to_string())
                     ));
                 }
@@ -209,8 +209,13 @@ pub fn run_closeout(
             let dest = snapshots_dir.join(format!("graph_{ts}.json"));
             if std::fs::copy(&graph_src, &dest).is_ok() {
                 result.graph_snapshot_written = true;
-                // Prune snapshots older than 30 days.
-                prune_old_snapshots(&snapshots_dir, 30);
+                // `[consolidation] graph_snapshot_days` was parsed and documented
+                // but never read here; the age limit was a literal 30.
+                let max_age_days = prefs_path
+                    .and_then(|p| crate::prefs::load(p).ok())
+                    .map(|p| u64::from(p.consolidation.graph_snapshot_days))
+                    .unwrap_or(30);
+                prune_old_snapshots(&snapshots_dir, max_age_days);
                 let _ = store.conn().execute(
                     "UPDATE protocol_sessions SET graph_snapshot_written = 1 WHERE session_key = ?1",
                     params![session_key],
@@ -350,7 +355,7 @@ fn commit_marker(
     prefs_path: Option<&Path>,
 ) -> Result<bool> {
     match marker {
-        KnowledgeMarker::Pattern { name, intent, body, trust, uses, tags } => {
+        KnowledgeMarker::Pattern { name, intent, body, trust, kind, uses, tags } => {
             // Check for duplicate name.
             let exists: bool = store.conn().query_row(
                 "SELECT COUNT(*) > 0 FROM patterns WHERE name = ?1",
@@ -372,7 +377,7 @@ fn commit_marker(
                 survival_rate: 1.0,
                 credibility: 0.0,
                 trust_level: crate::model::TrustLevel::default(),
-                kind: crate::model::MemoryKind::default(),
+                kind: crate::model::MemoryKind::from_str(kind),
                 tier: crate::model::EpistemicTier::default(),
                 hash: None,
                 included_in_context_count: 0,
@@ -776,36 +781,36 @@ fn extract_markers_from_mcp_calls(store: &Store) -> Result<Vec<KnowledgeMarker>>
 
 // ── Graph snapshot pruning ────────────────────────────────────────────────────
 
-const MAX_SNAPSHOTS: usize = 50;
+/// Drift analysis and `cortex graph-diff` only ever read the NEWEST snapshot
+/// (`graph_diff::find_previous_snapshot`); nothing else reads this directory.
+/// At ~34MB each, a cap of 50 held 1.1GB for one file's worth of use. A few are
+/// kept so a manual diff against a slightly older baseline stays possible.
+const MAX_SNAPSHOTS: usize = 5;
 
 fn prune_old_snapshots(dir: &Path, max_age_days: u64) {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(max_age_days * 86400))
         .unwrap_or(std::time::UNIX_EPOCH);
 
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    if mtime < cutoff {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
-        }
-    }
-
-    // Count-based pruning: keep only the N newest snapshots.
-    let mut snapshots: Vec<_> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            snapshots.push(entry.path());
-        }
-    }
+    let mut snapshots: Vec<std::path::PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().map(|e| e.path()).collect(),
+        Err(_) => return,
+    };
+    // Names carry the timestamp, so newest first.
     snapshots.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-    while snapshots.len() > MAX_SNAPSHOTS {
-        if let Some(old) = snapshots.pop() {
-            let _ = std::fs::remove_file(&old);
+
+    for (i, path) in snapshots.iter().enumerate() {
+        // The newest is the drift baseline and survives whatever its age.
+        // Age comes from mtime, and std::fs::copy carries graph.json's mtime over
+        // to the snapshot -- so without this, a fresh snapshot of a graph built
+        // long ago was deleted the moment it was written.
+        let too_old = i > 0
+            && std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map(|t| t < cutoff)
+                .unwrap_or(false);
+        if i >= MAX_SNAPSHOTS || too_old {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -940,13 +945,49 @@ correct: y[/CORTEX-AP]
         let store = test_store("promote");
         stage_marker(&store, "s1", &KnowledgeMarker::Pattern {
             name: "p1".into(), intent: "i".into(), body: "b".into(),
-            trust: "verified".into(), uses: vec![], tags: vec![],
+            trust: "verified".into(), kind: String::new(), uses: vec![], tags: vec![],
         }).unwrap();
         // Must not error — the old LIMIT form failed at prepare time.
         mark_promoted(&store, "s1", "pattern", "p1").unwrap();
         let promoted: i64 = store.conn().query_row(
             "SELECT COUNT(*) FROM knowledge_markers WHERE promoted = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(promoted, 1);
+    }
+
+    #[test]
+    fn snapshot_pruning_keeps_only_the_newest_few() {
+        let dir = crate::test_support::TempDir::new("snap_prune").unwrap();
+        for day in 1..=9 {
+            std::fs::write(dir.join(&format!("graph_2026090{day}_000000.json")), "{}").unwrap();
+        }
+        prune_old_snapshots(dir.path(), 30);
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path()).unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), MAX_SNAPSHOTS);
+        assert_eq!(left.last().unwrap(), "graph_20260909_000000.json", "the newest must survive");
+    }
+
+    /// A snapshot inherits graph.json's mtime through the copy, so a graph built
+    /// long ago yields a brand-new snapshot that already looks old.
+    #[test]
+    fn the_newest_snapshot_survives_age_pruning_whatever_its_mtime() {
+        let dir = crate::test_support::TempDir::new("snap_age").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86400);
+        for day in 1..=3 {
+            let p = dir.join(&format!("graph_2026090{day}_000000.json"));
+            std::fs::write(&p, "{}").unwrap();
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(long_ago).unwrap();
+        }
+        prune_old_snapshots(dir.path(), 30);
+
+        let left: Vec<String> = std::fs::read_dir(dir.path()).unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(left, vec!["graph_20260903_000000.json".to_string()],
+            "old snapshots go, but the drift baseline must not");
     }
 }
 
@@ -1027,6 +1068,12 @@ fn rebuild_graph(repo_root: &Path) -> Result<()> {
             "build",
             "--path", ".",
             "--code-only",
+            // Only graph.json is read, by cortex and by the graphify MCP server.
+            // Without --format every rebuild also wrote html, graphml, cypher,
+            // svg, wiki and obsidian output: ~340MB and ~50,000 files, unused.
+            "--format", "json",
+            // Local only, matching the rebuild command in the operating manual.
+            "--no-llm",
             "--update",
             "--output", ".graphify-output",
         ])

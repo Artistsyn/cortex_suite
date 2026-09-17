@@ -111,6 +111,8 @@ config drift between editors, and the PowerShell 5.1 traps.
 - `get_anti_patterns(hint)` / `list_patterns(hint)` — the traps and the vetted
   approaches for what you are about to write
 - `recall(topic)` — have we solved this before?
+- `set_checkpoint` / `get_checkpoint` — save where a long task stands and pick it
+  up again after a context reset
 - `quartz-ctx generate` — full API sheets in seconds: every type, variant and
   signature, with worked syntax mined from your `examples/` and `#[test]` bodies,
   `file:line` on every item, and a documentation-coverage report that names each
@@ -120,7 +122,7 @@ config drift between editors, and the PowerShell 5.1 traps.
 
 **Pass a `hint`.** `get_anti_patterns`, `list_patterns` and `get_preferences`
 require one. These tools list everything regardless — the hint decides what gets
-expanded. It cuts a session boot from ~34k tokens to ~10k with nothing dropped,
+expanded, and entries sharing no word with it are cut to one line. It cuts a session boot from ~34k tokens to ~10k with nothing dropped,
 and it is the only thing that records which knowledge actually proved useful.
 
 ## What you have to review

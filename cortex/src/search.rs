@@ -32,13 +32,20 @@ pub fn semantic_search<'a>(
     scored
 }
 
+/// How much of the gap to a perfect score the best keyword hit can close.
+const LEXICAL_WEIGHT: f32 = 0.55;
+
 /// Hybrid BM25 + cosine search.
 ///
-/// Lexical rank (0-indexed BM25 position) and cosine similarity are combined:
-///   score = 0.55 × (1 / (1 + lexical_rank)) + 0.45 × cosine_similarity
+/// Each unit keeps its cosine similarity, and a keyword hit closes part of the
+/// remaining gap to 1.0 -- less the further down the BM25 ranking it sits:
 ///
-/// This matches the formula verified in rta-smriti-brain and outperforms either
-/// signal alone on codebase corpora.
+///   score = cosine + (1 − cosine) × 0.55 / (1 + lexical_rank)
+///
+/// So a keyword match can only raise a score, never lower it. The first version
+/// blended the two (`0.55 / (1 + rank) + 0.45 × cosine`), under which a unit with
+/// cosine 0.9 that was also the second keyword hit fell to 0.68 -- below the
+/// very same unit with no keyword match at all.
 pub fn hybrid_search<'a>(
     store: &Store,
     query: &str,
@@ -59,14 +66,11 @@ pub fn hybrid_search<'a>(
         .iter()
         .map(|u| {
             let cosine = cosine_similarity(&query_vec, &u.term_vector);
-            let lex_rank = lexical_rank.get(u.id.as_str()).copied().unwrap_or(usize::MAX);
-            let score = if lex_rank == usize::MAX {
-                // No lexical evidence: keep pure semantic behavior instead of
-                // suppressing match confidence by a constant factor.
-                cosine
-            } else {
-                let lex_weight = 1.0 / (1.0 + lex_rank as f32);
-                0.55 * lex_weight + 0.45 * cosine
+            let score = match lexical_rank.get(u.id.as_str()) {
+                Some(&rank) => {
+                    cosine + (1.0 - cosine).max(0.0) * LEXICAL_WEIGHT / (1.0 + rank as f32)
+                }
+                None => cosine,
             };
             SearchResult { unit: u, score }
         })
@@ -96,7 +100,7 @@ pub fn keyword_search<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_term_vector_str, hybrid_search};
+    use super::{build_term_vector_str, hybrid_search, SearchResult};
     use crate::model::CodeUnit;
     use crate::test_support::TempStore;
 
@@ -119,6 +123,11 @@ mod tests {
         }
     }
 
+    fn score_of(results: &[SearchResult], id: &str) -> f32 {
+        results.iter().find(|r| r.unit.id == id).map(|r| r.score)
+            .unwrap_or_else(|| panic!("{id} missing from results"))
+    }
+
     #[test]
     fn hybrid_search_uses_lexical_rank_when_cosine_is_zero() {
         let store = TempStore::new("hybrid_lexical_only").unwrap();
@@ -133,16 +142,15 @@ mod tests {
         let no_hit = unit(
             "test::no_hit",
             "no_hit",
-            "no alpha token",
+            "no such token",
             "fn no_hit() { let beta = 2; }",
             vec![],
         );
 
         store.upsert_unit(&lexical_hit).unwrap();
         store.upsert_unit(&no_hit).unwrap();
-        store.rebuild_fts().unwrap();
 
-        let units = vec![lexical_hit.clone(), no_hit.clone()];
+        let units = vec![no_hit.clone(), lexical_hit.clone()];
         let results = hybrid_search(&store, "alpha", &units, 5);
 
         assert!(!results.is_empty(), "lexical hit should surface even with zero cosine");
@@ -150,36 +158,76 @@ mod tests {
         assert!(results[0].score > 0.0);
     }
 
+    /// The unit under test is only the SECOND keyword hit, which is where the
+    /// original blend went wrong: it scored below an identical unit that did
+    /// not match the keywords at all.
     #[test]
-    fn hybrid_search_blends_lexical_and_semantic_signals() {
-        let store = TempStore::new("hybrid_blend").unwrap();
-        let query = "spawn plugin";
+    fn a_keyword_hit_never_lowers_a_score() {
+        let store = TempStore::new("hybrid_monotonic").unwrap();
 
-        let lexical_only = unit(
-            "test::lexical_only",
-            "lexical_only",
-            "contains query text for lexical match",
-            "fn lexical_only() { // spawn plugin }",
-            build_term_vector_str(query),
+        let top = unit(
+            "test::spawn_plugin", "spawn_plugin", "spawn plugin",
+            "fn spawn_plugin() { spawn plugin }", vec![],
         );
-        let semantic_only = unit(
-            "test::semantic_only",
-            "semantic_only",
-            "semantic vector only",
-            "fn semantic_only() { }",
-            build_term_vector_str(query),
+        let second = unit(
+            "test::second", "second", "",
+            "fn second() { spawn }", build_term_vector_str("spawn"),
         );
+        let twin = unit(
+            "test::twin", "twin", "",
+            "fn twin() {}", build_term_vector_str("spawn"),
+        );
+        for u in [&top, &second, &twin] {
+            store.upsert_unit(u).unwrap();
+        }
 
-        store.upsert_unit(&lexical_only).unwrap();
-        store.upsert_unit(&semantic_only).unwrap();
-        store.rebuild_fts().unwrap();
+        let units = vec![twin.clone(), second.clone(), top.clone()];
+        let results = hybrid_search(&store, "spawn plugin", &units, 5);
 
-        let units = vec![lexical_only.clone(), semantic_only.clone()];
-        let results = hybrid_search(&store, query, &units, 5);
+        let (second_score, twin_score) = (score_of(&results, "test::second"), score_of(&results, "test::twin"));
+        assert!(
+            second_score > twin_score,
+            "a keyword match lowered the score: {second_score} with the hit vs {twin_score} without"
+        );
+    }
 
-        assert_eq!(results.len(), 2, "both lexical and semantic candidates should appear");
-        assert_eq!(results[0].unit.id, lexical_only.id);
-        assert!(results.iter().any(|r| r.unit.id == semantic_only.id));
+    /// Requiring every query word in one unit meant only a big unit could match
+    /// a multi-word query: the live `canvas::core::Canvas` (~1,450 tokens) was
+    /// the only unit containing both "spawn" and "plugin", so it came first and
+    /// every unit actually about spawning was not a keyword hit at all.
+    #[test]
+    fn keyword_search_matches_any_term() {
+        let store = TempStore::new("fts_any_term").unwrap();
+        let both = unit("test::Canvas", "Canvas", "", "fn draw() { spawn(); plugin(); }", vec![]);
+        let one = unit("test::spawn", "spawn", "spawn an object", "fn spawn(obj)", vec![]);
+        for u in [&both, &one] {
+            store.upsert_unit(u).unwrap();
+        }
+
+        let hits = store.fts_code_units("spawn plugin", 5).unwrap();
+        assert!(
+            hits.iter().any(|(id, _)| id == "test::spawn"),
+            "a unit matching one of the query words was not a keyword hit: {hits:?}"
+        );
+        assert!(
+            store.fts_code_units("spawn or not", 5).is_ok(),
+            "a query word that is also an FTS5 operator broke the search"
+        );
+    }
+
+    /// Two units of the same size holding the same word: the one NAMED for it
+    /// must rank first, not tie with one that only uses it in its body.
+    #[test]
+    fn a_name_match_outranks_the_same_word_in_a_body() {
+        let store = TempStore::new("fts_name_weight").unwrap();
+        let in_body = unit("test::go", "go", "", "fn go() { spawn }", vec![]);
+        let named = unit("test::spawn", "spawn", "", "fn spawn() { go }", vec![]);
+        for u in [&in_body, &named] {
+            store.upsert_unit(u).unwrap();
+        }
+
+        let hits = store.fts_code_units("spawn", 5).unwrap();
+        assert_eq!(hits.first().map(|(id, _)| id.as_str()), Some("test::spawn"), "{hits:?}");
     }
 
     #[test]
@@ -196,7 +244,6 @@ mod tests {
         );
 
         store.upsert_unit(&semantic_only).unwrap();
-        store.rebuild_fts().unwrap();
 
         let units = vec![semantic_only.clone()];
         let results = hybrid_search(&store, query, &units, 5);

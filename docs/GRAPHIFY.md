@@ -27,7 +27,7 @@ map, not ground truth about signatures**.
 cargo install graphify-rs
 ```
 
-Installs `graphify-rs` to `~/.cargo/bin`. Verified against **v0.8.0**. No other
+Installs `graphify-rs` to `~/.cargo/bin`. Verified against **v0.8.1**. No other
 dependencies; `--no-llm` / `--code-only` keep it fully local.
 
 ## Build a graph — `--output` is NOT optional
@@ -152,12 +152,17 @@ What cortex does with it:
 1. **At session closeout** it snapshots `graph.json` into
    `.graphify-output/snapshots/graph_<timestamp>.json`.
 2. **If the graph is stale** it rebuilds first, invoking graphify itself with
-   `--output .graphify-output` — so cortex's own rebuild is correct even if your
-   habit is not.
+   `--code-only --format json --no-llm --update --output .graphify-output` — so
+   cortex's own rebuild is correct even if your habit is not, and writes only the
+   `graph.json` that cortex and the MCP server read.
 3. **If the rebuild fails** it *skips* the snapshot and says why, rather than
    emitting a drift measurement against a stale file.
 4. **The consolidation pipeline** compares consecutive snapshots to detect
    architectural drift.
+5. **Old snapshots are pruned** at each closeout. Only the newest is ever read —
+   it is the drift baseline — so the five newest are kept, and any older than
+   `graph_snapshot_days` (`[consolidation]` in `.cortex/prefs.toml`, default 30)
+   are removed. The newest is never removed, whatever its age.
 
 Two consequences worth knowing:
 

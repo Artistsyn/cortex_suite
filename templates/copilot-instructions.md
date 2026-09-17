@@ -81,6 +81,10 @@ Embed markers as you go:
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
 ```
 
+A pattern takes an optional `kind="constraint|policy|fact"` (default
+`procedure`). Constraints and policies are served in their own sections ahead
+of ordinary patterns in `get_context`.
+
 Write the description as **what goes wrong**, not what the feature is, and tag
 with the API name, the behaviour, the domain and the colloquial term — entries
 are found by concept, not exact spelling.

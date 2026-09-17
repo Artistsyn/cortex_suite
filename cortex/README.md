@@ -68,7 +68,7 @@ Required MCP baseline tools: `get_delta`, `get_preferences`, `get_anti_patterns`
 
 ---
 
-## MCP Tools (22 total)
+## MCP Tools (29 total)
 
 | Tool | Purpose |
 |------|---------|
@@ -83,12 +83,16 @@ Required MCP baseline tools: `get_delta`, `get_preferences`, `get_anti_patterns`
 | `suggest_pattern` | Queue a pattern for review |
 | `query_graph` | Cross-crate dependency queries |
 | `simulate_change` | Preview impact of a code change |
-| `recurrent_think` | 4-dimensional iterative hypothesis refinement |
 | `begin_protocol_session` | Activate PROTOCOL mode + Phase 0 gating |
 | `get_session_health` | One-call health: Phase 0 status, gaps, proposals |
 | `flush_knowledge_markers` | Extract CORTEX-* tags from session turns |
 | `closeout_session` | Complete session closeout (Tier 1/2 commit model) |
 | `propose_skill` | Stage a skill candidate for review |
+| `note_challenge` / `resolve_challenge` | Record a disputed claim, then settle it with evidence |
+| `edit_guard` | Warn when an edit touches a recorded trap (installed as a hook) |
+| `compact_output` | Lossless compaction of command output (installed as a hook) |
+| `set_checkpoint` / `get_checkpoint` | Save and resume where a long task stands |
+| `list_memory_handles` / `expand_memory` | Every pattern on one line, then one body by id |
 | `get_syntax` / `get_usage_examples` / `get_helper` / `list_all` / `explain_dependency_path` | Code lookup |
 
 Delta controls: `include`, `exclude`, `max_files`, `max_patch_lines`
@@ -223,7 +227,7 @@ Rejected proposals logged to `.cortex/rejected-proposals.jsonl` (auto-rotated at
 ## Session Closeout (KNOWLEDGE COMMITTED)
 
 ```markdown
-[CORTEX-PATTERN: name="..." intent="..." trust="verified" uses="..."]body[/CORTEX-PATTERN]
+[CORTEX-PATTERN: name="..." intent="..." trust="verified" uses="..." kind="procedure|constraint|policy|fact"]body[/CORTEX-PATTERN]
 [CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
 [CORTEX-ADR: title="..." tags="..."]Context: ... Decision: ...[/CORTEX-ADR]

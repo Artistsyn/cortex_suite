@@ -80,7 +80,7 @@ impl MemoryKind {
 
 // ── Trust level ───────────────────────────────────────────────────────────────
 
-/// How a pattern was established — drives authority_score weighting.
+/// How a pattern was established.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TrustLevel {
     /// Manually promoted by the developer; highest confidence.
@@ -106,15 +106,6 @@ impl TrustLevel {
             "authoritative" => Self::Authoritative,
             "candidate"     => Self::Candidate,
             _               => Self::Crystallized,
-        }
-    }
-
-    /// Numeric trust weight used in authority_score.
-    pub fn weight(&self) -> f32 {
-        match self {
-            Self::Authoritative => 1.0,
-            Self::Crystallized  => 0.65,
-            Self::Candidate     => 0.25,
         }
     }
 }
@@ -175,7 +166,7 @@ pub struct Pattern {
     pub kind: MemoryKind,
     /// Epistemic authority tier
     pub tier: EpistemicTier,
-    /// MD5 hash of name + body for dedup
+    /// SHA-256 of name + body; an identical insert resolves to the existing row
     pub hash: Option<String>,
     /// How many times this pattern was included in a context pack
     pub included_in_context_count: i64,
@@ -198,7 +189,7 @@ pub struct AntiPattern {
     pub correct: String,
     pub tags: Vec<String>,
     pub added_at: DateTime<Utc>,
-    /// MD5 hash of description + wrong for dedup
+    /// SHA-256 of description + wrong; an identical insert resolves to the existing row
     pub hash: Option<String>,
     /// Superseded by another anti-pattern (soft delete)
     pub superseded_by: Option<i64>,
@@ -212,7 +203,7 @@ pub struct Annotation {
     pub body: String,
     pub tags: Vec<String>,
     pub added_at: DateTime<Utc>,
-    /// MD5 hash of topic + body for dedup
+    /// SHA-256 of topic + body; an identical insert resolves to the existing row
     pub hash: Option<String>,
 }
 
@@ -382,40 +373,6 @@ pub struct Checkpoint {
     pub updated_at: DateTime<Utc>,
 }
 
-// ── Context budget ────────────────────────────────────────────────────────────
-
-/// Per-block token budget breakdown for the assembled context pack.
-/// Returned alongside the rendered pack so the LLM can self-regulate.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ContextWindowOverview {
-    pub total_budget:       usize,
-    pub used_checkpoint:    usize,
-    pub used_api:           usize,
-    pub used_adrs:          usize,
-    pub used_patterns:      usize,
-    pub used_constraints:   usize,
-    pub used_annotations:   usize,
-    pub used_deltas:        usize,
-    pub total_used:         usize,
-    pub truncated:          bool,
-}
-
-// ── Pattern history ───────────────────────────────────────────────────────────
-
-/// Audit log entry for a pattern mutation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PatternHistoryEntry {
-    pub id: Option<i64>,
-    pub pattern_id: i64,
-    /// "ADD", "UPDATE", "SUPERSEDE", "DELETE"
-    pub event: String,
-    pub old_value: Option<String>,
-    pub new_value: Option<String>,
-    /// "crystallizer", "agent", "operator"
-    pub actor_id: String,
-    pub session_id: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
 
 // ── quartz-ctx integration ────────────────────────────────────────────────────
 

@@ -55,6 +55,10 @@ const UNCACHEABLE: &[&str] = &[
     // was recorded or settled when it was not.
     "note_challenge",
     "resolve_challenge",
+    // A replayed set_checkpoint would claim a save that never happened, and a
+    // replayed get_checkpoint would hand back a superseded one.
+    "set_checkpoint",
+    "get_checkpoint",
 ];
 
 pub fn serve(
@@ -303,6 +307,12 @@ fn tools_list() -> Value {
                             "description": "Optional scope prefix to restrict the search, \
                                             e.g. `synful`, `path_forge`, `ss_engine`. \
                                             Omit for the primary unscoped engine."
+                        },
+                        "resend": {
+                            "type": "boolean",
+                            "description": "Return the item in full even if it was sent earlier \
+                                            this session. Use it when a response references an \
+                                            item that is no longer in your context."
                         }
                     },
                     "required": ["name"]
@@ -718,6 +728,55 @@ fn tools_list() -> Value {
                     },
                     "required": ["id", "verdict", "subject", "evidence"]
                 }
+            },
+            {
+                "name": "set_checkpoint",
+                "description": "Save where the current task stands, so it can be resumed after a \
+                                context reset or compaction: the objective, what is verified, what \
+                                is still open, the next step, and approaches that must not be \
+                                retried. Append-only -- each call adds a new version for this session.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "objective":             { "type": "string", "description": "What the task is trying to accomplish." },
+                        "verified_evidence":     { "type": "string", "description": "What has been confirmed, and how." },
+                        "remaining_gaps":        { "type": "string", "description": "What is still unknown or unfinished." },
+                        "next_action":           { "type": "string", "description": "The specific next step." },
+                        "prohibited_repetition": { "type": "string", "description": "Approaches already tried that must not be tried again." }
+                    },
+                    "required": ["objective"]
+                }
+            },
+            {
+                "name": "get_checkpoint",
+                "description": "Return the latest checkpoint saved with set_checkpoint. scope=session \
+                                (default) reads this MCP session's; scope=any reads the most recent \
+                                from any session -- use that after a restart, when the session id \
+                                has changed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": { "type": "string", "enum": ["session", "any"], "description": "Which checkpoints to consider." }
+                    }
+                }
+            },
+            {
+                "name": "list_memory_handles",
+                "description": "List every live pattern as one line -- id, name, kind, intent -- \
+                                without bodies. Follow with expand_memory for only the bodies you need.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "expand_memory",
+                "description": "Return one pattern's full body, uses and tags by id (ids come from \
+                                list_memory_handles).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "description": "Pattern id." }
+                    },
+                    "required": ["id"]
+                }
             }
         ]
     })
@@ -795,6 +854,32 @@ mod tests {
                 enum_values.iter().any(|v| v.as_str() == Some("full")),
                 "{tool_name} missing full detail tier"
             );
+        }
+    }
+
+    /// `tools/list` is a hand-written list, separate from `dispatch`. Four tools
+    /// shipped in dispatch only: they answered when called by name, and no
+    /// client could ever discover them.
+    #[test]
+    fn every_dispatched_tool_is_listed() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+
+        let src = include_str!("tools.rs");
+        let dispatch = &src[src.find("pub fn dispatch(").expect("dispatch fn")..];
+        let dispatch = &dispatch[..dispatch.find("unknown tool").expect("dispatch fallthrough")];
+        let names: Vec<&str> = dispatch
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix('"')?;
+                let (name, after) = rest.split_once('"')?;
+                after.trim_start().starts_with("=>").then_some(name)
+            })
+            .collect();
+        assert!(names.len() > 20, "parsed only {} dispatch arms -- the parse is broken", names.len());
+
+        for name in names {
+            assert!(find_tool(tools, name).is_some(), "`{name}` is dispatched but missing from tools/list");
         }
     }
 }
