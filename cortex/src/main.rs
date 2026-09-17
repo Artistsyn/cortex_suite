@@ -1179,7 +1179,7 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
             "--name",
             project_name
         ],
-        "description": "Cortex MCP direct binary server. Reindex via .cortex/cortex.ps1 reindex (uses .cortex/index-sources.json)."
+        "description": "Cortex MCP direct binary server. Reindex via .cortex/cortex.sh reindex (.cortex/cortex.ps1 on Windows); sources are listed in .cortex/index-sources.json."
     });
 
     std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp)?)

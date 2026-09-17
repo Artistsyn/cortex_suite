@@ -326,11 +326,21 @@ pub fn staleness_notice(conn: &Connection, repo_root: &std::path::Path) -> Optio
     notified.insert(key, stale.clone());
 
     Some(format!(
-        "
-
-[stale index] {} changed since it was indexed - answers about it may          predate your edits. Refresh with `.cortex/cortex.ps1 reindex`.          (shown once per change)",
+        "\n\n[stale index] {} changed since it was indexed - answers about it may \
+         predate your edits. Refresh with `{}`. (shown once per change)",
         stale.join(", "),
+        reindex_command(),
     ))
+}
+
+/// The launcher's reindex command on the machine cortex is running on. The
+/// notice used to name `cortex.ps1` everywhere, which is the Windows launcher.
+pub fn reindex_command() -> &'static str {
+    if cfg!(windows) {
+        r".\.cortex\cortex.ps1 reindex"
+    } else {
+        "./.cortex/cortex.sh reindex"
+    }
 }
 
 /// Roots whose source has moved since it was last ingested.
@@ -953,6 +963,22 @@ mod staleness_notice_tests {
     /// The cadence IS the design. Per call is noise that gets tuned out; once per
     /// session is missed because the edit happens mid-session. Once per change is
     /// the only one that is both timely and quiet.
+    /// The notice named `cortex.ps1` on every platform, and a broken line
+    /// continuation left runs of spaces in the middle of the sentence.
+    #[test]
+    fn the_notice_names_this_platforms_launcher_in_one_clean_sentence() {
+        let f = fixture("launcher");
+        std::fs::write(f.dir.join("src").join("c.rs"), "fn c() {}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // clear the debounce
+
+        let notice = staleness_notice(&f.conn, &f.dir).expect("an edit must be reported");
+        assert!(notice.contains(reindex_command()), "{notice}");
+        assert!(!notice.contains("  "), "stray whitespace in the notice: {notice:?}");
+        if !cfg!(windows) {
+            assert!(!notice.contains("cortex.ps1"), "the Windows launcher named on Unix: {notice}");
+        }
+    }
+
     #[test]
     fn fires_once_per_change_not_once_per_call() {
         let f = fixture("cadence");
