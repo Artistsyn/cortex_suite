@@ -178,7 +178,7 @@ cortex correction --attempted "..." --reason "..." --fix "..."
 Writes `.cortex/health-report.json` with pattern survival, pending proposals, orphaned sessions.
 
 ### Stage 2: Cluster sessions
-TF-IDF cosine similarity over tool sequences. Threshold: 0.55. Results: `.cortex/clusters.json`.
+TF-IDF cosine similarity over the tools that distinguish a session (hook, session-protocol and generic editing tools are excluded) plus the top-level directories it touched. Threshold: 0.55. Results: `.cortex/clusters.json`. A skill candidate is named from what its sessions share, so rejecting one candidate never hides different work.
 
 ### Stage 3: Detect skills
 Clusters with ≥ `skill_candidate_min_occurrences` (default 3) become SKILL.md drafts.

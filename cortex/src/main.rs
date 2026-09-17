@@ -4229,7 +4229,7 @@ fn run_cluster_sessions(threshold: f32, output: Option<&Path>, db_path: &Path) -
     let snapshots = miner::load_snapshots(&mined_tasks_dir)?;
     if snapshots.is_empty() {
         println!("[cortex] No session snapshots found in {}.", mined_tasks_dir.display());
-        println!("         Run closeout_session (or cortex.ps1 post-session) to generate snapshots.");
+        println!("         Run closeout_session (or {}) to generate snapshots.", crate::cache::launcher_command("post-session"));
         return Ok(());
     }
 
@@ -4251,16 +4251,12 @@ fn run_detect_skills(min_occurrences: u32, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
     let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
 
-    // Load clusters from existing clusters.json if present, otherwise re-cluster.
-    let clusters_path = repo_root.join(".cortex").join("clusters.json");
-    let clusters: Vec<miner::SessionCluster> = if clusters_path.exists() {
-        let raw = std::fs::read_to_string(&clusters_path)?;
-        serde_json::from_str(&raw).unwrap_or_default()
-    } else {
-        let mined_tasks_dir = repo_root.join(".cortex").join("mined-tasks");
-        let snapshots = miner::load_snapshots(&mined_tasks_dir)?;
-        miner::cluster_snapshots(&snapshots, 0.55)
-    };
+    // Always re-cluster. A clusters.json written by an older build lacks the
+    // shared signal tools and domains candidates are named from, so reading it
+    // back would detect nothing and say nothing.
+    let mined_tasks_dir = repo_root.join(".cortex").join("mined-tasks");
+    let snapshots = miner::load_snapshots(&mined_tasks_dir)?;
+    let clusters = miner::cluster_snapshots(&snapshots, 0.55);
 
     let prefs = load_prefs_from_repo(repo_root);
     let skills_dir = &prefs.skills.skills_dir;
@@ -4555,10 +4551,10 @@ fn run_health_report(db_path: &Path) -> Result<()> {
     println!("  unclosed sessions: {} (that did work)", orphans);
     println!("  hot gaps (7d):     {}", gaps);
 
-    if low_survival > 0 { println!("  ! {} low-survival patterns — run: cortex.ps1 quality-check", low_survival); }
+    if low_survival > 0 { println!("  ! {} low-survival patterns — run: {}", low_survival, crate::cache::launcher_command("quality-check")); }
     if orphans > 0       { println!("  ! {} unclosed session(s) with work in them — run: cortex session-orphans", orphans); }
-    if pending_proposals > 0 { println!("  ! {} proposals pending — run: cortex.ps1 review-proposals", pending_proposals); }
-    if gaps > 0          { println!("  ! {} hot query gaps — run: cortex.ps1 propose-gaps", gaps); }
+    if pending_proposals > 0 { println!("  ! {} proposals pending — run: {}", pending_proposals, crate::cache::launcher_command("review-proposals")); }
+    if gaps > 0          { println!("  ! {} hot query gaps — run: {}", gaps, crate::cache::launcher_command("propose-gaps")); }
     println!("===========================");
     Ok(())
 }

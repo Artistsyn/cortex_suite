@@ -27,6 +27,7 @@ pub struct SessionSnapshot {
 /// Load all session snapshots from `.cortex/mined-tasks/`.
 pub fn load_snapshots(mined_tasks_dir: &Path) -> Result<Vec<SessionSnapshot>> {
     let mut snapshots = Vec::new();
+    let repo_root = mined_tasks_dir.parent().and_then(Path::parent);
 
     if !mined_tasks_dir.exists() {
         return Ok(snapshots);
@@ -61,7 +62,9 @@ pub fn load_snapshots(mined_tasks_dir: &Path) -> Result<Vec<SessionSnapshot>> {
                     m
                 },
                 domain_tags: v["domain_tags"].as_array()
-                    .map(|a| a.iter().filter_map(|t| t.as_str()).map(str::to_string).collect())
+                    .map(|a| a.iter().filter_map(|t| t.as_str())
+                        .filter(|t| is_repo_dir(repo_root, t))
+                        .map(str::to_string).collect())
                     .unwrap_or_default(),
                 created_at: v["created_at"].as_str().map(str::to_string),
             };
@@ -74,6 +77,61 @@ pub fn load_snapshots(mined_tasks_dir: &Path) -> Result<Vec<SessionSnapshot>> {
     // Sort newest-first.
     snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     Ok(snapshots)
+}
+
+/// Whether a domain tag names a real top-level directory of the repository.
+///
+/// Snapshots written before the tagger resolved its repo root carry path
+/// fragments instead of domains -- on a live store `C:`, `Users`, `G:` and
+/// `private` outnumbered real domains roughly two to one -- and clustering on
+/// them grouped unrelated sessions by the drive they ran on.
+fn is_repo_dir(repo_root: Option<&Path>, tag: &str) -> bool {
+    let Some(root) = repo_root else { return false };
+    !tag.is_empty() && !tag.contains(['/', '\\', ':']) && root.join(tag).is_dir()
+}
+
+// ── Signal ────────────────────────────────────────────────────────────────────
+
+/// Tools that say nothing about what a session was for. Hooks fire the first
+/// three on every prompt, command and edit; the session protocol calls the next
+/// group in every session; and every coding session reads, edits and runs things.
+///
+/// Clustering on them grouped sessions by era rather than by work -- sessions
+/// from before the hooks existed formed clusters of their own -- and naming from
+/// them resolved nearly every cluster to `workflow-general`.
+pub const NON_SIGNAL_TOOLS: &[&str] = &[
+    "note_challenge", "compact_output", "edit_guard",
+    "get_delta", "get_preferences", "get_anti_patterns", "get_context", "list_patterns",
+    "begin_protocol_session", "get_session_health", "flush_knowledge_markers", "closeout_session",
+    "Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS", "TodoWrite",
+];
+
+/// A tool sequence with the non-signal tools removed, order kept.
+pub fn signal_tools(sequence: &[String]) -> Vec<String> {
+    sequence.iter().filter(|t| !NON_SIGNAL_TOOLS.contains(&t.as_str())).cloned().collect()
+}
+
+/// What a session is clustered on: its signal tools and its domain tags.
+fn cluster_tokens(s: &SessionSnapshot) -> Vec<String> {
+    let mut tokens = signal_tools(&s.tool_sequence);
+    tokens.extend(s.domain_tags.iter().map(|d| format!("domain:{d}")));
+    tokens
+}
+
+/// Items present in at least half of the lists, most common first, ties by name.
+fn shared(lists: impl Iterator<Item = Vec<String>>) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut n = 0usize;
+    for list in lists {
+        n += 1;
+        let unique: std::collections::HashSet<String> = list.into_iter().collect();
+        for item in unique {
+            *counts.entry(item).or_insert(0) += 1;
+        }
+    }
+    let mut common: Vec<(String, usize)> = counts.into_iter().filter(|(_, c)| c * 2 >= n).collect();
+    common.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    common.into_iter().map(|(t, _)| t).collect()
 }
 
 // ── TF-IDF term vector ────────────────────────────────────────────────────────
@@ -122,21 +180,34 @@ pub struct SessionCluster {
     pub total_markers: usize,
     /// Similarity threshold used.
     pub threshold: f32,
+    /// Signal tools used by at least half the members, most common first.
+    #[serde(default)]
+    pub signal_tools: Vec<String>,
+    /// Domain tags shared by at least half the members, most common first.
+    #[serde(default)]
+    pub domain_tags: Vec<String>,
 }
 
-/// Cluster session snapshots by TF-IDF tool-sequence similarity.
-/// Returns a list of clusters ordered by size descending.
+/// Cluster session snapshots by TF-IDF similarity of their signal tools and
+/// domain tags. Returns a list of clusters ordered by size descending.
 pub fn cluster_snapshots(
     snapshots: &[SessionSnapshot],
     threshold: f32,
 ) -> Vec<SessionCluster> {
-    if snapshots.is_empty() { return vec![]; }
+    // A session with nothing but non-signal tools and no domain says nothing
+    // about what kind of work it was; clustering it only yields a cluster of
+    // "sessions that happened".
+    let usable: Vec<(&SessionSnapshot, Vec<String>)> = snapshots.iter()
+        .map(|s| (s, cluster_tokens(s)))
+        .filter(|(_, tokens)| !tokens.is_empty())
+        .collect();
+    if usable.is_empty() { return vec![]; }
 
-    // Build corpus IDF: log(N / df) for each tool token.
-    let n = snapshots.len() as f32;
+    // Build corpus IDF: log(N / df) for each token.
+    let n = usable.len() as f32;
     let mut df: HashMap<String, usize> = HashMap::new();
-    for s in snapshots {
-        let unique: std::collections::HashSet<_> = s.tool_sequence.iter().collect();
+    for (_, tokens) in &usable {
+        let unique: std::collections::HashSet<_> = tokens.iter().collect();
         for t in unique { *df.entry(t.clone()).or_insert(0) += 1; }
     }
     let idf: HashMap<String, f32> = df.iter()
@@ -144,16 +215,16 @@ pub fn cluster_snapshots(
         .collect();
 
     // Build TF-IDF vector per snapshot.
-    let vecs: Vec<HashMap<String, f32>> = snapshots.iter()
-        .map(|s| build_tfidf(&s.tool_sequence, &idf))
+    let vecs: Vec<HashMap<String, f32>> = usable.iter()
+        .map(|(_, tokens)| build_tfidf(tokens, &idf))
         .collect();
 
     // Greedy clustering: each unassigned snapshot either joins an existing
     // cluster (if cosine ≥ threshold with centroid) or starts a new one.
     let mut cluster_centroids: Vec<usize>  = Vec::new();
-    let mut assignments: Vec<Option<usize>> = vec![None; snapshots.len()];
+    let mut assignments: Vec<Option<usize>> = vec![None; usable.len()];
 
-    for i in 0..snapshots.len() {
+    for i in 0..usable.len() {
         let mut best_cluster = None;
         let mut best_sim = 0.0f32;
 
@@ -178,16 +249,18 @@ pub fn cluster_snapshots(
     let mut clusters: Vec<SessionCluster> = (0..num_clusters).map(|ci| {
         let centroid_idx = cluster_centroids[ci];
         SessionCluster {
-            centroid_key: snapshots[centroid_idx].session_key.clone(),
+            centroid_key: usable[centroid_idx].0.session_key.clone(),
             members: vec![],
-            tool_sequence: snapshots[centroid_idx].tool_sequence.clone(),
+            tool_sequence: usable[centroid_idx].0.tool_sequence.clone(),
             outcome_counts: HashMap::new(),
             total_markers: 0,
             threshold,
+            signal_tools: vec![],
+            domain_tags: vec![],
         }
     }).collect();
 
-    for (i, snap) in snapshots.iter().enumerate() {
+    for (i, (snap, _)) in usable.iter().enumerate() {
         if let Some(ci) = assignments[i] {
             clusters[ci].members.push(snap.session_key.clone());
             if let Some(o) = &snap.outcome_type {
@@ -195,6 +268,16 @@ pub fn cluster_snapshots(
             }
             clusters[ci].total_markers += snap.marker_counts.values().sum::<usize>();
         }
+    }
+
+    // What the members have in common -- the basis a candidate is named on.
+    for (ci, cluster) in clusters.iter_mut().enumerate() {
+        let members: Vec<&SessionSnapshot> = usable.iter().enumerate()
+            .filter(|(i, _)| assignments[*i] == Some(ci))
+            .map(|(_, (s, _))| *s)
+            .collect();
+        cluster.signal_tools = shared(members.iter().map(|s| signal_tools(&s.tool_sequence)));
+        cluster.domain_tags = shared(members.iter().map(|s| s.domain_tags.clone()));
     }
 
     clusters.sort_by(|a, b| b.members.len().cmp(&a.members.len()));
@@ -233,4 +316,60 @@ pub fn format_cluster_report(clusters: &[SessionCluster]) -> String {
 
 pub fn clusters_to_json(clusters: &[SessionCluster]) -> String {
     serde_json::to_string_pretty(clusters).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(key: &str, tools: &[&str], domains: &[&str]) -> SessionSnapshot {
+        SessionSnapshot {
+            session_key: key.into(),
+            outcome_type: Some("build_pass".into()),
+            tool_sequence: tools.iter().map(|t| t.to_string()).collect(),
+            marker_counts: HashMap::new(),
+            domain_tags: domains.iter().map(|d| d.to_string()).collect(),
+            created_at: None,
+        }
+    }
+
+    /// Sessions from before the hooks existed formed clusters of their own,
+    /// apart from identical work done after.
+    #[test]
+    fn hooks_and_protocol_tools_do_not_split_the_same_work() {
+        let snaps = vec![
+            snap("new1", &["note_challenge", "compact_output", "get_anti_patterns", "get_item", "recall", "Edit"], &["engine"]),
+            snap("old1", &["get_delta", "get_preferences", "get_item", "recall", "Bash"], &["engine"]),
+            snap("new2", &["note_challenge", "edit_guard", "semantic_search", "query_graph"], &["docs"]),
+        ];
+        let clusters = cluster_snapshots(&snaps, 0.55);
+
+        let with_new1 = clusters.iter().find(|c| c.members.contains(&"new1".to_string())).unwrap();
+        assert!(with_new1.members.contains(&"old1".to_string()), "{clusters:?}");
+        assert!(!with_new1.members.contains(&"new2".to_string()), "{clusters:?}");
+        assert_eq!(with_new1.signal_tools, vec!["get_item", "recall"]);
+        assert_eq!(with_new1.domain_tags, vec!["engine"]);
+    }
+
+    #[test]
+    fn a_session_with_nothing_but_noise_is_not_clustered() {
+        let snaps = vec![snap("noise", &["note_challenge", "closeout_session", "Bash", "Edit"], &[])];
+        assert!(cluster_snapshots(&snaps, 0.55).is_empty());
+    }
+
+    /// Path fragments written by the old tagger must not become domains.
+    #[test]
+    fn only_real_top_level_directories_survive_as_domain_tags() {
+        let root = crate::test_support::TempDir::new("miner_tags").unwrap();
+        std::fs::create_dir_all(root.join("engine")).unwrap();
+        let mined = root.join(".cortex").join("mined-tasks");
+        std::fs::create_dir_all(&mined).unwrap();
+        std::fs::write(
+            mined.join("session_a.json"),
+            r#"{"session_key":"a","tool_sequence":["get_item"],"domain_tags":["engine","Users","C:","private"]}"#,
+        ).unwrap();
+
+        let snaps = load_snapshots(&mined).unwrap();
+        assert_eq!(snaps[0].domain_tags, vec!["engine"]);
+    }
 }

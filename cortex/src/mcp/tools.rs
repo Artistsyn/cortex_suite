@@ -2501,12 +2501,13 @@ fn tool_propose_skill(
             let _ = crate::skills::upsert_agent_candidate(
                 store, name, trigger, session_id, &tool_sequence);
             let _ = crate::skills::set_skill_draft_path(store, name, &path);
+            let publish = crate::cache::launcher_command(&format!("skill-approve {name}"));
             Ok(format!(
                 "✓ Agent-authored skill draft written: {path}\n\
                  Name: {name}\n\
                  Trigger: {trigger}\n\
                  Your procedure text was preserved verbatim in the draft.\n\
-                 To publish: cortex.ps1 skill-approve {name}"
+                 To publish: {publish}"
             ))
         }
         Err(e) => Err(format!("failed to draft skill '{name}': {e}")),

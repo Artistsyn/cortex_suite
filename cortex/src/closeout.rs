@@ -606,6 +606,12 @@ fn ingest_session_trace(
     let mut tools: Vec<String> = Vec::new();
     let mut tags:  Vec<String> = Vec::new();
 
+    // Resolve the root once. The server is usually started with `--repo .`,
+    // while hook paths are absolute (and on macOS canonical: /private/var, not
+    // /var), so a literal prefix strip never matched and every tag became the
+    // first component of an absolute path -- `Users`, `C:`, `private`.
+    let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
 
@@ -631,15 +637,20 @@ fn ingest_session_trace(
             // folder layout and workspace name baked into the tagger. Anywhere
             // else the whole path became the tag, so the miner clustered on
             // noise and skill detection quietly degraded for every user but one.
-            let root_norm = repo_root.to_string_lossy().replace('\\', "/");
-            let tag = norm
-                .strip_prefix(root_norm.trim_end_matches('/'))
-                .unwrap_or(&norm)
-                .trim_start_matches('/')
-                .split('/')
-                .find(|c| !c.is_empty())
-                .unwrap_or("")
-                .to_string();
+            let touched = Path::new(&norm);
+            let touched = if touched.is_relative() { root.join(touched) } else { touched.to_path_buf() };
+            // Canonicalise when the file still exists; a deleted file keeps its
+            // spelling, which is checked against both forms of the root.
+            let touched = std::fs::canonicalize(&touched).unwrap_or(touched);
+            // A path outside the repository -- a scratch file, a temp dir -- says
+            // nothing about which part of the project the session worked on.
+            let tag = touched
+                .strip_prefix(&root)
+                .or_else(|_| touched.strip_prefix(repo_root))
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .unwrap_or_default();
             if !tag.is_empty() && !tag.contains('.') && !tags.iter().any(|t| t == &tag) && tags.len() < 10 {
                 tags.push(tag);
             }
@@ -658,6 +669,43 @@ fn ingest_session_trace(
 }
 
 // ── Session snapshot ──────────────────────────────────────────────────────────
+
+/// The cortex tools a session called, first use first.
+///
+/// Keyed by session. Calls logged before they were stamped with one have no
+/// key, so those fall back to a recent window -- compared in the stored
+/// format. The old filter used `datetime('now', '-3 hours')`, which renders as
+/// `2026-09-17 03:…` against stored `2026-09-17T06:…`; 'T' sorts after ' ', so
+/// it matched the whole day, and every session that day shared one trajectory.
+fn session_tools(store: &Store, session_key: &str) -> Vec<String> {
+    fn first_column(row: &rusqlite::Row) -> rusqlite::Result<String> {
+        row.get(0)
+    }
+    let collect = |rows: rusqlite::Result<rusqlite::MappedRows<'_, fn(&rusqlite::Row) -> rusqlite::Result<String>>>| {
+        rows.map(|r| r.filter_map(|x| x.ok()).filter(|s| !s.is_empty()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+
+    let own = match store.conn().prepare(
+        "SELECT tool FROM mcp_calls WHERE logical_session_key = ?1
+         GROUP BY tool ORDER BY MIN(id) LIMIT 30",
+    ) {
+        Ok(mut stmt) => collect(stmt.query_map(params![session_key], first_column as fn(&rusqlite::Row) -> _)),
+        Err(_) => vec![],
+    };
+    if !own.is_empty() {
+        return own;
+    }
+    match store.conn().prepare(
+        "SELECT tool FROM mcp_calls
+         WHERE logical_session_key IS NULL
+           AND called_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-3 hours')
+         GROUP BY tool ORDER BY MIN(id) LIMIT 30",
+    ) {
+        Ok(mut stmt) => collect(stmt.query_map([], first_column as fn(&rusqlite::Row) -> _)),
+        Err(_) => vec![],
+    }
+}
 
 fn write_session_snapshot(
     store: &Store,
@@ -679,19 +727,7 @@ fn write_session_snapshot(
     });
 
     // Read recent tool sequences from mcp_calls for this session.
-    let mut tool_seq: Vec<String> = {
-        if let Ok(mut stmt) = store.conn().prepare(
-            "SELECT DISTINCT tool FROM mcp_calls
-             WHERE called_at >= datetime('now', '-3 hours')
-             ORDER BY id ASC LIMIT 30"
-        ) {
-            stmt.query_map([], |r| r.get::<_, String>(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).filter(|s| !s.is_empty()).collect())
-                .unwrap_or_default()
-        } else {
-            vec![]
-        }
-    };
+    let mut tool_seq: Vec<String> = session_tools(store, session_key);
 
     // Merge in host-side trace events (Claude Code PostToolUse hook writes
     // .cortex/session-trace.jsonl). This is what makes trajectories on Claude
@@ -952,6 +988,63 @@ correct: y[/CORTEX-AP]
         let promoted: i64 = store.conn().query_row(
             "SELECT COUNT(*) FROM knowledge_markers WHERE promoted = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(promoted, 1);
+    }
+
+    /// The server runs with `--repo .` while hook paths are absolute and, on
+    /// macOS, canonical, so the literal prefix strip never matched and tags came
+    /// out as `Users`, `C:` or `private`.
+    #[test]
+    fn domain_tags_come_from_the_repo_relative_path_however_the_root_is_spelled() {
+        let repo = crate::test_support::TempDir::new("tagger").unwrap();
+        std::fs::create_dir_all(repo.join("engine").join("src")).unwrap();
+        std::fs::create_dir_all(repo.join(".cortex").join("mined")).unwrap();
+        let real = std::fs::canonicalize(repo.path()).unwrap();
+        let trace = repo.join(".cortex").join("session-trace.jsonl");
+        let lines = [
+            json!({"tool_name": "Edit", "tool_input": {"file_path": real.join("engine/src/lib.rs").to_string_lossy()}}),
+            json!({"tool_name": "Write", "tool_input": {"file_path": "/tmp/cortex-elsewhere/notes.md"}}),
+        ];
+        std::fs::write(&trace, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+
+        // A non-canonical spelling of the root, as `--repo .` or a symlinked temp dir gives.
+        let spelled = repo.path().join("engine").join("..");
+        let (tools, tags) = ingest_session_trace(&trace, &repo.join(".cortex").join("mined"), "s", &spelled);
+        assert_eq!(tools, vec!["Edit", "Write"]);
+        assert_eq!(tags, vec!["engine"], "a path outside the repo must not become a tag either");
+    }
+
+    /// A snapshot took every tool any session called that day, mixing
+    /// concurrent sessions into one trajectory.
+    #[test]
+    fn a_session_snapshot_records_only_that_sessions_tools() {
+        let store = test_store("snapshot_tools");
+        let repo = crate::test_support::TempDir::new("snapshot_repo").unwrap();
+        // Through the logging chokepoint, which must stamp the session.
+        for (tool, key) in [("get_item", "mine"), ("query_graph", "theirs"), ("recall", "mine"), ("get_item", "mine")] {
+            store.log_mcp_call(tool, "{}", Some(key)).unwrap();
+        }
+        let path = write_session_snapshot(&store, "mine", "build_pass", &[], repo.path()).unwrap();
+        let snap: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(snap["tool_sequence"], json!(["get_item", "recall"]));
+    }
+
+    /// Calls logged before they carried a session fall back to a recent window,
+    /// compared in the stored timestamp format rather than matching all day.
+    #[test]
+    fn unkeyed_calls_fall_back_to_the_last_three_hours_not_the_whole_day() {
+        let store = test_store("snapshot_fallback");
+        let repo = crate::test_support::TempDir::new("snapshot_fallback_repo").unwrap();
+        let recent = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let hours_ago = (Utc::now() - chrono::Duration::hours(5)).to_rfc3339();
+        for (tool, at) in [("query_graph", hours_ago.as_str()), ("recall", recent.as_str())] {
+            store.conn().execute(
+                "INSERT INTO mcp_calls (tool, args, called_at) VALUES (?1, '{}', ?2)",
+                params![tool, at],
+            ).unwrap();
+        }
+        let path = write_session_snapshot(&store, "unstamped", "build_pass", &[], repo.path()).unwrap();
+        let snap: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(snap["tool_sequence"], json!(["recall"]));
     }
 
     #[test]

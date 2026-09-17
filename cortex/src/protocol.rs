@@ -250,8 +250,9 @@ pub fn status_report(
 
     if pending_proposals > 0 {
         out.push_str(&format!(
-            "Cross-session proposals: {} pending review (run `cortex.ps1 review-proposals`)\n",
-            pending_proposals
+            "Cross-session proposals: {} pending review (run `{}`)\n",
+            pending_proposals,
+            crate::cache::launcher_command("review-proposals"),
         ));
     }
 

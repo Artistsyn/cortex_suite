@@ -29,8 +29,7 @@ pub fn detect_skill_candidates(
         if cluster.members.len() < min_occurrences as usize { continue; }
         if cluster.tool_sequence.is_empty() { continue; }
 
-        // Derive a name from the top tools in the sequence.
-        let name = derive_skill_name(&cluster.tool_sequence);
+        let name = derive_skill_name(cluster);
         if name.is_empty() { continue; }
 
         // A decision already taken is not re-opened.
@@ -59,7 +58,7 @@ pub fn detect_skill_candidates(
         let total = cluster.members.len();
         let confidence = if total > 0 { pass as f32 / total as f32 } else { 0.0 };
 
-        let seq_json = serde_json::to_string(&cluster.tool_sequence)
+        let seq_json = serde_json::to_string(&cluster.signal_tools)
             .unwrap_or_else(|_| "[]".to_string());
         let keys_json = serde_json::to_string(&cluster.members)
             .unwrap_or_else(|_| "[]".to_string());
@@ -83,39 +82,39 @@ pub fn detect_skill_candidates(
             name,
             occurrence_count: total,
             confidence,
-            tool_sequence: cluster.tool_sequence.clone(),
+            tool_sequence: cluster.signal_tools.clone(),
         });
     }
 
     Ok(promoted)
 }
 
-/// Derive a human-readable skill name from a tool sequence.
-fn derive_skill_name(tools: &[String]) -> String {
-    // Strip common bootstrap tools — they appear in every session.
-    let skip = ["get_delta", "get_preferences", "get_anti_patterns", "get_context",
-                "list_patterns", "begin_protocol_session", "get_session_health",
-                "flush_knowledge_markers", "closeout_session"];
-
-    let domain_tools: Vec<&str> = tools.iter()
-        .filter(|t| !skip.contains(&t.as_str()))
-        .map(|t| t.as_str())
-        .collect();
-
-    if domain_tools.is_empty() { return String::new(); }
-
-    // Map tool names to domain keywords.
-    let keyword_for = |t: &str| -> &'static str {
-        if t.contains("quartz") || t.contains("forge") { return "quartz-forge"; }
-        if t.contains("graph") || t.contains("simulate") { return "graph-analysis"; }
-        if t.contains("recall") || t.contains("semantic") { return "knowledge-lookup"; }
-        if t.contains("get_item") || t.contains("get_syntax") { return "api-lookup"; }
-        if t.contains("crystallize") || t.contains("suggest_pattern") { return "pattern-capture"; }
-        "general"
-    };
-
-    let first_key = keyword_for(domain_tools[0]);
-    format!("workflow-{}", first_key)
+/// Name a candidate after what its sessions share: their common domain, then up
+/// to two common signal tools.
+///
+/// The name is the candidate's identity, and a verdict on a name is permanent.
+/// Naming used to map the first non-bootstrap tool onto six fixed words, and
+/// hooks led almost every sequence, so nearly every cluster became
+/// `workflow-general` -- which, once rejected, silently discarded every later
+/// cluster. Distinct work now gets a distinct name, so a verdict covers only the
+/// work it was given on.
+fn derive_skill_name(cluster: &SessionCluster) -> String {
+    // A shared domain alone is "work in this directory", not a workflow.
+    if cluster.signal_tools.is_empty() {
+        return String::new();
+    }
+    let joined = cluster.domain_tags.iter().take(1)
+        .chain(cluster.signal_tools.iter().take(2))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("-")
+        .to_lowercase();
+    let slug = joined
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("workflow-{slug}")
 }
 
 // ── Draft SKILL.md generation ─────────────────────────────────────────────────
@@ -804,6 +803,48 @@ mod tests {
         );
         assert_eq!(proposals[0].query_text, "ExampleType");
         assert_eq!(proposals[0].seen_count, 6);
+    }
+
+    fn cluster(members: usize, signal: &[&str], domains: &[&str]) -> crate::miner::SessionCluster {
+        crate::miner::SessionCluster {
+            centroid_key: "c".into(),
+            members: (0..members).map(|i| format!("s{i}")).collect(),
+            tool_sequence: signal.iter().map(|t| t.to_string()).collect(),
+            outcome_counts: std::collections::HashMap::from([("build_pass".to_string(), members)]),
+            total_markers: 0,
+            threshold: 0.55,
+            signal_tools: signal.iter().map(|t| t.to_string()).collect(),
+            domain_tags: domains.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    /// Rejecting one generic name used to discard every later cluster, because
+    /// nearly all of them were named `workflow-general`.
+    #[test]
+    fn a_verdict_covers_only_the_work_it_was_given_on() {
+        let store = crate::test_support::TempStore::new("skill_names").expect("temp store");
+        store.conn().execute(
+            "INSERT INTO skill_candidates (name, status) VALUES ('workflow-general', 'rejected')", [],
+        ).unwrap();
+
+        let found = super::detect_skill_candidates(&store, &[
+            cluster(4, &["get_item", "recall"], &["engine"]),
+            cluster(3, &["semantic_search", "query_graph"], &[]),
+            cluster(5, &[], &["engine"]),          // a shared domain, but no workflow
+            cluster(2, &["set_checkpoint"], &[]),  // too few sessions
+        ], 3).unwrap();
+        let names: Vec<&str> = found.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["workflow-engine-get-item-recall", "workflow-semantic-search-query-graph"]);
+
+        store.conn().execute(
+            "UPDATE skill_candidates SET status = 'rejected' WHERE name = 'workflow-engine-get-item-recall'", [],
+        ).unwrap();
+        let again = super::detect_skill_candidates(&store, &[
+            cluster(4, &["get_item", "recall"], &["engine"]),
+            cluster(3, &["semantic_search", "query_graph"], &[]),
+        ], 3).unwrap();
+        let names: Vec<&str> = again.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["workflow-semantic-search-query-graph"], "a rejection must stay with its own work");
     }
 
     #[test]

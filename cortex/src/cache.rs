@@ -333,6 +333,15 @@ pub fn staleness_notice(conn: &Connection, repo_root: &std::path::Path) -> Optio
     ))
 }
 
+/// A launcher command on the machine cortex is running on.
+pub fn launcher_command(subcommand: &str) -> String {
+    if cfg!(windows) {
+        format!(r".\.cortex\cortex.ps1 {subcommand}")
+    } else {
+        format!("./.cortex/cortex.sh {subcommand}")
+    }
+}
+
 /// The launcher's reindex command on the machine cortex is running on. The
 /// notice used to name `cortex.ps1` everywhere, which is the Windows launcher.
 pub fn reindex_command() -> &'static str {

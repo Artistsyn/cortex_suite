@@ -140,7 +140,7 @@ pub fn serve(
                 let args_str = args.to_string();
 
                 // Log the call regardless of cache hit.
-                if let Ok(call_id) = store.log_mcp_call(tool, &args_str) {
+                if let Ok(call_id) = store.log_mcp_call(tool, &args_str, Some(&session_id)) {
                     let _ = store.log_session_retrieval(
                         &session_id,
                         "mcp_calls",

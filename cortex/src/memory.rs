@@ -1995,11 +1995,14 @@ impl Store {
     /// output (`compact_output`) is replaced by a size stub and credentials are
     /// scrubbed from what remains — see `redact` for why this has to happen at
     /// write time rather than being cleaned up later.
-    pub fn log_mcp_call(&self, tool: &str, args: &str) -> Result<i64> {
+    /// `session_key` is stored as `logical_session_key`. The column existed but
+    /// was never written, so every row was unattributed and a session's
+    /// trajectory could only be guessed from timestamps.
+    pub fn log_mcp_call(&self, tool: &str, args: &str, session_key: Option<&str>) -> Result<i64> {
         let safe = crate::redact::redact_call_args(tool, args);
         self.conn.execute(
-            "INSERT INTO mcp_calls (tool, args, called_at) VALUES (?1, ?2, ?3)",
-            params![tool, safe, chrono::Utc::now().to_rfc3339()],
+            "INSERT INTO mcp_calls (tool, args, called_at, logical_session_key) VALUES (?1, ?2, ?3, ?4)",
+            params![tool, safe, chrono::Utc::now().to_rfc3339(), session_key],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
