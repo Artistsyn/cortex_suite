@@ -2160,24 +2160,44 @@ fn review_queue_line(store: &Store) -> String {
     }
     for (sig, count, sample) in &repeats {
         let first = sample.lines().next().unwrap_or("").trim();
+        let quoted = shell_quote(sig);
+        // Both ways out named in full. The old hint suggested recording a trap,
+        // which never cleared the failure, and offered no way to dismiss one.
         out.push_str(&format!(
             "  recurring failure `{sig}` — hit in {count} sessions\n    {first}\n    \
-             worth recording as a trap? cortex anti-pattern add ...\n"
+             a real trap? {}\n    if not: {}\n",
+            crate::cache::launcher_command(&format!(
+                "anti-pattern add --description \"...\" --wrong \"...\" --correct \"...\" --resolves {quoted}"
+            )),
+            crate::cache::launcher_command(&format!("recurring-dismiss {quoted}")),
         ));
     }
     if !drafted.is_empty() {
         out.push_str(&format!(
-            "  {} skill draft(s): {}\n    approve: cortex skill-approve <name>   reject: cortex skill-reject <name>\n",
+            "  {} skill draft(s): {}\n    approve: {}   reject: {}\n",
             drafted.len(),
-            drafted.join(", ")
+            drafted.join(", "),
+            crate::cache::launcher_command("skill-approve <name>"),
+            crate::cache::launcher_command("skill-reject <name>"),
         ));
     }
     if proposals > 0 {
         out.push_str(&format!(
-            "  {proposals} proposal(s) pending\n    review: cortex review-proposals\n"
+            "  {proposals} proposal(s) pending\n    review: {}\n",
+            crate::cache::launcher_command("review-proposals")
         ));
     }
     out
+}
+
+/// Quote a value for the shell the launcher runs in. Signatures carry spaces,
+/// backticks and `@`, so a hint printed unquoted would not survive a paste.
+fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("'{}'", s.replace('\'', "''"))
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 fn tool_get_session_health(
@@ -2859,7 +2879,10 @@ mod tests {
         assert!(out.contains("AWAITING YOUR REVIEW"), "{out}");
         assert!(out.contains("needs-a-human"), "{out}");
         assert!(!out.contains("already-live"), "approved skills are not review work: {out}");
-        assert!(out.contains("cortex skill-approve"), "must name the command: {out}");
+        // The runnable command for this platform's launcher, not a bare name the
+        // user would have to translate.
+        let approve = crate::cache::launcher_command("skill-approve");
+        assert!(out.contains(&approve), "must name the command ({approve}): {out}");
 
         // Rejected proposals are settled; pending ones are not.
         store.conn().execute(
@@ -2876,7 +2899,24 @@ mod tests {
         ).unwrap();
         let out = super::review_queue_line(&store);
         assert!(out.contains("1 proposal(s) pending"), "{out}");
-        assert!(out.contains("cortex review-proposals"), "{out}");
+        let review = crate::cache::launcher_command("review-proposals");
+        assert!(out.contains(&review), "must name the command ({review}): {out}");
+
+        // A recurring failure names both ways out, runnable as printed. The old
+        // hint suggested recording a trap, which never cleared the failure, and
+        // offered no dismissal at all -- so it was listed at every closeout.
+        let sig = "assert:assertion `left == right` failed@wire.rs";
+        store.conn().execute(
+            "INSERT INTO recurring_errors (signature, sample, command, seen_count) VALUES (?1, 'x', 'cargo test', 3)",
+            rusqlite::params![sig],
+        ).unwrap();
+        let out = super::review_queue_line(&store);
+        let quoted = super::shell_quote(sig);
+        assert!(out.contains(&format!("--resolves {quoted}")), "{out}");
+        assert!(out.contains(&crate::cache::launcher_command(&format!("recurring-dismiss {quoted}"))), "{out}");
+
+        assert!(crate::test_signal::mark_recurring_handled(&store, sig).unwrap());
+        assert!(!super::review_queue_line(&store).contains("recurring failure"), "a handled failure must leave the queue");
 
         let _ = std::fs::remove_file(&tmp);
     }

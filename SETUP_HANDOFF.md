@@ -472,6 +472,7 @@ cortex skill-approve <name>              # publish one to your skills dir
 
 ```bash
 cortex review-proposals                  # pending proposals; then proposal-approve / proposal-reject <id>
+cortex recurring-dismiss '<signature>'   # a recurring failure that is not a trap (a real one: anti-pattern add ... --resolves '<signature>')
 ```
 
 The block prints nothing when the queue is empty, so its absence means the queue

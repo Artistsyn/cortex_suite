@@ -257,6 +257,13 @@ enum Command {
     /// Flag patterns with survival_rate < 0.4 and use_count >= 3 for review.
     ProposeSurvival,
 
+    /// Mark a recurring failure as handled so closeout stops listing it.
+    /// For one that is a real trap, record it instead: `anti-pattern add ... --resolves <signature>`.
+    RecurringDismiss {
+        /// The signature exactly as closeout prints it.
+        signature: String,
+    },
+
     /// Run the full 6-stage consolidation pipeline.
     /// Equivalent to: cluster-sessions → detect-skills → propose-gaps → propose-survival.
     ConsolidatePipeline,
@@ -675,6 +682,9 @@ enum AntiPatternCmd {
         #[arg(long)] wrong: String,
         #[arg(long)] correct: String,
         #[arg(long, value_delimiter = ',')] tags: Vec<String>,
+        /// A recurring failure (signature as closeout prints it) this trap
+        /// accounts for; it is marked handled so review stops raising it.
+        #[arg(long)] resolves: Option<String>,
     },
     Remove { id: i64 },
     /// Retire an anti-pattern in favour of a newer one. Use this when a later
@@ -756,6 +766,7 @@ fn main() -> Result<()> {
         }
         Command::ProposeGaps { min_count } => run_propose_gaps(min_count, &db_path),
         Command::ProposeSurvival                => run_propose_survival(&db_path),
+        Command::RecurringDismiss { signature } => run_recurring_dismiss(&signature, &db_path),
         Command::ConsolidatePipeline            => run_consolidate_pipeline(&db_path),
         Command::ConsolidateIfStale { staleness_hours } => {
             run_consolidate_if_stale(staleness_hours, &db_path)
@@ -2779,8 +2790,10 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
     if format == OutputFormat::Text {
         return match cmd {
             AntiPatternCmd::List => crystallizer::list_anti_patterns(&store),
-            AntiPatternCmd::Add { description, wrong, correct, tags } =>
-                crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags),
+            AntiPatternCmd::Add { description, wrong, correct, tags, resolves } => {
+                crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags)?;
+                resolve_recurring(&store, resolves.as_deref()).map(|_| ())
+            }
             AntiPatternCmd::Remove { id } => crystallizer::remove_anti_pattern(&store, id),
             AntiPatternCmd::Supersede { id, by } => run_supersede(&store, "anti_patterns", id, by),
             AntiPatternCmd::Retired => run_retired(&store, "anti_patterns"),
@@ -2792,7 +2805,7 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
             let anti_patterns = store.all_anti_patterns()?;
             print_json(&anti_patterns)
         }
-        AntiPatternCmd::Add { description, wrong, correct, tags } => {
+        AntiPatternCmd::Add { description, wrong, correct, tags, resolves } => {
             let (id, created) = store.insert_anti_pattern_checked(&model::AntiPattern {
                 id: None,
                 description: description.clone(),
@@ -2803,7 +2816,8 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
                 hash: None,
                 superseded_by: None,
             })?;
-            print_json(&json!({"ok": true, "action": "add", "id": id, "created": created, "description": description}))
+            let resolved = resolve_recurring(&store, resolves.as_deref())?;
+            print_json(&json!({"ok": true, "action": "add", "id": id, "created": created, "description": description, "resolved_recurring": resolved}))
         }
         AntiPatternCmd::Remove { id } => {
             store.delete_anti_pattern(id)?;
@@ -4333,6 +4347,29 @@ fn run_consolidate_if_stale(staleness_hours: u32, db_path: &Path) -> Result<()> 
     run_consolidate_pipeline(db_path)
 }
 
+fn run_recurring_dismiss(signature: &str, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    if crate::test_signal::mark_recurring_handled(&store, signature)? {
+        println!("[cortex] recurring failure `{signature}` marked handled; closeout will not raise it again.");
+        Ok(())
+    } else {
+        anyhow::bail!("no recurring failure with signature `{signature}` -- copy it exactly as closeout prints it")
+    }
+}
+
+/// `anti-pattern add --resolves <signature>`: recording the trap is what handling
+/// a recurring failure means, so it also clears the failure from review.
+fn resolve_recurring(store: &Store, signature: Option<&str>) -> Result<bool> {
+    let Some(sig) = signature else { return Ok(false) };
+    let found = crate::test_signal::mark_recurring_handled(store, sig)?;
+    if found {
+        println!("[cortex] recurring failure `{sig}` marked handled.");
+    } else {
+        eprintln!("[cortex] warning: no recurring failure with signature `{sig}`; the anti-pattern was still added.");
+    }
+    Ok(found)
+}
+
 fn run_review_proposals(kind: Option<&str>, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
     let mut proposals = consolidator2::load_pending_proposals(&store)?;
@@ -4345,8 +4382,8 @@ fn run_review_proposals(kind: Option<&str>, db_path: &Path) -> Result<()> {
         return Ok(());
     }
     println!("{}", consolidator2::format_pending_proposals(&proposals));
-    println!("To approve: cortex.exe proposal-approve <id>");
-    println!("To reject:  cortex.exe proposal-reject <id> [--reason \"...\"]");
+    println!("To approve: {}", crate::cache::launcher_command("proposal-approve <id>"));
+    println!("To reject:  {}", crate::cache::launcher_command("proposal-reject <id> [--reason \"...\"]"));
     Ok(())
 }
 

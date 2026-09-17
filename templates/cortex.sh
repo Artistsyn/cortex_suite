@@ -344,7 +344,7 @@ EOF
 doctor|selfcheck|status|recall|health-report|graph-diff|meta|prune|review|crystallize|adr|\
 consolidate|correction|cluster-sessions|detect-skills|propose-gaps|propose-survival|\
 consolidate-pipeline|consolidate-if-stale|review-proposals|skill-status|skill-approve|\
-skill-reject|scoreboard|pattern|anti-pattern|prefs|annotate|context|graph|index|watch|\
+skill-reject|recurring-dismiss|proposal-approve|proposal-reject|scoreboard|pattern|anti-pattern|prefs|annotate|context|graph|index|watch|\
 fired)
     # `fired` is on this list because it was documented as a launcher command
     # and was not on it: an unlisted command falls through to the help text

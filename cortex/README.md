@@ -145,6 +145,7 @@ cortex correction --attempted "..." --reason "..." --fix "..."
 .\.cortex\cortex.ps1 skill-status        # List skill candidates with confidence scores
 .\.cortex\cortex.ps1 skill-approve <n>
 .\.cortex\cortex.ps1 skill-reject <n>
+.\.cortex\cortex.ps1 recurring-dismiss '<signature>'   # A recurring failure that is not a trap (a real one: anti-pattern add ... --resolves)
 ```
 
 ### Meta-Analysis (Stage 8)

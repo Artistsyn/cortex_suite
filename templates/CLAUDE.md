@@ -216,6 +216,7 @@ report and in `get_session_health`, with the command that resolves it:
 cortex skill-approve <name>     # publish a drafted skill
 cortex skill-reject <name>      # discard it
 cortex review-proposals         # pending proposals, then proposal-approve / proposal-reject <id>
+cortex recurring-dismiss '<sig>' # a recurring failure that is not a trap (a real one: anti-pattern add ... --resolves '<sig>')
 ```
 
 The block is silent when the queue is empty. Read a drafted skill before

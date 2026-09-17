@@ -307,6 +307,20 @@ pub fn recurring(store: &Store, min: i64) -> Result<Vec<(String, i64, String)>> 
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Mark a recurring failure as handled, so review stops raising it.
+///
+/// `proposed = 1` is the "a human already ruled on this" flag, but nothing set
+/// it: recording the trap did not, and there was no command to dismiss one, so
+/// every failure seen in three sessions was listed at every closeout forever.
+/// Returns whether a failure with that signature existed.
+pub fn mark_recurring_handled(store: &Store, signature: &str) -> Result<bool> {
+    let n = store.conn().execute(
+        "UPDATE recurring_errors SET proposed = 1 WHERE signature = ?1",
+        params![signature],
+    )?;
+    Ok(n > 0)
+}
+
 /// Make the stored counters reflect this session's CURRENT verdict.
 ///
 /// The hard requirement is that twenty-four test runs must not credit a pattern
@@ -424,6 +438,28 @@ pub fn already_scored(store: &Store, session_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_handled_recurring_failure_is_no_longer_raised() {
+        let Some(store) = temp_store("handled") else { return };
+        for sig in ["rust:E0063:inner_cone_angle_deg", "rust:E0425:parse_header"] {
+            store.conn().execute(
+                "INSERT INTO recurring_errors (signature, sample, command, seen_count)
+                 VALUES (?1, 'x', 'cargo test', 3)",
+                params![sig],
+            ).unwrap();
+        }
+        assert_eq!(recurring(&store, 3).unwrap().len(), 2);
+
+        assert!(mark_recurring_handled(&store, "rust:E0063:inner_cone_angle_deg").unwrap());
+        let left: Vec<String> = recurring(&store, 3).unwrap().into_iter().map(|(s, _, _)| s).collect();
+        assert_eq!(left, vec!["rust:E0425:parse_header"]);
+
+        assert!(
+            !mark_recurring_handled(&store, "no:such:signature").unwrap(),
+            "an unknown signature must say it matched nothing"
+        );
+    }
 
     #[test]
     fn a_non_build_command_is_not_a_verdict() {
