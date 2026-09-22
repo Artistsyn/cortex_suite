@@ -771,7 +771,7 @@ fn main() -> Result<()> {
         Command::ConsolidateIfStale { staleness_hours } => {
             run_consolidate_if_stale(staleness_hours, &db_path)
         }
-        Command::ReviewProposals { kind }       => run_review_proposals(kind.as_deref(), &db_path),
+        Command::ReviewProposals { kind }       => run_review_proposals(kind.as_deref(), &db_path, format),
         Command::SkillStatus                    => run_skill_status(&db_path),
         Command::SkillApprove { name, force }   => run_skill_approve(&name, &db_path, force),
         Command::SkillReject { name }           => run_skill_reject(&name, &db_path),
@@ -4370,12 +4370,55 @@ fn resolve_recurring(store: &Store, signature: Option<&str>) -> Result<bool> {
     Ok(found)
 }
 
-fn run_review_proposals(kind: Option<&str>, db_path: &Path) -> Result<()> {
+/// List pending proposals, as text for a human or JSON for anything else.
+///
+/// `--format json` IS HONOURED HERE NOW. It is a GLOBAL flag, so clap printed
+/// it in this subcommand's `--help` -- "[possible values: text, json]" -- while
+/// the command silently ignored it and emitted the human listing either way.
+/// Anything parsing that output got prose where it asked for JSON, and the
+/// failure is silent on both sides: clap accepts the flag, the command
+/// succeeds, and only the caller's parser knows anything went wrong.
+///
+/// The JSON form carries the FULL `proposed_text`. The text form truncates
+/// each proposal to one line, which is fine for a human who will then open the
+/// one they care about and wrong for a reviewer deciding from the output alone
+/// -- approving from truncated one-liners means committing entries to the
+/// store without having read them.
+fn run_review_proposals(kind: Option<&str>, db_path: &Path, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
     let mut proposals = consolidator2::load_pending_proposals(&store)?;
     if let Some(k) = kind {
         proposals.retain(|p| p.proposal_type.contains(k));
     }
+
+    if format == OutputFormat::Json {
+        // An empty list is a valid answer and must still be VALID JSON --
+        // printing a human "no pending proposals" line here would break every
+        // caller precisely when there is nothing wrong.
+        let items: Vec<serde_json::Value> = proposals
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "proposal_type": p.proposal_type,
+                    // FULL text, not the one-line truncation the human form uses.
+                    "proposed_text": p.proposed_text,
+                    // Evidence is stored as a JSON string; hand back structure
+                    // where it parses and the raw string where it does not,
+                    // rather than emitting something that only looks like JSON.
+                    "evidence": serde_json::from_str::<serde_json::Value>(&p.evidence)
+                        .unwrap_or_else(|_| serde_json::Value::String(p.evidence.clone())),
+                    "created_at": p.created_at,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "pending": items.len(), "proposals": items })
+        );
+        return Ok(());
+    }
+
     if proposals.is_empty() {
         println!("[cortex] No pending proposals{}.",
             kind.map(|k| format!(" of type '{k}'")).unwrap_or_default());
