@@ -75,7 +75,7 @@ Required MCP baseline tools: `get_delta`, `get_preferences`, `get_anti_patterns`
 | `semantic_search` | Find anything related to a concept |
 | `get_item` | Full details of a type/function |
 | `get_context` | Pre-compiled context packet for a task |
-| `get_delta` | Changes since last checkpoint |
+| `get_delta` | API items added, removed or reshaped - net, from the index's change journal (no git needed); default window is this session |
 | `get_preferences` | Style rules and API notes |
 | `get_anti_patterns` | All known bug traps |
 | `list_patterns` | Approved implementation patterns |
@@ -414,7 +414,7 @@ it as a live skill. Copilot tools available:
 | `semantic_search` | "Find anything related to collision" |
 | `get_item` | "Show the full details of `Action`" |
 | `get_context` | "Give me context for working on src/player.rs" |
-| `get_delta` | "Show changes since last checkpoint, excluding build artifacts" |
+| `get_delta` | "What changed in the API since 2h ago?" |
 | `recall` | "What do we know about gravity?" |
 | `list_patterns` | "What patterns are approved?" |
 | `get_anti_patterns` | "What should I never do?" |
@@ -423,7 +423,7 @@ it as a live skill. Copilot tools available:
 
 Phase 4.2 delta controls:
 
-- `get_delta`: `include`, `exclude`, `max_files`, `max_patch_lines`
+- `get_delta`: `since` (`session`, a time, `90m`/`2h`/`1d`, or a git ref), `max_changes`; in a git repository also `include`, `exclude`, `max_files`, `max_patch_lines` for the file list
 - `get_context`: `delta_include`, `delta_exclude`, `delta_max_files`, `delta_max_patch_lines`
 
 ### Watching

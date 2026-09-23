@@ -63,7 +63,8 @@ empty *silently* is worse still, because "no item named `Canvas`" then reads as 
 fact about your code.
 
 1. **Edit `.cortex/index-sources.json`** — list your crates. This is the only file
-   you must edit by hand. New roots are picked up within ~5s, without a restart.
+   you must edit by hand. New roots, and edits to the manifest, are picked up on
+   the next call, without a restart.
 2. **Index once:**
    ```bash
    ./.cortex/cortex.sh reindex          # .\.cortex\cortex.ps1 on Windows
@@ -588,26 +589,32 @@ config pointing at `.graphify-output/graph.json` would never find a file. Check
 `ls .graphify-output/graph.json` before wiring it up.
 
 **→ [docs/GRAPHIFY.md](docs/GRAPHIFY.md)** for the config snippets, the tools
-worth knowing, and its pitfalls — chiefly that a graph is a **snapshot**: unlike
-quartz-ctx it does not re-read source, so a stale graph answers confidently and
-wrongly until you rebuild.
+worth knowing, and its pitfalls — chiefly that `graphify-rs serve` loads its
+graph once and never re-reads it, so wire it through `cortex graphify-serve`,
+which rebuilds and reloads when the source moves.
 
 ## 7. Languages, and what each is worth
 
 | Language | Extractor | Signal |
 |---|---|---|
-| Rust | `syn` | **resolved** — types, trait impls, cross-file `impl` blocks, full signatures |
-| Python, TypeScript / JavaScript, Go, Java, **C#**, C / C++, Ruby, PHP | tree-sitter | **name_resolved** — declarations, members, bases and interfaces, linked across files by name |
+| Rust | `syn` | **resolved** — the language requires declared types, so signatures are complete as written |
+| Python, TypeScript / JavaScript, Go, Java, **C#**, C / C++, Ruby, PHP | tree-sitter | **name_resolved** — same name linking; types only where the source declares them |
 
-The distinction is real and worth respecting, and it is a distinction between
-two kinds of resolution rather than between resolution and none. `syn`
-understands Rust. The tree-sitter front ends parse a concrete syntax tree and
-then feed one project-wide attachment pass — the same pass the Rust front end
-uses — so a member declared away from its type still reaches it: a Go method on
-its receiver, a C++ member defined out of line in a `.cpp`, a C# `partial` half.
-What they do **not** do is infer types, so two same-named types in one project
-can be told apart wrongly. Items say so themselves: read the `name_resolved` tag
-rather than assuming Rust's `resolved`.
+The distinction is about the SOURCE, not the parser. `syn` parses Rust; it does
+not resolve types any more than tree-sitter does, and every language — Rust
+included — feeds one project-wide attachment pass that links by name, so a member
+declared away from its type still reaches it: a Rust `impl` in another file, a Go
+method on its receiver, a C++ member defined out of line, a C# `partial` half.
+What `resolved` really promises is that Rust requires declared types, so a Rust
+signature is complete as written. `name_resolved` languages may omit them: an
+empty type on a JavaScript parameter means the source never said, not that the
+extractor missed it. Same-named types are listed together with provenance in
+every language rather than guessed between.
+
+The 2026-09-23 parity pass closed the extraction gaps that WERE the extractor's:
+doc comments above `export` statements (JS/TS), `this.x = ...` fields (JS/TS),
+`Enum` subclasses as enums and `self.x` fields typed from `__init__` annotations
+(Python). On the web editor: JS types with fields 0% → 100%, JS docs 11% → 52%.
 
 That is a large improvement on the original behaviour, which was to return
 **zero items silently** for a non-Rust project — an answer indistinguishable from

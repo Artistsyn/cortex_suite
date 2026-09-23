@@ -29,98 +29,160 @@ pub fn parse_dir(dir: &Path) -> Result<Vec<ApiItem>> {
 
 /// Recursively parse all `.rs` files under `dir` using explicit options.
 pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
-    let mut all_items: Vec<ApiItem> = Vec::new();
-    let mut orphan_impls: Vec<PendingImpl> = Vec::new();
-    let mut skipped_generated = 0usize;
-    let mut partial_types: Vec<String> = Vec::new();
-    let mut boundaries: Vec<crate::bridge::Boundary> = Vec::new();
-    let gitignore = load_gitignore(dir);
-
-    for entry in WalkDir::new(dir)
-        .into_iter()
-        // Prune whole directories rather than filtering files, so we never
-        // descend into build output or vendored dependencies at all.
-        .filter_entry(|e| !is_excluded_dir(e) && !is_gitignored(&gitignore, e, dir))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            let p = e.path();
-            p.extension().map_or(false, |ext| ext == "rs")
-                || crate::lang::Language::from_path(p).is_some()
-        })
-    {
-        let path = entry.path();
-        let content = match std::fs::read_to_string(path) {
+    let mut parsed: Vec<FileParse> = Vec::new();
+    for path in source_files(dir) {
+        let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("warn: could not read {}: {}", path.display(), e);
                 continue;
             }
         };
+        parsed.push(parse_source_file(dir, &path, &content, opts));
+    }
+    report_parse_outcomes(&parsed);
+    Ok(assemble(parsed.iter()))
+}
 
-        // Non-Rust files go through tree-sitter. They feed the SAME orphan list
-        // as the Rust front end, so a Go method whose receiver type is declared
-        // three files away, or a C++ member defined out of line in a .cpp, is
-        // attached by the one pass below rather than dropped. Routing them past
-        // that pass is what made every non-Rust project look like a pile of
-        // types with no behaviour.
-        if let Some(lang) = crate::lang::Language::from_path(path) {
-            if looks_generated(path, &content) {
-                skipped_generated += 1;
-                continue;
-            }
-            let module_path = derive_module_path(dir, path);
-            let rel_path = path
-                .strip_prefix(dir)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            boundaries.extend(crate::bridge::scan_file(
-                Path::new(&rel_path),
-                &content,
-                lang.label(),
-            ));
-            let extracted = crate::lang::parse_file(
-                &content,
-                lang,
-                &module_path,
-                &rel_path,
-                opts.include_private,
-            );
-            all_items.extend(extracted.items);
-            orphan_impls.extend(extracted.orphans);
-            for name in extracted.partial_types {
-                if !partial_types.contains(&name) {
-                    partial_types.push(name);
-                }
-            }
-            continue;
+/// Everything one file contributes, before any cross-file resolution.
+///
+/// Split out of `parse_dir_with` so a long-lived server can keep one of these
+/// per file and re-parse only the files that changed. The cross-file work -
+/// partial types, impls whose owner lives elsewhere, language boundaries - is
+/// done by `assemble` over the whole set, so an incremental rebuild and a cold
+/// parse run exactly the same resolution and cannot disagree.
+#[derive(Debug, Clone, Default)]
+pub struct FileParse {
+    pub items: Vec<ApiItem>,
+    pub orphans: Vec<PendingImpl>,
+    pub partial_types: Vec<String>,
+    pub boundaries: Vec<crate::bridge::Boundary>,
+    /// Build output recognised by shape; contributes nothing.
+    pub generated: bool,
+    /// Why the file could not be parsed. Its items are then absent, which is
+    /// indistinguishable from "this file declares nothing" unless it is kept.
+    pub error: Option<String>,
+}
+
+/// Every source file `parse_dir_with` reads under `dir`, in a stable order.
+///
+/// Sorted by path: resolution breaks ties by position (the first half of a
+/// partial type is canonical), and readdir order is not something two runs -
+/// or a cold parse and an incremental one - are guaranteed to share.
+pub fn source_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let gitignore = load_gitignore(dir);
+    WalkDir::new(dir)
+        .sort_by_file_name()
+        .into_iter()
+        // Prune whole directories rather than filtering files, so we never
+        // descend into build output or vendored dependencies at all.
+        .filter_entry(|e| !is_excluded_dir(e) && !is_gitignored(&gitignore, e, dir))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| is_source_path(e.path()))
+        .map(|e| e.into_path())
+        .collect()
+}
+
+/// A file extension some front end reads.
+pub fn is_source_path(p: &Path) -> bool {
+    p.extension().map_or(false, |ext| ext == "rs") || crate::lang::Language::from_path(p).is_some()
+}
+
+/// Parse one file of the root `dir`.
+pub fn parse_source_file(dir: &Path, path: &Path, content: &str, opts: ParseOptions) -> FileParse {
+    let module_path = derive_module_path(dir, path);
+    let rel_path = path
+        .strip_prefix(dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    // Non-Rust files go through tree-sitter. They feed the SAME orphan list
+    // as the Rust front end, so a Go method whose receiver type is declared
+    // three files away, or a C++ member defined out of line in a .cpp, is
+    // attached by the one pass in `assemble` rather than dropped. Routing them
+    // past that pass is what made every non-Rust project look like a pile of
+    // types with no behaviour.
+    if let Some(lang) = crate::lang::Language::from_path(path) {
+        if looks_generated(path, content) {
+            return FileParse { generated: true, ..FileParse::default() };
         }
-
-        match syn::parse_file(&content) {
-            Ok(file) => {
-                let module_path = derive_module_path(dir, path);
-                let rel_path = path
-                    .strip_prefix(dir)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                // Rust is on both sides of these boundaries: it serves routes
-                // (axum, actix) and exports wasm/FFI symbols that JavaScript
-                // imports. Scanning only the tree-sitter languages would find
-                // every caller and none of the callees.
-                boundaries.extend(crate::bridge::scan_file(
-                    Path::new(&rel_path),
-                    &content,
-                    "rust",
-                ));
-                let (items, leftovers) =
-                    extract_items(&file, &module_path, &rel_path, opts.include_private);
-                all_items.extend(items);
-                orphan_impls.extend(leftovers);
+        let boundaries = crate::bridge::scan_file(Path::new(&rel_path), content, lang.label());
+        let extracted =
+            crate::lang::parse_file(content, lang, &module_path, &rel_path, opts.include_private);
+        let mut partial_types: Vec<String> = Vec::new();
+        for name in extracted.partial_types {
+            if !partial_types.contains(&name) {
+                partial_types.push(name);
             }
-            Err(e) => {
-                eprintln!("warn: could not parse {}: {}", path.display(), e);
+        }
+        return FileParse {
+            items: extracted.items,
+            orphans: extracted.orphans,
+            partial_types,
+            boundaries,
+            ..FileParse::default()
+        };
+    }
+
+    match syn::parse_file(content) {
+        Ok(file) => {
+            // Rust is on both sides of these boundaries: it serves routes
+            // (axum, actix) and exports wasm/FFI symbols that JavaScript
+            // imports. Scanning only the tree-sitter languages would find
+            // every caller and none of the callees.
+            let boundaries = crate::bridge::scan_file(Path::new(&rel_path), content, "rust");
+            let (items, orphans) =
+                extract_items(&file, &module_path, &rel_path, opts.include_private);
+            FileParse { items, orphans, boundaries, ..FileParse::default() }
+        }
+        Err(e) => {
+            let at = e.span().start();
+            FileParse {
+                error: Some(format!("{rel_path}:{}:{}: {e}", at.line, at.column + 1)),
+                ..FileParse::default()
+            }
+        }
+    }
+}
+
+/// Print what a batch parse skipped or failed on. A filter that silently drops
+/// files is one nobody can tell apart from a project that genuinely has none -
+/// and if it ever over-matches, this line is the only way anyone finds out.
+pub fn report_parse_outcomes<'a>(parsed: impl IntoIterator<Item = &'a FileParse>) {
+    let mut skipped_generated = 0usize;
+    for p in parsed {
+        if p.generated {
+            skipped_generated += 1;
+        }
+        if let Some(err) = &p.error {
+            eprintln!("warn: could not parse {err}");
+        }
+    }
+    if skipped_generated > 0 {
+        eprintln!(
+            "  skipped {skipped_generated} generated/minified file(s) — build output, not API"
+        );
+    }
+}
+
+/// Resolve a root's per-file results into its items.
+///
+/// Consumes nothing: a server keeping `FileParse`s per file calls this again
+/// after re-parsing one of them.
+pub fn assemble<'a>(parsed: impl IntoIterator<Item = &'a FileParse>) -> Vec<ApiItem> {
+    let mut all_items: Vec<ApiItem> = Vec::new();
+    let mut orphan_impls: Vec<PendingImpl> = Vec::new();
+    let mut partial_types: Vec<String> = Vec::new();
+    let mut boundaries: Vec<crate::bridge::Boundary> = Vec::new();
+    for p in parsed {
+        all_items.extend(p.items.iter().cloned());
+        orphan_impls.extend(p.orphans.iter().cloned());
+        boundaries.extend(p.boundaries.iter().cloned());
+        for name in &p.partial_types {
+            if !partial_types.contains(name) {
+                partial_types.push(name.clone());
             }
         }
     }
@@ -217,16 +279,7 @@ pub fn parse_dir_with(dir: &Path, opts: ParseOptions) -> Result<Vec<ApiItem>> {
     // read.
     attach_cross_language_edges(&mut all_items, &crate::bridge::link(&boundaries));
 
-    // Say what was skipped. A filter that silently drops files is one nobody can
-    // tell apart from a project that genuinely has none — and if this one ever
-    // over-matches, this line is the only way anyone finds out.
-    if skipped_generated > 0 {
-        eprintln!(
-            "  skipped {skipped_generated} generated/minified file(s) — build output, not API"
-        );
-    }
-
-    Ok(all_items)
+    all_items
 }
 
 /// Which indexed item does `file:line` belong to?
@@ -472,18 +525,7 @@ pub fn looks_generated(path: &Path, content: &str) -> bool {
 /// Diagnostics must apply the same exclusions as the parser, or `selfcheck`
 /// reports a file count the parser never touches.
 pub fn count_source_files(dir: &Path) -> usize {
-    let gitignore = load_gitignore(dir);
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_entry(|e| !is_excluded_dir(e) && !is_gitignored(&gitignore, e, dir))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            let p = e.path();
-            p.extension().and_then(|x| x.to_str()) == Some("rs")
-                || crate::lang::Language::from_path(p).is_some()
-        })
-        .count()
+    source_files(dir).len()
 }
 
 /// True when this entry is a directory that should not be descended into.
@@ -665,7 +707,8 @@ fn extract_items(
 /// attachment pass the Rust front end uses. Giving every language its own
 /// resolution pass is how the cross-file impl bug got fixed in one extractor and
 /// lived on for months in another; there is exactly one pass here.
-pub(crate) struct PendingImpl {
+#[derive(Debug, Clone)]
+pub struct PendingImpl {
     pub(crate) self_ty: String,
     pub(crate) trait_name: Option<String>,
     pub(crate) methods: Vec<ApiMethod>,

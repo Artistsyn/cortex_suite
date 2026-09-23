@@ -9,7 +9,7 @@ use crate::git;
 use crate::graph;
 use crate::memory::Store;
 use crate::model::{CodeUnit, PendingObservation};
-use crate::planner::{build_context_packet, render_packet};
+use crate::planner::{build_context_packet_with, render_packet};
 use crate::search::{hybrid_search, keyword_search};
 
 pub fn dispatch(
@@ -29,7 +29,7 @@ pub fn dispatch(
         "get_usage_examples"   => tool_get_usage_examples(args, store, units, session_id),
         "get_helper"           => tool_get_helper(args, store, units, session_id),
         "get_context"          => tool_get_context(args, store, units, repo_root, prefs_summary, session_id),
-        "get_delta"            => tool_get_delta(args, repo_root),
+        "get_delta"            => tool_get_delta(args, store, repo_root),
         "query_graph"          => tool_query_graph(args, store, session_id),
         "explain_dependency_path" => tool_explain_dependency_path(args, store, session_id),
         "get_preferences"      => tool_get_preferences(args, store, prefs_summary, session_id),
@@ -713,7 +713,7 @@ fn tool_get_context(
         max_patch_lines: args.get("delta_max_patch_lines").and_then(|v| v.as_u64()).unwrap_or(40) as usize,
     };
 
-    let packet = build_context_packet(store, &augmented, budget, Some(repo_root), Some(&delta_opts))
+    let packet = build_context_packet_with(store, units, &augmented, budget, Some(repo_root), Some(&delta_opts))
         .map_err(|e| e.to_string())?;
 
     if packet.relevant_units.is_empty()
@@ -753,28 +753,74 @@ fn tool_get_context(
     Ok(out)
 }
 
-fn tool_get_delta(args: &Value, repo_root: &Path) -> Result<String, String> {
+fn tool_get_delta(args: &Value, store: &Store, repo_root: &Path) -> Result<String, String> {
+    // What changed in the CODE'S API, from the journal every index run writes -
+    // no git needed. This used to be `git diff` alone, and on a workspace that
+    // is not a repository every git failure mapped to empty output, so it
+    // answered "No git deltas found." on a tree with four days of edits in it.
+    let since_arg = args.get("since").and_then(|v| v.as_str()).unwrap_or("session");
+    let cap = args.get("max_changes").and_then(|v| v.as_u64()).unwrap_or(60) as usize;
+    let is_git = git::is_git_repo(repo_root);
+
+    let mut out = String::new();
+    match crate::indexer::parse_since(since_arg) {
+        Some(since) => {
+            let changes = crate::indexer::net_changes_since(store.conn(), since)
+                .map_err(|e| e.to_string())?;
+            let label = if since_arg.eq_ignore_ascii_case("session") {
+                "this session".to_string()
+            } else {
+                since.format("%Y-%m-%d %H:%M UTC").to_string()
+            };
+            if changes.is_empty() {
+                out.push_str(&format!("No API changes since {label}.\n"));
+            } else {
+                out.push_str(&format!("API changes since {label} ({}):\n", changes.len()));
+                out.push_str(&crate::indexer::render_changes(&changes, cap));
+            }
+        }
+        None if is_git => {} // a git ref: handled below
+        None => {
+            return Err(format!(
+                "`since` must be `session`, an RFC 3339 time, or a span like `90m`/`2h`/`1d` \
+                 (`{since_arg}` is none of those, and {} is not a git repository, so it \
+                 cannot be a ref either)",
+                repo_root.display()
+            ))
+        }
+    }
+
+    // The evidence behind the answer: how far up the check ladder the refresh
+    // that ran before this call had to go. "No API changes" means something
+    // only when it says what was actually checked.
+    if let Some(check) = crate::indexer::last_check() {
+        out.push_str(&format!("({check})\n"));
+    }
+
+    if !is_git {
+        out.push_str("(not a git repository - file-level diffs unavailable)\n");
+        return Ok(out);
+    }
+
     let opts = crate::git::DeltaOptions {
         include: args.get("include").and_then(|v| v.as_str()).map(str::to_string),
         exclude: args.get("exclude").and_then(|v| v.as_str()).map(str::to_string),
         max_files: args.get("max_files").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
         max_patch_lines: args.get("max_patch_lines").and_then(|v| v.as_u64()).unwrap_or(40) as usize,
     };
-
-    let deltas = if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
-        git::commit_deltas_with_options(repo_root, since, "HEAD", &opts).map_err(|e| e.to_string())?
+    let deltas = if crate::indexer::parse_since(since_arg).is_none() {
+        git::commit_deltas_with_options(repo_root, since_arg, "HEAD", &opts).map_err(|e| e.to_string())?
     } else {
         git::head_deltas_with_options(repo_root, &opts).map_err(|e| e.to_string())?
     };
-
     if deltas.is_empty() {
-        return Ok("No git deltas found.".to_string());
-    }
-
-    let mut out = String::new();
-    for d in deltas {
-        let entry = git::compress_delta(&d);
-        out.push_str(&format!("{} {} - {}\n", entry.change, entry.path, entry.summary));
+        out.push_str("No uncommitted file changes.\n");
+    } else {
+        out.push_str("Files:\n");
+        for d in deltas {
+            let entry = git::compress_delta(&d);
+            out.push_str(&format!("{} {} - {}\n", entry.change, entry.path, entry.summary));
+        }
     }
     Ok(out)
 }
@@ -1131,6 +1177,16 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
             p.survival_rate * 100.0,
             p.intent
         ));
+        // Only for entries the caller is actually being handed: the check is a
+        // few indexed lookups, not something to run over a whole listing.
+        if relevant {
+            if let Some(note) =
+                crate::knowledge::drift_note(store.conn(), &[&p.intent, &p.body], &p.uses, p.approved_at)
+            {
+                out.push_str(&note);
+                out.push('\n');
+            }
+        }
         // Distinguish a TARGETED expansion from bulk browsing.
         //
         // A listing touches every row on every call, so crediting all of them
@@ -1449,12 +1505,24 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
         }
 
         if full || relevant {
+            let drift = if relevant {
+                crate::knowledge::drift_note(
+                    store.conn(),
+                    &[&ap.description, &ap.wrong, &ap.correct],
+                    &[],
+                    ap.added_at,
+                )
+                .map(|n| format!("{n}\n"))
+                .unwrap_or_default()
+            } else {
+                String::new()
+            };
             out.push_str(&format!("### {}
 ✗ wrong:   {}
 ✓ correct: {}
-
+{}
 ",
-                ap.description, ap.wrong, ap.correct));
+                ap.description, ap.wrong, ap.correct, drift));
             expanded += 1;
         } else {
             // Every trap stays listed -- that is this call's safety function, and
@@ -2146,7 +2214,11 @@ fn review_queue_line(store: &Store) -> String {
     // agent that dropped it is the one least likely to remember.
     let open = crate::corrections::open_count(store).unwrap_or(0);
 
-    if drafted.is_empty() && proposals == 0 && repeats.is_empty() && open == 0 {
+    // Stored lessons whose code moved after they were written. Computed from
+    // the change journal, so it costs one query while the journal is empty.
+    let drifted = crate::knowledge::drifted_entries(store).len();
+
+    if drafted.is_empty() && proposals == 0 && repeats.is_empty() && open == 0 && drifted == 0 {
         return String::new();
     }
 
@@ -2185,6 +2257,13 @@ fn review_queue_line(store: &Store) -> String {
         out.push_str(&format!(
             "  {proposals} proposal(s) pending\n    review: {}\n",
             crate::cache::launcher_command("review-proposals")
+        ));
+    }
+    if drifted > 0 {
+        out.push_str(&format!(
+            "  {drifted} pattern/anti-pattern entr(ies) name code that changed after they were \
+             written\n    list: {}  (re-verify, then update or supersede)\n",
+            crate::cache::launcher_command("knowledge-drift")
         ));
     }
     out

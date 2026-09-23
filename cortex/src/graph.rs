@@ -31,6 +31,106 @@ pub fn sync_nodes(conn: &Connection) -> Result<usize> {
     Ok(n)
 }
 
+/// `sync_nodes`, restricted to one source root's units.
+pub fn sync_nodes_for_root(conn: &Connection, source_root: &str) -> Result<usize> {
+    let n = conn.execute(
+        "INSERT INTO graph_nodes (id, kind, name, module_path)
+         SELECT id, kind, name, module_path FROM code_units
+         WHERE source_root = ?1
+         ON CONFLICT(id) DO UPDATE SET
+             kind        = excluded.kind,
+             name        = excluded.name,
+             module_path = excluded.module_path",
+        params![source_root],
+    )?;
+    Ok(n)
+}
+
+/// `infer_edges`, restricted to edges LEAVING `units` (and their member child
+/// nodes). Inferred edges only ever leave the unit they are inferred from, so
+/// this is exactly the set a change to these units can invalidate - except
+/// edges INTO a newly added unit from elsewhere, which wait for the next
+/// global pass.
+pub fn infer_edges_for(conn: &Connection, units: &[CodeUnit]) -> Result<usize> {
+    {
+        let mut del = conn.prepare(
+            "DELETE FROM graph_edges WHERE source = 'inferred' AND from_id = ?1",
+        )?;
+        // Member child nodes are `<unit>::<kind>:<name>`. A range on the key
+        // (':' + 1 is ';') lets the index do the work; the instr tests then
+        // keep a submodule's units (`<unit>::sub::X`) out of it.
+        let mut del_children = conn.prepare(
+            "DELETE FROM graph_edges WHERE source = 'inferred'
+               AND from_id >= ?1 || '::' AND from_id < ?1 || ':;'
+               AND instr(substr(from_id, length(?1) + 3), '::') = 0
+               AND instr(substr(from_id, length(?1) + 3), ':') > 0",
+        )?;
+        for u in units {
+            del.execute(params![u.id])?;
+            del_children.execute(params![u.id])?;
+        }
+    }
+    let by_name = node_name_to_id(conn)?;
+    let mut seen = HashSet::<(String, String, String)>::new();
+    let mut inserted = 0usize;
+    for unit in units {
+        inserted += infer_impl_edges(conn, unit, &by_name, &mut seen)?;
+        inserted += infer_uses_edges(conn, unit, &by_name, &mut seen)?;
+        inserted += infer_derived_edges(conn, unit, &mut seen)?;
+    }
+    Ok(inserted)
+}
+
+/// Units OUTSIDE `exclude_root` whose text names any of `names`.
+///
+/// Inferred edges leave the unit they are inferred from, so when a root gains
+/// an item, the edges INTO it live on units elsewhere that already named it -
+/// and a per-root refresh never revisits those. This finds them: one pass over
+/// the other roots' text, a set lookup per identifier, so it costs the same for
+/// one new name as for a hundred. Only the fields inference reads are loaded.
+pub fn units_mentioning(
+    conn: &Connection,
+    names: &HashSet<&str>,
+    exclude_root: &str,
+) -> Result<Vec<CodeUnit>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, kind, name, module_path, compressed FROM code_units
+          WHERE source_root IS NOT ?1",
+    )?;
+    let rows = stmt.query_map(params![exclude_root], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, kind, name, module_path, compressed) = row?;
+        let mentions = compressed
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|tok| tok != name && names.contains(tok));
+        if mentions {
+            out.push(CodeUnit {
+                id,
+                kind,
+                name,
+                module_path,
+                summary: String::new(),
+                compressed,
+                term_vector: Vec::new(),
+                indexed_at: chrono::Utc::now(),
+            });
+        }
+    }
+    Ok(out)
+}
+
 pub fn infer_edges(conn: &Connection, units: &[CodeUnit]) -> Result<usize> {
     conn.execute("DELETE FROM graph_edges WHERE source = 'inferred'", [])?;
 
@@ -76,11 +176,44 @@ pub fn ingest_calls(
     if calls.is_empty() {
         return Ok((0, 0));
     }
+    let resolver = CallResolver::for_root(conn, source_root)?;
+    ingest_calls_with(conn, &resolver, unit_id, calls, scope)
+}
 
-    // name -> unit ids, for resolving a path call's owner.
-    let by_name = node_name_to_ids(conn, source_root)?;
-    // method name -> unit ids owning a method of that name.
-    let by_method = method_name_to_ids(conn, source_root)?;
+/// The lookups call resolution needs for one source root.
+///
+/// Built once per root and reused for every unit. Building them per unit - as
+/// `ingest_calls` alone does - re-reads and re-parses the whole root for each
+/// of its units, which is quadratic and dominated indexing time.
+pub struct CallResolver {
+    /// name -> unit ids, for resolving a path call's owner.
+    by_name: HashMap<String, Vec<String>>,
+    /// method name -> unit ids owning a method of that name.
+    by_method: HashMap<String, Vec<String>>,
+}
+
+impl CallResolver {
+    pub fn for_root(conn: &Connection, source_root: &str) -> Result<Self> {
+        Ok(Self {
+            by_name: node_name_to_ids(conn, source_root)?,
+            by_method: method_name_to_ids(conn, source_root)?,
+        })
+    }
+}
+
+/// `ingest_calls` with the root's lookups already built.
+pub fn ingest_calls_with(
+    conn: &Connection,
+    resolver: &CallResolver,
+    unit_id: &str,
+    calls: &[crate::model::ApiGraphCall],
+    scope: Option<&str>,
+) -> Result<(usize, usize)> {
+    if calls.is_empty() {
+        return Ok((0, 0));
+    }
+    let by_name = &resolver.by_name;
+    let by_method = &resolver.by_method;
 
     let mut recorded = 0usize;
     let mut edged = 0usize;

@@ -19,6 +19,22 @@ pub fn build_context_packet(
     delta_options: Option<&git::DeltaOptions>,
 ) -> Result<ContextPacket> {
     let all_units = store.all_units()?;
+    build_context_packet_with(store, &all_units, hint, token_budget, repo_root, delta_options)
+}
+
+/// `build_context_packet` over units the caller already holds.
+///
+/// The MCP server keeps every unit in memory (reloaded only when the index
+/// generation moves), yet each `get_context` used to read and deserialise all
+/// of them again from SQLite - thousands of rows and term vectors per call.
+pub fn build_context_packet_with(
+    store: &Store,
+    all_units: &[crate::model::CodeUnit],
+    hint: &str,
+    token_budget: usize,
+    repo_root: Option<&Path>,
+    delta_options: Option<&git::DeltaOptions>,
+) -> Result<ContextPacket> {
     let all_patterns = store.all_patterns()?;
     let all_anti_patterns = store.all_anti_patterns()?;
     let all_annotations = store.all_annotations()?;
@@ -26,7 +42,7 @@ pub fn build_context_packet(
     let mut budget_remaining = token_budget;
 
     // Semantic search for relevant units
-    let search_results = semantic_search(hint, &all_units, 8);
+    let search_results = semantic_search(hint, all_units, 8);
     let mut relevant_units = Vec::new();
     for result in search_results {
         let cost = estimate_tokens(&result.unit.compressed);
@@ -95,10 +111,31 @@ pub fn build_context_packet(
             max_patch_lines: 40,
         });
 
-        git::head_deltas_with_options(root, &opts)?
-            .into_iter()
-            .map(|d| git::compress_delta(&d))
-            .collect()
+        // The index's change journal first: it needs no git and names API
+        // items rather than files. File diffs follow when there is a repo.
+        let mut d: Vec<crate::model::DeltaEntry> =
+            crate::indexer::net_changes_since(store.conn(), crate::indexer::session_start())
+                .unwrap_or_default()
+                .into_iter()
+                .take(opts.max_files)
+                .map(|c| crate::model::DeltaEntry {
+                    path: c.unit_id,
+                    change: c.change.to_string(),
+                    summary: if c.detail.is_empty() {
+                        c.location.unwrap_or_default()
+                    } else {
+                        c.detail.join(", ")
+                    },
+                })
+                .collect();
+        if git::is_git_repo(root) {
+            d.extend(
+                git::head_deltas_with_options(root, &opts)?
+                    .into_iter()
+                    .map(|d| git::compress_delta(&d)),
+            );
+        }
+        d
     } else {
         vec![]
     };

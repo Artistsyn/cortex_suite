@@ -7,8 +7,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::cache::{
-    cache_stats, compute_index_version, current_index_version,
-    staleness_notice,
+    cache_stats, compute_index_version,
     invalidate_stale, SessionRegistry,
 };
 use crate::memory::Store;
@@ -28,6 +27,17 @@ const CODE_BACKED: &[&str] = &[
     "get_item", "get_syntax", "get_usage_examples", "get_helper",
     "semantic_search", "recall", "query_graph", "get_context",
     "explain_dependency_path", "simulate_change", "find_related_types",
+    "list_all",
+];
+
+/// Tools that bring the code index up to date before answering: everything
+/// code-backed, plus the change journal (`get_delta`) and the knowledge
+/// listings, whose drift flags are computed from it.
+const FRESHNESS_BARRIER: &[&str] = &[
+    "get_item", "get_syntax", "get_usage_examples", "get_helper",
+    "semantic_search", "recall", "query_graph", "get_context",
+    "explain_dependency_path", "simulate_change", "find_related_types",
+    "list_all", "get_delta", "get_anti_patterns", "list_patterns",
 ];
 
 /// Max response cache entries before LRU eviction kicks in.
@@ -63,7 +73,7 @@ const UNCACHEABLE: &[&str] = &[
 
 pub fn serve(
     store: Store,
-    units: Vec<CodeUnit>,
+    mut units: Vec<CodeUnit>,
     engine_name: &str,
     repo_root: PathBuf,
     prefs_summary: String,
@@ -115,6 +125,9 @@ pub fn serve(
         crate::protocol::is_bootstrap_complete(store.conn(), &session_id).unwrap_or(false),
         Ordering::Relaxed,
     );
+
+    let mut units_generation = crate::indexer::generation(store.conn());
+    crate::indexer::mark_session_start();
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -194,10 +207,43 @@ pub fn serve(
                     }
                 }
 
-                // Still sampled per request, but now only to decide whether the
-                // INDEX is stale enough to warn about — nothing is keyed on it.
-                let _index_version =
-                    current_index_version(store.conn(), Some(repo_root.as_path()));
+                // Bring the code index up to date BEFORE answering, for every
+                // tool whose answer depends on it.
+                //
+                // This used to be a notice: the index went stale on the first
+                // edit, the server said so once, and the remedy it named
+                // (`reindex`) updated the database but not this process's
+                // in-memory units - so following the advice silenced the
+                // warning and left the answers stale. Now the stale roots are
+                // re-indexed in-process (only units whose text changed are
+                // rewritten; ~0.3 s for an edit in a 1,000-unit crate, ~5 ms
+                // when nothing changed) and the units reloaded, so the lookup an
+                // agent makes right after its own edit sees that edit.
+                let mut refresh_failed: Vec<(String, String)> = Vec::new();
+                if FRESHNESS_BARRIER.contains(&tool) {
+                    let summary = crate::indexer::refresh_stale(&store, repo_root.as_path());
+                    for (src, out) in &summary.refreshed {
+                        eprintln!(
+                            "cortex: refreshed {src} ({} added, {} removed, {} changed, {:.0} ms)",
+                            out.added, out.removed, out.changed,
+                            out.elapsed.as_secs_f64() * 1000.0
+                        );
+                    }
+                    refresh_failed = summary.failed;
+                }
+                // Reload when THIS process or ANOTHER (the launcher, a second
+                // session's server) indexed anything since the units were read.
+                let generation_now = crate::indexer::generation(store.conn());
+                if generation_now != units_generation {
+                    match store.all_units() {
+                        Ok(fresh) => {
+                            eprintln!("cortex: reloaded {} units (index generation {generation_now})", fresh.len());
+                            units = fresh;
+                            units_generation = generation_now;
+                        }
+                        Err(e) => eprintln!("warn: could not reload units: {e}"),
+                    }
+                }
 
                 // The response cache is gone.
                 //
@@ -224,15 +270,34 @@ pub fn serve(
                         &prefs_summary,
                     );
 
-                    // Then attach the notice to the answer it qualifies, so it
-                    // rides on the response the staleness actually affects.
+                    // A root that could not be brought current is named on the
+                    // answer it qualifies - on an error answer too, since "no
+                    // item named X" is exactly what a stale index says about a
+                    // new X. (The notice used to be spent on error answers and
+                    // then withheld, so it was lost on the very call staleness
+                    // had broken.)
                     if CODE_BACKED.contains(&tool) {
-                        if let Some(notice) = staleness_notice(store.conn(), repo_root.as_path()) {
-                            if let Ok(ref mut res) = result {
-                                if let Some(text) = res["content"][0]["text"].as_str() {
-                                    let joined = format!("{text}{notice}");
-                                    res["content"][0]["text"] = json!(joined);
+                        let mut notice = String::new();
+                        if !refresh_failed.is_empty() {
+                            notice.push_str("\n\n[stale index] could not refresh: ");
+                            let parts: Vec<String> = refresh_failed
+                                .iter()
+                                .map(|(src, err)| format!("{src} ({err})"))
+                                .collect();
+                            notice.push_str(&parts.join("; "));
+                            notice.push_str(" - answers about these roots may predate recent edits.");
+                        }
+                        // No other staleness notice: every code-backed call
+                        // refreshed first, so a root is stale only if its
+                        // refresh failed, and that is reported above.
+                        if !notice.is_empty() {
+                            match result {
+                                Ok(ref mut res) => {
+                                    if let Some(text) = res["content"][0]["text"].as_str() {
+                                        res["content"][0]["text"] = json!(format!("{text}{notice}"));
+                                    }
                                 }
+                                Err(ref mut msg) => msg.push_str(&notice),
                             }
                         }
                     }
@@ -375,11 +440,16 @@ fn tools_list() -> Value {
             },
             {
                 "name": "get_delta",
-                "description": "Get compressed git delta entries for working tree or from a commit range.",
+                "description": "What changed in the code's API: items added, removed or reshaped \
+                                (fields, methods, variants, signatures), net over the window, from \
+                                the index's own change journal - works without git and covers \
+                                uncommitted edits. Default window: this session. Also lists changed \
+                                files when the workspace is a git repository.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "since": { "type": "string", "description": "Optional start ref. Uses HEAD working tree diff when omitted." },
+                        "since": { "type": "string", "description": "`session` (default), an RFC 3339 time, a span like `90m`/`2h`/`1d`, or - in a git repository - a commit ref." },
+                        "max_changes": { "type": "integer", "description": "Max API changes to list (default: 60)." },
                         "include": { "type": "string", "description": "Optional substring include filter for changed paths." },
                         "exclude": { "type": "string", "description": "Optional substring exclude filter for changed paths." },
                         "max_files": { "type": "integer", "description": "Max changed files to return (default: 128)." },

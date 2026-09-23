@@ -25,3 +25,20 @@ walkdir     = "2.0"
 flate2      = "1.0"
 sha2        = "0.10"
 hex         = "0.4"
+# The extraction core. Linked rather than shelled out to, so cortex and
+# quartz-ctx parse the code through one front end and cannot disagree.
+quartz-ctx  = { path = "../quartz-ctx" }
+
+# The MCP configs run the DEV build, so its speed is every agent's latency.
+# opt-level 1 measured 3-10x faster per tool call (get_context 454 -> 43 ms,
+# semantic_search 105 -> 10 ms) and keeps debuginfo; the price is a slower
+# first build and some variables optimised out in a debugger.
+[profile.dev]
+opt-level = 1
+
+# Optimise dependencies even in the dev build the MCP config runs. The bundled
+# SQLite and the tree-sitter grammars are C, compiled at -O0 otherwise, which
+# made an in-request re-index several times slower for no debugging benefit -
+# nobody steps through sqlite3.c. cortex's own code stays unoptimised.
+[profile.dev.package."*"]
+opt-level = 2

@@ -10,6 +10,9 @@ mod crystallizer;
 mod git;
 mod graph;
 mod graph_diff;
+mod graphify_proxy;
+mod indexer;
+mod knowledge;
 mod markers;
 mod memory;
 mod mcp;
@@ -118,6 +121,32 @@ enum Command {
     /// of a suite that advertises none -- and that only fails on a machine that
     /// lacks it, which is never the author's.
     Manifest {
+        /// Repo root holding .cortex/index-sources.json.
+        #[arg(long, default_value = ".")]
+        repo: std::path::PathBuf,
+    },
+
+    /// List patterns and anti-patterns that name code which changed after they
+    /// were written, per the index's change journal.
+    KnowledgeDrift,
+
+    /// Serve graphify's MCP tools, rebuilding and reloading graph.json when the
+    /// source has moved past it (graphify-rs alone loads it once at startup).
+    GraphifyServe {
+        /// Repo root the graph describes.
+        #[arg(long, default_value = ".")]
+        repo: std::path::PathBuf,
+        /// The graph file graphify-rs serves.
+        #[arg(long, default_value = ".graphify-output/graph.json")]
+        graph: std::path::PathBuf,
+        /// graphify-rs executable.
+        #[arg(long, default_value = "graphify-rs")]
+        graphify: String,
+    },
+
+    /// Re-index only the manifest roots whose source changed since they were
+    /// indexed - what the MCP server does before every code-backed answer.
+    Refresh {
         /// Repo root holding .cortex/index-sources.json.
         #[arg(long, default_value = ".")]
         repo: std::path::PathBuf,
@@ -738,6 +767,19 @@ fn main() -> Result<()> {
         Command::AntiPattern(cmd)  => run_anti_pattern(cmd, &db_path, format),
         Command::Annotate(cmd)     => run_annotate(cmd, &db_path, format),
         Command::Manifest { repo } => run_manifest(&repo),
+        Command::Refresh { repo }  => run_refresh(&repo, &db_path),
+        Command::KnowledgeDrift    => {
+            let store = Store::open(&db_path)?;
+            let drifted = knowledge::drifted_entries(&store);
+            if drifted.is_empty() {
+                println!("no stored entry names code that changed after it was written");
+            }
+            for (kind, id, title, note) in drifted {
+                println!("{kind} #{id}: {title}\n  {note}");
+            }
+            Ok(())
+        }
+        Command::GraphifyServe { repo, graph, graphify } => graphify_proxy::serve(&repo, &graph, &graphify),
         Command::Prune { keep_calls } => run_prune(keep_calls, &db_path),
         Command::PruneIndex { keep, apply } => run_prune_index(keep, apply, &db_path),
         Command::Status { full }   => run_status(&db_path, full, format),
@@ -2385,134 +2427,103 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
 
     eprintln!("cortex index: compressing {}", args.source.display());
-    let (mut units, mut members) = compressor::compress_dir(&args.source, args.scope.as_deref())?;
-    eprintln!("  source: {} items compressed, {} members", units.len(), members.len());
 
-    let mut graph_calls: Vec<(String, Vec<model::ApiGraphCall>)> = Vec::new();
-    if let Some(graph_path) = &args.api_graph {
-        let json = std::fs::read_to_string(graph_path)
-            .with_context(|| format!("could not read api-graph: {}", graph_path.display()))?;
-        let graph_items: Vec<model::ApiGraphItem> = serde_json::from_str(&json)?;
-        // Same scope as the source itself: quartz-ctx ids are unprefixed, so
-        // ingesting a scoped source without it would collide with the primary
-        // engine's ids and overwrite them.
-        // Keep each item's calls alongside the unit id they belong to, so they
-        // can be ingested once the graph nodes exist.
-        for gi in &graph_items {
-            if gi.calls.is_empty() { continue; }
-            let raw_module = gi.module_path.join("::");
-            let module_path = match args.scope.as_deref() {
-                Some(sc) if raw_module.is_empty() => sc.to_string(),
-                Some(sc) => format!("{}::{}", sc, raw_module),
-                None => raw_module,
-            };
-            let id = if module_path.is_empty() { gi.name.clone() } else { format!("{}::{}", module_path, gi.name) };
-            graph_calls.push((id, gi.calls.clone()));
+    // Snapshot the files BEFORE extracting, so an edit that lands mid-index is
+    // left looking changed instead of being stamped as indexed.
+    let fp_key_early = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| args.source.strip_prefix(&cwd).ok().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| args.source.clone())
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let prior = indexer::load_stamps(store.conn(), &fp_key_early)?;
+    let mut check = indexer::RootCheck::default();
+    let (snapshot, _) = indexer::take_snapshot(&args.source, &prior, &mut check);
+
+    // An api-graph file (the launcher's path) is honoured; without one, the
+    // same extractor runs in-process, so `cortex index` alone is complete.
+    let graph_items: Vec<model::ApiGraphItem> = match &args.api_graph {
+        Some(graph_path) => {
+            let json = std::fs::read_to_string(graph_path)
+                .with_context(|| format!("could not read api-graph: {}", graph_path.display()))?;
+            serde_json::from_str(&json)?
         }
-        // Members too, not only units. Ingesting units alone left every
-        // api-graph-only type with no fields and no variants — which for a
-        // non-Rust root is every type it has, since cortex's own pass reads
-        // Rust. The store then disagreed with quartz-ctx about the same type
-        // while both were fed by the one extractor.
-        let graph_members = compressor::api_graph_members(&graph_items, args.scope.as_deref());
-        let graph_units = compressor::compress_api_graph(&graph_items, args.scope.as_deref());
-        // Merge: api-graph items take precedence (they carry full method
-        // signatures with types, per-method docs and field docs).
-        let source_ids: std::collections::HashSet<String> =
-            graph_units.iter().map(|u| u.id.clone()).collect();
-        let ingested = source_ids.len();
-        let replaced = units.iter().filter(|u| source_ids.contains(&u.id)).count();
-        units.retain(|u| !source_ids.contains(&u.id));
-        units.extend(graph_units);
-        // Drop the syn pass's members for any unit the api-graph replaced, so a
-        // type does not end up with both extractors' idea of its fields.
-        members.retain(|m| !source_ids.contains(&m.parent_id));
-        members.extend(graph_members);
-        eprintln!(
-            "  api-graph: {} items from {} ({} replaced own extraction, {} added)",
-            ingested,
-            graph_path.display(),
-            replaced,
-            ingested - replaced,
-        );
-    }
+        None => indexer::extract_api_graph(&args.source, true)?,
+    };
 
-    // Stamp provenance so orphaned sources can be pruned later. Normalised to
-    // forward slashes so the same root indexed from PowerShell and bash agrees.
-    let source_root = args.source.to_string_lossy().replace('\\', "/");
-
-    for unit in &units {
-        store.upsert_unit_from(unit, Some(&source_root))?;
-        store.upsert_symbol_catalog_from_unit(unit)?;
-        store.add_symbol_example_if_missing(
-            &unit.id,
-            &unit.module_path,
-            None,
-            &unit.compressed,
-            "index_unit",
-        )?;
-    }
-    for member in &members {
-        store.upsert_member(member)?;
-    }
-
-    let synced = graph::sync_nodes(store.conn())?;
-    let all_units = store.all_units()?;
-    let inferred = graph::infer_edges(store.conn(), &all_units)?;
-
-    // Call edges, if the api-graph carried any. Recorded after node sync so
-    // callees can be resolved against the units that were just indexed.
-    if !graph_calls.is_empty() {
-        // Clear this source's previous call rows so a reindex replaces rather
-        // than accumulates. Keyed on the unit ids being re-ingested, because an
-        // empty scope prefix in a LIKE would match — and delete — everything.
-        for (unit_id, _) in &graph_calls {
-            let module = unit_id.rsplit_once("::").map(|(m, _)| m).unwrap_or(unit_id);
-            store.conn().execute(
-                "DELETE FROM call_graph WHERE source = 'extracted' AND caller LIKE ?1",
-                rusqlite::params![format!("{module}::%")],
-            ).ok();
-            // Same for the derived graph edges, which carry source='calls' so
-            // infer_edges cannot delete them on the next source's pass.
-            store.conn().execute(
-                "DELETE FROM graph_edges WHERE source = 'calls' AND from_id LIKE ?1",
-                rusqlite::params![format!("{module}::%")],
-            ).ok();
-        }
-        let mut recorded = 0usize;
-        let mut edged = 0usize;
-        for (unit_id, calls) in &graph_calls {
-            let (r, e) = graph::ingest_calls(store.conn(), unit_id, calls, args.scope.as_deref(), &source_root)?;
-            recorded += r;
-            edged += e;
-        }
-        eprintln!(
-            "  calls: {} recorded, {} resolved to graph edges ({} left unresolved)",
-            recorded, edged, recorded.saturating_sub(edged)
-        );
-    }
-
-    eprintln!("  total: {} units in index", units.len());
-    eprintln!("  graph: {} nodes synced, {} edges inferred", synced, inferred);
-    eprintln!("  db: {}", db_path.display());
-
-    // Record what this source looked like at ingest, so the server can tell
-    // later whether the store still reflects the code. Keyed by the manifest's
-    // own relative path so it lines up with what stale_roots reads.
+    // Provenance and the fingerprint key are the path as given, relative to
+    // the cwd where possible, with forward slashes - the manifest's spelling.
     let rel = std::env::current_dir()
         .ok()
         .and_then(|cwd| args.source.strip_prefix(&cwd).ok().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| args.source.clone());
-    // MAIN_SEPARATOR rather than an escaped backslash literal: the manifest
-    // stores forward slashes, and this key has to match what stale_roots builds.
     let rel_key = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
-    let fp = cache::root_fingerprint(&args.source);
-    match store.set_meta(&format!("source_fp:{rel_key}"), &fp) {
-        Ok(()) => eprintln!("  stamped: source_fp:{rel_key}"),
-        Err(e) => eprintln!("  warn: could not stamp source fingerprint for {rel_key}: {e}"),
-    }
+    let spec = indexer::RootSpec {
+        source: args.source.clone(),
+        source_root: args.source.to_string_lossy().replace('\\', "/"),
+        fp_key: rel_key.clone(),
+        scope: args.scope.clone(),
+        include_private: true,
+        journal: !prior.is_empty(),
+    };
+
+    // The index is claimed to reflect THIS snapshot; see index_root.
+    let out = indexer::index_root(
+        &store,
+        &spec,
+        Some(graph_items),
+        indexer::GraphPass::Global,
+        &snapshot,
+    )?;
+    eprintln!(
+        "  api-graph: {} items ({} replaced own extraction, {} added)",
+        out.api_graph_items,
+        out.api_graph_replaced,
+        out.api_graph_items.saturating_sub(out.api_graph_replaced),
+    );
+    eprintln!("  source: {} units, {} members", out.units, out.members);
+    eprintln!(
+        "  changes: {} added, {} removed, {} changed (journaled for get_delta)",
+        out.added, out.removed, out.changed
+    );
+    eprintln!(
+        "  calls: {} recorded, {} resolved to graph edges ({} left unresolved)",
+        out.calls_recorded,
+        out.calls_edged,
+        out.calls_recorded.saturating_sub(out.calls_edged)
+    );
+    eprintln!("  total: {} units in index", store.unit_count()?);
+    eprintln!("  graph: {} nodes synced, {} edges inferred", out.graph_nodes, out.graph_edges);
+    eprintln!("  db: {}", db_path.display());
+    eprintln!("  stamped: source_fp:{rel_key}");
+    eprintln!("  took: {:.2}s", out.elapsed.as_secs_f64());
     eprintln!("\ndone.");
     Ok(())
+}
+
+fn run_refresh(repo: &Path, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let t = std::time::Instant::now();
+    let summary = indexer::refresh_stale(&store, repo);
+    for (src, out) in &summary.refreshed {
+        eprintln!(
+            "  refreshed {src}: {} units, {} added, {} removed, {} changed ({:.0} ms)",
+            out.units, out.added, out.removed, out.changed,
+            out.elapsed.as_secs_f64() * 1000.0
+        );
+    }
+    for (src, err) in &summary.failed {
+        eprintln!("  FAILED {src}: {err}");
+    }
+    eprintln!("  {}", indexer::describe_checks(&summary.checks));
+    if summary.pruned_orphans > 0 {
+        eprintln!("  pruned {} unit(s) from roots no longer in the manifest", summary.pruned_orphans);
+    }
+    if !summary.changed_anything() && summary.failed.is_empty() {
+        eprintln!("  every root is current");
+    }
+    eprintln!("done in {:.2}s", t.elapsed().as_secs_f64());
+    if summary.failed.is_empty() { Ok(()) } else { anyhow::bail!("{} root(s) failed", summary.failed.len()) }
 }
 
 fn run_serve(args: ServeArgs, db_path: &Path) -> Result<()> {

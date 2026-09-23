@@ -737,3 +737,64 @@ fn shortening_a_value_never_splits_a_character() {
     assert_eq!(ellipsize("short", 60), "short");
     assert_eq!(ellipsize("", 60), "");
 }
+
+// ── Parity: what Rust gets and the other front ends were missing ──────────────
+
+/// A doc comment above `export class` / `export const` / `export interface` is a
+/// sibling of the export statement, not of the declaration inside it. Reading
+/// only the declaration's siblings lost it: 502 of 870 exports in the web
+/// editor's frontend came back undocumented.
+#[test]
+fn a_doc_comment_above_an_export_reaches_the_item() {
+    let js = parse(
+        "/** A camera rig. */\nexport class Rig {}\n\n/** Clamp a value. */\nexport const clamp = (v) => v;\n\n/** A panel. */\nexport function Panel() {}\n",
+        Language::JavaScript,
+        true,
+    );
+    assert_eq!(item(&js, "Rig").doc, "A camera rig.");
+    assert_eq!(item(&js, "clamp").doc, "Clamp a value.");
+    assert_eq!(item(&js, "Panel").doc, "A panel.");
+    let ts = parse("/** Shape of a node. */\nexport interface Node { id: string }\n", Language::TypeScript, true);
+    assert_eq!(item(&ts, "Node").doc, "Shape of a node.");
+}
+
+/// JS declares instance fields by assigning them, as Python does; only Python
+/// had a path for it, so 413 `this.x = ...` fields were missing.
+#[test]
+fn js_fields_assigned_through_this_are_fields() {
+    let js = parse(
+        "class Rig {\n  speed = 2;\n  constructor(t) { this.target = t; this.zoom = 1; }\n  move() { this.zoom = 2; other.x = 1; }\n}\n",
+        Language::JavaScript,
+        true,
+    );
+    assert_eq!(field_names(item(&js, "Rig")), ["speed", "target", "zoom"]);
+}
+
+/// `class Mode(Enum)` is an enum: its members are variants, not untyped fields.
+#[test]
+fn a_python_enum_class_is_an_enum_with_variants() {
+    let py = parse(
+        "from enum import Enum\nclass Mode(Enum):\n    SOLID = 1\n    WIRE = 2\n    def label(self):\n        return 'x'\n",
+        Language::Python,
+        true,
+    );
+    let m = item(&py, "Mode");
+    assert_eq!(m.kind, ItemKind::Enum);
+    let v: Vec<&str> = m.variants.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(v, ["SOLID", "WIRE"]);
+    assert!(m.fields.is_empty());
+    assert_eq!(method_names(m), ["label"]);
+}
+
+/// `self.name = name` takes the type `__init__` declared for `name`.
+#[test]
+fn a_python_field_assigned_from_an_annotated_parameter_takes_its_type() {
+    let py = parse(
+        "class Scene:\n    def __init__(self, name: str, count: int = 0, loose=None):\n        self.name = name\n        self.count = count\n        self.loose = loose\n        self.items = []\n",
+        Language::Python,
+        true,
+    );
+    let s = item(&py, "Scene");
+    let tys: Vec<(&str, &str)> = s.fields.iter().map(|f| (f.name.as_str(), f.ty.as_str())).collect();
+    assert_eq!(tys, [("name", "str"), ("count", "int"), ("loose", ""), ("items", "")]);
+}

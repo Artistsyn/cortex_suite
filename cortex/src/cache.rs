@@ -245,12 +245,9 @@ pub fn source_fingerprint(repo_root: &std::path::Path) -> Option<String> {
     for target in targets {
         let Some(src) = target.get("source").and_then(|s| s.as_str()) else { continue };
         let root = repo_root.join(src);
-        let (count, newest) = walk_source(&root);
         hasher.update(src.as_bytes());
         hasher.update(b":");
-        hasher.update(count.to_string().as_bytes());
-        hasher.update(b"@");
-        hasher.update(newest.to_string().as_bytes());
+        hasher.update(root_fingerprint(&root).as_bytes());
         hasher.update(b"
 ");
     }
@@ -262,12 +259,26 @@ pub fn source_fingerprint(repo_root: &std::path::Path) -> Option<String> {
 ///
 /// Stamped per root at index time so staleness is attributable: a change in one
 /// crate should re-ingest that crate, not rescan the other ten.
+///
+/// Every source file's relative path, size and NANOSECOND mtime, over the same
+/// pruned walk the parser does. It used to be "count of .rs files @ newest
+/// mtime", which was blind three ways: to every non-Rust file (a Python/JS root
+/// hashed as `0@0` forever), to a rename (`mv` keeps count and mtimes), and to
+/// an edit that is not the newest file's.
 pub fn root_fingerprint(root: &std::path::Path) -> String {
-    let (count, newest) = walk_source(root);
+    fingerprint_of(&walk_source(root))
+}
+
+/// The fingerprint of an already-walked file list (see `walk_source`).
+pub fn fingerprint_of(files: &[(String, u64, u128)]) -> String {
     let mut h = Sha256::new();
-    h.update(count.to_string().as_bytes());
-    h.update(b"@");
-    h.update(newest.to_string().as_bytes());
+    h.update(b"v2\n");
+    for (rel, len, mtime_ns) in files {
+        h.update(rel.as_bytes());
+        h.update(b"\0");
+        h.update(len.to_le_bytes());
+        h.update(mtime_ns.to_le_bytes());
+    }
     hex::encode(h.finalize())
 }
 
@@ -358,6 +369,23 @@ pub fn reindex_command() -> &'static str {
 /// means the store genuinely reflects the code; a non-empty one names exactly
 /// which sources to re-ingest.
 pub fn stale_roots(conn: &Connection, repo_root: &std::path::Path) -> Vec<String> {
+    stale_roots_filtered(conn, repo_root, None)
+}
+
+/// `stale_roots`, checking only the named sources.
+pub fn stale_roots_among(
+    conn: &Connection,
+    repo_root: &std::path::Path,
+    only: &[String],
+) -> Vec<String> {
+    stale_roots_filtered(conn, repo_root, Some(only))
+}
+
+fn stale_roots_filtered(
+    conn: &Connection,
+    repo_root: &std::path::Path,
+    only: Option<&[String]>,
+) -> Vec<String> {
     let manifest = repo_root.join(".cortex").join("index-sources.json");
     let Ok(raw) = std::fs::read(&manifest) else { return Vec::new() };
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&raw) else { return Vec::new() };
@@ -365,61 +393,63 @@ pub fn stale_roots(conn: &Connection, repo_root: &std::path::Path) -> Vec<String
 
     let mut stale = Vec::new();
     for target in targets {
-        let Some(src) = target.get("source").and_then(|s| s.as_str()) else { continue };
-        let dir = repo_root.join(src);
+        let Some(raw_src) = target.get("source").and_then(|s| s.as_str()) else { continue };
+        // Keys are stamped with forward slashes (see indexer::refresh_stale); a
+        // Windows manifest written with backslashes must look them up the same
+        // way, or every root reads as stale on every call.
+        let src_owned = raw_src.replace('\\', "/");
+        let src = src_owned.as_str();
+        if only.is_some_and(|o| !o.iter().any(|x| x == src)) { continue; }
+        let dir = repo_root.join(raw_src);
         if !dir.exists() { continue; }
         let live = root_fingerprint(&dir);
         let key = format!("source_fp:{src}");
         let stamped: Option<String> = conn.query_row(
             "SELECT value FROM meta WHERE key = ?1", rusqlite::params![key], |r| r.get(0),
         ).ok();
-        // No stamp means this root predates the mechanism -- silent, not stale,
-        // so an existing store does not start shouting on first run.
-        if let Some(prev) = stamped {
-            if prev != live { stale.push(src.to_string()); }
+        // No stamp means this root has never been indexed. That used to be
+        // "silent, not stale" so an old store would not start shouting; now a
+        // stale root is refreshed rather than reported, so an unindexed one is
+        // simply indexed on first use.
+        // A root stamped while one of its files was "racily clean" (modified
+        // within moments of being read) is not settled by its fingerprint: a
+        // second write inside the same timestamp tick would not move it. It
+        // stays stale until a content check clears it.
+        let racy: Option<String> = conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            rusqlite::params![format!("source_racy:{src}")], |r| r.get(0),
+        ).ok();
+        if stamped.as_deref() != Some(live.as_str()) || racy.is_some() {
+            stale.push(src.to_string());
         }
     }
     stale
 }
 
-/// Count `.rs` files under `root` and find the newest mtime, in nanoseconds.
+/// Every source file under `root` as (relative path, size, mtime in ns).
 ///
-/// Build output and vendored trees are pruned. A scanner without ignore rules
-/// cannot be pointed at a project root -- it reads generated bindings under
-/// `target/` as if they were the project's own API.
-fn walk_source(root: &std::path::Path) -> (u64, u128) {
-    const PRUNE: &[&str] = &[
-        "target", "node_modules", "vendor", "dist", "build", "out",
-        ".git", ".venv", "__pycache__", ".next",
-    ];
-    let mut count: u64 = 0;
-    let mut newest: u128 = 0;
-
-    let walker = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
-        // Never prune the walk root itself, so an explicit --source ./target works.
-        if e.depth() == 0 {
-            return true;
-        }
-        !e.file_name().to_str().is_some_and(|n| PRUNE.contains(&n))
-    });
-
-    for entry in walker.flatten() {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        if entry.path().extension().and_then(|x| x.to_str()) != Some("rs") {
-            continue;
-        }
-        count += 1;
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    newest = newest.max(since.as_nanos());
-                }
-            }
-        }
+/// The walk is quartz-ctx's own - same languages, same pruning of build output
+/// and vendored trees, same `.gitignore` - so a file counts here exactly when
+/// the extractor would read it. A second, hand-kept prune list is how the two
+/// disagreed before: this one only knew `.rs`.
+pub fn walk_source(root: &std::path::Path) -> Vec<(String, u64, u128)> {
+    let mut out = Vec::new();
+    for path in quartz_ctx::parser::source_files(root) {
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push((rel, meta.len(), mtime_ns));
     }
-    (count, newest)
+    out
 }
 
 pub fn compute_index_version(
@@ -503,7 +533,7 @@ pub fn compute_index_version(
 /// without a build script: it moves on every relink, including a rebuild from
 /// identical sources, which is the conservative direction for a cache key.
 /// Falls back to the compile timestamp constant if the path cannot be read.
-fn build_stamp() -> String {
+pub fn build_stamp() -> String {
     std::env::current_exe()
         .and_then(|p| std::fs::metadata(p))
         .and_then(|m| m.modified())
@@ -922,10 +952,12 @@ mod stale_root_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An unstamped root predates the mechanism. It must stay silent rather than
-    /// report stale, or every existing store starts shouting on first run.
+    /// An unstamped root has never been indexed. It used to be reported as
+    /// nothing, so an existing store would not start shouting; now a stale root
+    /// is refreshed rather than shouted about, so an unstamped one is stale and
+    /// gets indexed on first use instead of being served as absent forever.
     #[test]
-    fn an_unstamped_root_is_silent() {
+    fn an_unstamped_root_is_stale_so_it_gets_indexed() {
         let dir = std::env::temp_dir().join(format!("cortex_unstamped_{}", std::process::id()));
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
@@ -938,7 +970,7 @@ mod stale_root_tests {
 
         let conn = Connection::open_in_memory().unwrap();
         conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
-        assert!(stale_roots(&conn, &dir).is_empty(), "no stamp means no claim");
+        assert_eq!(stale_roots(&conn, &dir), ["src"], "never indexed means stale");
 
         std::fs::remove_dir_all(&dir).ok();
     }
