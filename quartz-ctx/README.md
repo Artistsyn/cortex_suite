@@ -23,15 +23,22 @@ quartz-ctx serve --source src --name MyProject
 
 Runs a JSON-RPC MCP server over stdio. Used jointly with **cortex** to give the agent both structure (quartz-ctx) and judgment (cortex).
 
+Before every tool call the server re-stats its roots (the same pruned walk the
+parser does) and re-parses only files whose size or nanosecond mtime moved, then
+re-runs cross-file resolution for the roots that changed. An edit is visible to
+the very next call; nothing is served from a timer. A file written within ~3 s of
+being read is content-hashed rather than trusted, so two same-size writes inside
+one timestamp tick are still caught. Files that fail to parse are named on
+not-found answers, since their items are missing.
+
+The extraction core (`parser`, `incremental`, `lang`, `model`) is also a library,
+`quartz_ctx`, which cortex links — so both servers read code through one parser.
+
 #### MCP tools
 
 | Tool | What it does |
 |------|-------------|
 | `get_api_context` | Hint-matched summary of types, signatures, and enum variants |
-| `get_anti_patterns` | Known mistakes to avoid for the current task (hint required) |
-| `list_patterns` | Vetted approaches stored from prior sessions (hint required) |
-| `get_preferences` | Recorded preferences relevant to the current task (hint required) |
-| `recall` | Free-form lookup across all stored knowledge |
 | `trace_across_languages` | Cross-language call/data flow tracing |
 | `list_items` | List all public items, optionally filtered by kind |
 | `get_item` | Full details for a named item |

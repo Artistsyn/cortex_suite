@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Generates structured Copilot context from a Rust codebase's public API surface"
 
+[lib]
+name = "quartz_ctx"
+path = "src/lib.rs"
+
 [[bin]]
 name = "quartz-ctx"
 path = "src/main.rs"

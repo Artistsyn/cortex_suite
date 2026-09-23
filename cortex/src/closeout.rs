@@ -1091,7 +1091,7 @@ correct: y[/CORTEX-AP]
 /// against the newest source file rather than a fixed age: a graph built an hour
 /// ago is stale if the code changed since, and one built a month ago is fine if
 /// nothing has.
-fn graph_is_stale(repo_root: &Path, graph: &Path) -> Option<String> {
+pub(crate) fn graph_is_stale(repo_root: &Path, graph: &Path) -> Option<String> {
     let graph_time = std::fs::metadata(graph).and_then(|m| m.modified()).ok()?;
     let mut newest: Option<(std::time::SystemTime, String)> = None;
     let mut stack = vec![repo_root.to_path_buf()];
@@ -1106,10 +1106,24 @@ fn graph_is_stale(repo_root: &Path, graph: &Path) -> Option<String> {
             let path = e.path();
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
+            if name.starts_with('.')
+                || matches!(
+                    name.as_ref(),
+                    "target" | "node_modules" | "venv" | "site-packages" | "__pycache__"
+                        | "dist" | "build" | "vendor"
+                )
+            {
                 continue;
             }
             if path.is_dir() {
+                // A directory's own mtime moves when an entry is added, removed
+                // or renamed - the changes a newest-FILE scan cannot see, since
+                // `mv` keeps a file's mtime and a deleted file has none.
+                if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                    if newest.as_ref().map(|(nt, _)| t > *nt).unwrap_or(true) {
+                        newest = Some((t, path.display().to_string()));
+                    }
+                }
                 stack.push(path);
                 continue;
             }
@@ -1149,7 +1163,7 @@ fn graph_is_stale(repo_root: &Path, graph: &Path) -> Option<String> {
 /// Rebuild the graph in place. Fails if graphify-rs is not on PATH, which is a
 /// normal state on a machine that does not have it — hence a skipped snapshot
 /// rather than a failed closeout.
-fn rebuild_graph(repo_root: &Path) -> Result<()> {
+pub(crate) fn rebuild_graph(repo_root: &Path) -> Result<()> {
     // --output is REQUIRED. Without it graphify-rs writes to its own per-project
     // cache under ~/.graphify-rs/<project>-<hash>/, not to the repo, so the
     // rebuild "succeeds" and .graphify-output/graph.json stays exactly as stale

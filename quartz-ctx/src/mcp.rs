@@ -25,120 +25,123 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use walkdir::WalkDir;
 
 use crate::model::{ApiItem, Confidence, ItemKind, Visibility};
-use crate::{helpers, parser, Resolved, SourcePlan};
+use crate::{helpers, incremental, parser, Resolved, SourcePlan};
 
-// ── Source auto-reload ────────────────────────────────────────────────────────
+// ── Keeping the served data current ─────────────────────────────────────────
 
-/// How often (at most) we stat-scan the source trees for changes.
-const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a DEGRADED plan (a configured root absent, or the manifest
+/// unreadable) is re-resolved. A healthy plan is re-resolved only when the
+/// manifest file itself changes.
+const REPLAN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Cheap change fingerprint: FNV over every .rs path + mtime in all sources.
-fn source_fingerprint(sources: &[(PathBuf, String, bool)]) -> u64 {
-    let mut h: u64 = 14695981039346656037;
-    let mut mix = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(1099511628211);
-        }
-    };
-    for (path, _, _) in sources {
-        for entry in WalkDir::new(path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            // Must watch every language the parser reads, not just Rust —
-            // otherwise a TypeScript or Go project's fingerprint never moves and
-            // the server serves its first parse forever, with the "auto-reloads
-            // within ~5s" promise quietly untrue for everything but Rust.
-            .filter(|e| {
-                let p = e.path();
-                p.extension().map_or(false, |ext| ext == "rs")
-                    || crate::lang::Language::from_path(p).is_some()
-            })
-        {
-            mix(entry.path().to_string_lossy().as_bytes());
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    if let Ok(d) = mtime.duration_since(std::time::UNIX_EPOCH) {
-                        mix(&d.as_secs().to_le_bytes());
-                    }
-                }
-            }
-        }
-    }
-    h
+fn manifest_stamp(plan: &SourcePlan) -> Option<(u64, std::time::SystemTime)> {
+    let m = std::fs::metadata(plan.manifest_path()?).ok()?;
+    Some((m.len(), m.modified().ok()?))
 }
 
-/// Re-parse the sources if anything changed since the last check.
-/// The API served is therefore always ground truth — no server restarts needed
-/// after engine edits.
-fn maybe_reload(
-    items: &mut Vec<ApiItem>,
-    state: &mut Resolved,
-    plan: &SourcePlan,
-    last_check: &mut Instant,
-    fingerprint: &mut u64,
-) {
-    if last_check.elapsed() < RELOAD_CHECK_INTERVAL {
-        return;
-    }
-    *last_check = Instant::now();
+/// Everything the server holds between requests.
+struct Live {
+    ws: incremental::Workspace,
+    state: Resolved,
+    plan: SourcePlan,
+    manifest: Option<(u64, std::time::SystemTime)>,
+    last_replan: Instant,
+    /// Parse errors already announced, so a persistent one is not re-sent on
+    /// every answer - it is re-sent on answers it could explain (not-found).
+    announced_errors: Vec<String>,
+}
 
-    // Re-resolve the plan only while something it named is absent: a root that
-    // has not been checked out, or a manifest that could not be read.
-    //
-    // Without this, recovering from an empty start needs a server restart —
-    // and the workspace that starts empty is exactly the one where the user is
-    // about to create the thing that fixes it. Guarded on the degraded state
-    // because a full resolve re-reads the manifest and can re-walk a --discover
-    // tree, which is not work to repeat every five seconds once healthy.
-    if !state.missing.is_empty() || state.manifest_error.is_some() {
-        let fresh = plan.resolve();
-        if fresh.sources != state.sources {
-            let gained: Vec<String> = fresh
-                .sources
-                .iter()
-                .filter(|(p, _, _)| !state.sources.iter().any(|(q, _, _)| q == p))
-                .map(|(p, t, _)| format!("{} (origin: {t})", p.display()))
-                .collect();
-            if !gained.is_empty() {
-                eprintln!("quartz-ctx: source root(s) now present — {}", gained.join(", "));
+impl Live {
+    /// Bring the served items in line with the disk. Runs before EVERY answer.
+    ///
+    /// This replaced a 5 s throttle over a whole-tree fingerprint. The throttle
+    /// was the wrong trade: it saved a few milliseconds per call and cost the
+    /// one query that matters most - the agent's lookup right after its own
+    /// edit - which it answered from the previous parse with no warning. A
+    /// refresh here re-stats the pruned tree and re-parses only files whose
+    /// size or nanosecond mtime moved; measured on the FlowMake manifest it is
+    /// a few milliseconds when nothing changed.
+    fn sync(&mut self) {
+        let manifest_now = manifest_stamp(&self.plan);
+        let degraded = !self.state.missing.is_empty() || self.state.manifest_error.is_some();
+        let replan = manifest_now != self.manifest
+            || (degraded && self.last_replan.elapsed() >= REPLAN_INTERVAL);
+        if replan {
+            self.last_replan = Instant::now();
+            self.manifest = manifest_now;
+            let fresh = self.plan.resolve();
+            // A manifest that stops parsing mid-session is almost always one
+            // being edited (a half-saved file). Dropping every root until it
+            // parses again would empty the index under the agent's feet; keep
+            // the last good roots and say so on each answer instead.
+            if fresh.manifest_error.is_some() && !self.state.sources.is_empty() {
+                if self.state.manifest_error != fresh.manifest_error {
+                    eprintln!(
+                        "quartz-ctx: manifest unreadable ({}) - keeping the last good source list",
+                        fresh.manifest_error.as_deref().unwrap_or("")
+                    );
+                }
+                self.state.manifest_error = fresh.manifest_error;
+            } else if fresh.sources != self.state.sources {
+                let gained: Vec<String> = fresh
+                    .sources
+                    .iter()
+                    .filter(|(p, _, _)| !self.state.sources.iter().any(|(q, _, _)| q == p))
+                    .map(|(p, t, _)| format!("{} (origin: {t})", p.display()))
+                    .collect();
+                if !gained.is_empty() {
+                    eprintln!("quartz-ctx: source root(s) now present — {}", gained.join(", "));
+                }
+                self.ws = incremental::Workspace::load(&fresh.sources);
+                eprintln!("quartz-ctx: source plan changed — {} API items", self.ws.items().len());
+                self.state = fresh;
+            } else {
+                self.state = fresh;
             }
-            *state = fresh;
-            *fingerprint = 0; // force the reparse below
-        } else {
-            *state = fresh;
         }
-    }
 
-    if state.sources.is_empty() {
-        return;
-    }
-
-    let fp = source_fingerprint(&state.sources);
-    if fp == *fingerprint {
-        return;
-    }
-    *fingerprint = fp;
-
-    match parser::load_sources_with(&state.sources) {
-        Ok(new_items) if !new_items.is_empty() => {
+        if self.state.sources.is_empty() {
+            return;
+        }
+        let r = self.ws.refresh();
+        if r.touched_files() > 0 {
             eprintln!(
-                "quartz-ctx: source change detected — reloaded {} API items (was {})",
-                new_items.len(), items.len()
+                "quartz-ctx: {} file(s) changed — {} API change(s), {} items, {:.1} ms",
+                r.touched_files(),
+                r.api_changes.len(),
+                self.ws.items().len(),
+                r.elapsed.as_secs_f64() * 1000.0
             );
-            *items = new_items;
         }
-        // Keeping previous data is right when there IS previous data. With an
-        // empty index there is none to keep, and staying empty silently is the
-        // failure this whole path exists to avoid.
-        Ok(_) if items.is_empty() => {
-            eprintln!("quartz-ctx: sources present but still 0 items — serving diagnostics")
+    }
+
+    /// A line naming files that do not parse, or None.
+    ///
+    /// Their items are absent, so "no item named X" may be false: X can be
+    /// sitting in one of them. Attached to every not-found answer, and to the
+    /// first answer after the set of broken files changes.
+    fn parse_error_notice(&mut self, answer_was_error: bool) -> Option<String> {
+        let errors = self.ws.parse_errors();
+        let changed = errors != self.announced_errors;
+        self.announced_errors = errors.clone();
+        if errors.is_empty() || !(answer_was_error || changed) {
+            return None;
         }
-        Ok(_) => eprintln!("quartz-ctx: reload produced 0 items — keeping previous data"),
-        Err(e) => eprintln!("quartz-ctx: reload failed ({e}) — keeping previous data"),
+        let shown: Vec<&String> = errors.iter().take(5).collect();
+        let more = errors.len().saturating_sub(shown.len());
+        let mut out = format!(
+            "\n\n[parse error] {} file(s) fail to parse, so their items are not served:",
+            errors.len()
+        );
+        for e in shown {
+            out.push_str(&format!("\n  {e}"));
+        }
+        if more > 0 {
+            out.push_str(&format!("\n  ... and {more} more"));
+        }
+        Some(out)
     }
 }
 
@@ -147,7 +150,7 @@ fn maybe_reload(
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn serve(
-    items: Vec<ApiItem>,
+    ws: incremental::Workspace,
     engine_name: &str,
     resolved: Resolved,
     plan: SourcePlan,
@@ -156,12 +159,16 @@ pub fn serve(
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
 
-    let mut items = items;
-    let mut state = resolved;
-    let mut last_check = Instant::now();
-    let mut fingerprint = source_fingerprint(&state.sources);
-
-    eprintln!("quartz-ctx MCP server ready ({} items loaded)", items.len());
+    let mut live = Live {
+        manifest: manifest_stamp(&plan),
+        ws,
+        state: resolved,
+        plan,
+        last_replan: Instant::now(),
+        announced_errors: Vec::new(),
+    };
+    // Broken files at startup are announced on the first answer.
+    eprintln!("quartz-ctx MCP server ready ({} items loaded)", live.ws.items().len());
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -190,17 +197,45 @@ pub fn serve(
         let id = req["id"].clone();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
-        // Keep served data in sync with the source tree (throttled stat scan).
         if method == "tools/call" {
-            maybe_reload(&mut items, &mut state, &plan, &mut last_check, &mut fingerprint);
+            live.sync();
         }
 
-        let result = match method {
+        let mut result = match method {
             "initialize"  => Ok(initialize_result(engine_name)),
             "tools/list"  => Ok(tools_list_result()),
-            "tools/call"  => tools_call(&params, &items, &state),
+            "tools/call"  => tools_call(&params, live.ws.items(), &live.state),
             other         => Err(format!("unknown method: {other}")),
         };
+
+        if method == "tools/call" && !live.ws.items().is_empty() {
+            if let Some(err) = &live.state.manifest_error {
+                let notice = format!(
+                    "\n\n[manifest] the sources manifest cannot be read ({err}) - serving \
+                     the last good source list until it can."
+                );
+                match &mut result {
+                    Ok(r) => {
+                        if let Some(text) = r["content"][0]["text"].as_str() {
+                            r["content"][0]["text"] = json!(format!("{text}{notice}"));
+                        }
+                    }
+                    Err(msg) => msg.push_str(&notice),
+                }
+            }
+        }
+        if method == "tools/call" {
+            if let Some(notice) = live.parse_error_notice(result.is_err()) {
+                match &mut result {
+                    Ok(r) => {
+                        if let Some(text) = r["content"][0]["text"].as_str() {
+                            r["content"][0]["text"] = json!(format!("{text}{notice}"));
+                        }
+                    }
+                    Err(msg) => msg.push_str(&notice),
+                }
+            }
+        }
 
         let response = match result {
             Ok(r)    => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
@@ -621,12 +656,13 @@ fn tool_get_item(args: &Value, items: &[ApiItem]) -> Result<String, String> {
              locations are as written; types are not checked and cross-file links \
              are not followed. Verify a signature before relying on it.\n\n",
         ),
+        // One line, not a paragraph: every Rust item is linked across files by
+        // name too (syn parses; it does not resolve types), and the paragraph
+        // this replaced cost ~60 tokens on every JS/Python lookup to say so.
+        // What genuinely differs is whether the SOURCE declares types; a
+        // same-named collision is already shown by listing every match.
         Confidence::NameResolved => out.push_str(
-            "> **name_resolved** — parsed from syntax, then linked across files by \
-             name: members declared away from this type are attached, and declared \
-             bases and interfaces are recorded. Types are not inferred, so two \
-             same-named types can be told apart wrongly, and a call through a \
-             variable names the method without knowing the receiver.\n\n",
+            "> types are as written in the source (none inferred)\n\n",
         ),
         Confidence::Resolved => {}
     }

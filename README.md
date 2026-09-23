@@ -6,8 +6,17 @@ No network calls, no API keys, no telemetry.
 
 | | Owns | How it stays true |
 |---|---|---|
-| **quartz-ctx** | **Structure** — what the code *is*: types, signatures, enum variants, interfaces, `file:line` | parsed live from source, auto-reloads within ~5s of an edit |
-| **cortex** | **Judgment** — what you *learned*: patterns, anti-patterns, decisions, corrections | SQLite, grown from your sessions |
+| **quartz-ctx** | **Structure** — what the code *is*: types, signatures, enum variants, interfaces, `file:line` | checked against the disk before every answer; only changed files are re-parsed |
+| **cortex** | **Judgment** — what you *learned*: patterns, anti-patterns, decisions, corrections | SQLite, grown from your sessions; its code index refreshes itself before every code-backed answer |
+
+**An edit is visible to the very next call, on both servers.** Nothing waits on a
+timer, a `reindex`, a restart or a git commit. Each server decides freshness when
+it answers, by the cheapest check that can settle it — file metadata, then a
+content hash, then a re-parse, then an API comparison — so an unchanged tree
+costs a few milliseconds and an edit costs its own files. What changed is kept
+in a change journal: `get_delta` reports it per API item (no git needed), and a
+stored pattern that names code changed since it was written says so when it is
+served.
 
 The split is enforced, not conventional: quartz-ctx holds no hand-written
 knowledge, and cortex no longer parses code itself — it ingests quartz-ctx's
@@ -27,10 +36,14 @@ Each item carries what it is **and where it came from** — language, source roo
 never confused. When several declarations share a name, you get all of them with
 their provenance rather than whichever happened to be first.
 
-Confidence is a three-way tag, not a boolean: `resolved` (a real front end agreed
-the types are these types) → `name_resolved` (cross-file linking by name, no type
-inference) → `ast_only`. An agent cannot calibrate what it is told if everything
-arrives with the same authority.
+Every item carries a confidence tag. Read it as a statement about the SOURCE,
+not the parser: no front end here infers types — `syn` parses Rust exactly as
+tree-sitter parses the rest, and every language is linked across files by name in
+the same pass. `resolved` (Rust) means the language requires declared types, so
+signatures and fields are complete as written; `name_resolved` means the language
+may leave them out (a JavaScript parameter has no type unless JSDoc gives one),
+so an empty type is "not declared", not "unknown to us"; `ast_only` means one file,
+no cross-file linking.
 
 ### Calls that cross the language boundary
 
@@ -92,7 +105,8 @@ Setup installs a launcher into `.cortex/` for both platforms — `cortex.sh` and
 `cortex.ps1`, same commands on each:
 
 ```bash
-./.cortex/cortex.sh reindex      # re-extract and re-index every configured source
+./.cortex/cortex.sh reindex      # full rebuild of every configured source (first run)
+./.cortex/cortex.sh refresh      # re-index only what changed (the servers do this themselves)
 ./.cortex/cortex.sh check-mcp    # confirm both MCP configs agree and use relative paths
 ./.cortex/cortex.sh deploy       # rebuild without stopping the running server
 ```
@@ -144,22 +158,28 @@ cargo install graphify-rs
 graphify-rs build --path . --code-only --format json --output .graphify-output
 ```
 
-Neither cortex nor quartz-ctx requires it. Note that a graph is a **snapshot**:
-unlike quartz-ctx it does not re-read source, so rebuild it after significant
-changes or it answers confidently and wrongly.
+Neither cortex nor quartz-ctx requires it. `graphify-rs serve` loads its graph
+once and never re-reads it, so serve it through `cortex graphify-serve`, which
+rebuilds and reloads the graph when the source has moved past it — see
+[docs/GRAPHIFY.md](docs/GRAPHIFY.md).
 
 ## Languages
 
-| Language | Extractor | Signal |
-|---|---|---|
-| Rust | `syn` | `resolved` — types, trait impls, cross-file `impl` blocks |
-| Python, TypeScript / JavaScript, Go, Java, C#, C / C++, Ruby, PHP | tree-sitter | `name_resolved` — declarations, members, bases and interfaces, linked across files by name |
+| Language | Extractor | Tag | What comes out |
+|---|---|---|---|
+| Rust | `syn` | `resolved` | types, fields, variants, methods (cross-file `impl` blocks attached by name + module proximity), trait impls, calls |
+| TypeScript | tree-sitter | `name_resolved` | classes, interfaces (fields), enums (variants), type aliases, functions incl. `const f = () =>`, typed signatures, JSDoc |
+| JavaScript / JSX | tree-sitter | `name_resolved` | classes with class-body fields AND `this.x = ...` fields, functions incl. arrow consts and components, JSDoc (docs above `export` included) |
+| Python | tree-sitter | `name_resolved` | classes, fields from the class body and from `self.x = ...` (typed from `__init__` annotations), `Enum` subclasses as enums, typed signatures, docstrings |
+| Go, Java, C#, C / C++, Ruby, PHP | tree-sitter | `name_resolved` | declarations, members, bases and interfaces; Go receivers, C++ out-of-line members and C# `partial` halves attached across files |
 
-Rust is the strong path. The others are parsed from a concrete syntax tree and
-then linked by the same project-wide resolution pass, which is a real resolution
-step — but by name, not by type, so two same-named types in one project can be
-told apart wrongly. The tag says which you are reading; do not treat
-`name_resolved` as `resolved`.
+Measured on a real FastAPI + React level editor (the reference workspace) after
+the 2026-09-23 parity pass:
+JavaScript types with fields 0% → 100%, JavaScript items with docs 11% → 52%.
+The remaining gap is what the source declares — plain JavaScript has no types to
+extract except what JSDoc states (and JSDoc lines arrive in the item's doc) — not
+what the extractor reads. Two same-named types in one project are listed together
+with their provenance rather than guessed between, in every language.
 
 Visibility follows each language's own convention rather than Rust's — a leading
 underscore in Python and JS/TS, `#field` in modern JS, `private` / `protected`
@@ -171,10 +191,11 @@ root: a language with no `pub` returns almost nothing under a library view.
 
 ## Limits
 
-Only Rust resolves types, so relationships between items in the other languages
-are thinner. Call edges are recorded for every call site but only become graph
-edges when the callee is unambiguous — a method call carries no receiver type, so
-edging it would invent ownership.
+No language's types are inferred, Rust's included: relationships are linked by
+name, so where the source leaves a type out (untyped JavaScript, un-annotated
+Python) there is less to link. Call edges are recorded for every call site but
+only become graph edges when the callee is unambiguous — a method call carries no
+receiver type, so edging it would invent ownership.
 
 ## Layout
 

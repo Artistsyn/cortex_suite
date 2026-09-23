@@ -74,11 +74,19 @@ Point `--graph` at the **same path you passed to `--output`**. Add to **both**
 `.mcp.json` and `.vscode/mcp.json` — the same drift trap as the other two
 servers applies.
 
+Serve it **through cortex**, not directly. `graphify-rs serve` reads
+`graph.json` once, at startup, and never again: a rebuild during a session
+changes nothing for any session already running. `cortex graphify-serve` is a
+line-for-line proxy that, before each tool call, rebuilds the graph when the
+source has moved past it (incremental, JSON only - ~1.5 s on a 32k-node graph)
+and restarts graphify with the host's handshake replayed. ~20 ms per call when
+the graph is current; no idle CPU.
+
 `.mcp.json` (Claude Code):
 ```json
 "graphify": {
-  "command": "graphify-rs",
-  "args": ["serve", "--graph", ".graphify-output/graph.json"]
+  "command": "cortex_suite/cortex/target/debug/cortex",
+  "args": ["graphify-serve", "--repo", ".", "--graph", ".graphify-output/graph.json"]
 }
 ```
 
@@ -86,14 +94,14 @@ servers applies.
 ```json
 "graphify": {
   "type": "stdio",
-  "command": "graphify-rs",
-  "args": ["serve", "--graph", ".graphify-output/graph.json"],
-  "description": "Whole-repo structural graph. Call graph_stats for live counts."
+  "command": "cortex_suite/cortex/target/debug/cortex",
+  "args": ["graphify-serve", "--repo", ".", "--graph", ".graphify-output/graph.json"],
+  "description": "Whole-repo structural graph, rebuilt and reloaded when the source moves."
 }
 ```
 
-`graphify-rs` resolves from `PATH` once `~/.cargo/bin` is on it, so no relative
-path is needed. Restart the editor afterwards.
+`graphify-rs` must still resolve from `PATH` (cortex runs it); pass
+`--graphify <path>` if it does not. Restart the editor afterwards.
 
 ## Tools worth knowing
 
@@ -107,11 +115,12 @@ path is needed. Restart the editor afterwards.
 
 ## Pitfalls
 
-**Stale graphs are silent.** Unlike quartz-ctx, which re-reads source within ~5s,
-graphify serves whatever was in `graph.json` when the server started. A graph
-built before a refactor answers confidently and wrongly. Rebuild after
-significant changes — and pass `--output` again, or the rebuild lands in the
-global cache while the server keeps serving the old in-project file:
+**Stale graphs are silent - unless served through cortex.** Straight
+`graphify-rs serve` answers from whatever `graph.json` held when it started,
+confidently and wrongly after a refactor. `cortex graphify-serve` (above) closes
+that; an answer ending `[graph snapshot is stale ...]` means its rebuild failed.
+A manual rebuild must pass `--output` again, or it lands in the global cache
+while the in-project file stays old:
 
 ```bash
 graphify-rs build --path . --code-only --update --format json --output .graphify-output

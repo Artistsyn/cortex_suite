@@ -1,13 +1,11 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
-mod bridge;
-mod calls;
+// The extraction core is the library half of this crate, shared with cortex.
+use quartz_ctx::{bridge, calls, incremental, lang, model, parser};
+
 mod discover;
 mod helpers;
-mod lang;
 mod mcp;
-mod model;
-mod parser;
 mod usage;
 mod render;
 
@@ -391,6 +389,12 @@ pub struct Resolved {
 }
 
 impl SourcePlan {
+    /// The manifest this plan reads, if any - watched so an edit to it takes
+    /// effect without a restart.
+    pub fn manifest_path(&self) -> Option<&Path> {
+        self.manifest.as_deref()
+    }
+
     fn from_args(args: &ServeArgs) -> Self {
         Self {
             explicit: args.source.clone(),
@@ -605,27 +609,23 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         eprintln!("quartz-ctx serve: loading {} (origin: {tag}){view}", path.display());
     }
 
-    // A parse failure is per-root and already reported by the parser; an empty
-    // result is a state the notice explains, not a reason to exit.
-    let items = match parser::load_sources_with(&resolved.sources) {
-        Ok(items) => items,
-        Err(e) => {
-            eprintln!("warn: failed to parse source dirs: {e:#}");
-            Vec::new()
-        }
-    };
+    // A parse failure is per-file and reported, never fatal; an empty result is
+    // a state the notice explains, not a reason to exit.
+    let ws = incremental::Workspace::load(&resolved.sources);
+    let n = ws.items().len();
 
-    if items.is_empty() {
+    if n == 0 {
         eprintln!("warn: empty index — serving diagnostics until a source root appears");
     } else {
         eprintln!(
-            "  loaded {} API items from {} source(s) — listening on stdio",
-            items.len(),
-            resolved.sources.len()
+            "  loaded {} API items from {} source(s), {} files — listening on stdio",
+            n,
+            resolved.sources.len(),
+            ws.file_count()
         );
     }
 
-    mcp::serve(items, &args.name, resolved, plan)
+    mcp::serve(ws, &args.name, resolved, plan)
 }
 
 fn run_selfcheck(args: SelfcheckArgs) -> Result<()> {

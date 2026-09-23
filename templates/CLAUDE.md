@@ -34,10 +34,13 @@ it is never stale.
   rather than making the reader search — and when several declarations share a
   name, `get_item` lists them all with provenance instead of guessing. Narrow with
   `language`, `origin` or `file`.
-- **Read the confidence tag.** `resolved` means a real front end agreed the types
-  are these types. `name_resolved` means cross-file linking by name with no type
-  inference — correct about names, capable of confusing two same-named types.
-  `ast_only` knows nothing beyond one file. Do not treat them alike.
+- **Read the confidence tag as a statement about the source.** No language's
+  types are inferred - Rust's included; all are linked across files by name.
+  `resolved` (Rust) means the language requires declared types, so a signature
+  is complete as written. `name_resolved` means types appear only where the
+  source declared them - an untyped JS parameter is undeclared, not missed.
+  `ast_only` knows nothing beyond one file. Same-named types are listed
+  together with provenance in every language: pick by `origin`/`file`.
 
 **cortex owns JUDGMENT — what we *learned*.** DB-backed, grown from sessions.
 - `get_anti_patterns(hint)` — known traps
@@ -227,16 +230,41 @@ automatically here) and to `.github/prompts/<name>.prompt.md` (invoked as
 `/<name>` in Copilot Chat), so one approval covers both editors with no further
 wiring.
 
-### `[stale index]` in a response
+### Freshness - what "current" means here
 
-Answers drawn from indexed code carry a one-line notice when the source has
-changed since it was last indexed, naming the roots. It appears once per change,
-not once per call.
+Answers are checked against the disk at the moment they are given. Nothing
+depends on a timer, a `reindex`, a server restart or a git commit.
 
-It means results about those roots may predate your edits. Either re-run
-`cortex.sh reindex` (`cortex.ps1 reindex` on Windows) or treat answers about
-those roots as possibly behind. It is silent when the index is current, so when
-it does appear it is worth believing.
+- **quartz-ctx** re-stats its roots before every tool call and re-parses only
+  files whose size or nanosecond mtime moved (a file written within ~3 s of
+  being read is content-hashed instead of trusted). An edit is visible to the
+  very next call. A file that fails to parse is named on not-found answers,
+  since its items are missing: `[parse error] ... their items are not served`.
+- **cortex** climbs a check ladder before every code-backed answer, and before
+  `get_delta`, `get_anti_patterns` and `list_patterns`: metadata -> content
+  hash -> re-parse -> API facets, each rung only for what the one below could
+  not clear. ~5 ms when nothing changed, ~0.3 s for an edit in a 1,000-unit
+  crate. Renamed and deleted items leave the index.
+- **graphify** is served through `cortex graphify-serve`, which rebuilds
+  `graph.json` (~1.5 s, JSON only) and reloads graphify when the source has
+  moved past it. `graphify-rs serve` alone loads the file once and never again.
+
+`[stale index]` appears only when a refresh FAILED, naming the root and the
+error. Believe it; it is not a routine banner any more.
+
+`get_delta` answers "what changed in the API" from the index's own change
+journal - no git needed, uncommitted edits included, net per item. Default
+window is this session; `since` takes a time, `90m`/`2h`/`1d`, or a git ref.
+Its last line says how deep the check went, which is what makes "no changes"
+mean something.
+
+An expanded pattern or anti-pattern that names code changed after it was
+written carries `⚠ code it names changed since it was written: ...`. Re-verify
+before relying on it, then update or supersede the entry. `knowledge-drift`
+lists every such entry; closeout counts them under AWAITING YOUR REVIEW.
+
+`reindex` still exists for a full rebuild (graph passes across every root), but
+it is never needed for correct answers.
 
 ## Launcher commands
 
@@ -245,7 +273,9 @@ commands on both.
 
 | | |
 |---|---|
-| `reindex` | regenerate api-graphs and re-index every source in the manifest |
+| `reindex` | full rebuild of every manifest source (never needed for correctness - see Freshness) |
+| `refresh` | re-index only roots whose source changed; what the servers do before answering |
+| `knowledge-drift` | patterns/anti-patterns naming code that changed after they were written |
 | `deploy` | rebuild cortex without stopping the MCP server |
 | `check-mcp` | validate both MCP configs: every command resolves, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |

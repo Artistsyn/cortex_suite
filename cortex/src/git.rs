@@ -204,6 +204,18 @@ fn summarize(status: &DeltaStatus, patch_lines: &[String]) -> String {
     }
 }
 
+/// Whether `repo_root` is inside a git work tree. Every git helper here maps a
+/// failure to empty output, so without asking this first "not a repository"
+/// and "nothing changed" read the same.
+pub fn is_git_repo(repo_root: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn run_git(repo_root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)

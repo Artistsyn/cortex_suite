@@ -17,3 +17,6 @@ quartz-ctx/docs/
 
 # Graphify output — regenerate with `graphify-rs build`
 .graphify-output/
+
+# macOS Finder metadata
+.DS_Store

@@ -339,7 +339,26 @@ impl<'a> Cx<'a> {
         }
 
         if l.class_kinds().contains(&kind) {
-            if let Some((item, partial)) = self.type_item(node, ItemKind::Struct) {
+            if let Some((mut item, partial)) = self.type_item(node, ItemKind::Struct) {
+                // `class Mode(Enum)` is an enum; its class-level assignments are
+                // its members. Read as a struct it came back with untyped
+                // "fields" and no variants, so `get_variants` found nothing.
+                const ENUM_BASES: &[&str] =
+                    &["Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"];
+                if l == Language::Python
+                    && item.traits_impl.iter().any(|b| {
+                        ENUM_BASES.contains(&b.rsplit('.').next().unwrap_or(b))
+                    })
+                {
+                    item.kind = ItemKind::Enum;
+                    for f in std::mem::take(&mut item.fields) {
+                        item.variants.push(crate::model::ApiVariant {
+                            name: f.name,
+                            doc: f.doc,
+                            fields: vec![],
+                        });
+                    }
+                }
                 if partial && !self.out.partial_types.contains(&item.name) {
                     self.out.partial_types.push(item.name.clone());
                 }
@@ -489,6 +508,12 @@ impl<'a> Cx<'a> {
             // attributes are declared, so the same node has to be read twice.
             if l == Language::Python {
                 self.python_fields(member, vis_here, item);
+            }
+            // JS/TS declare instance fields the same way: by assigning them.
+            // Class-body `x = 1` fields are read below; these come first so a
+            // declared field keeps its declared type when both exist.
+            if matches!(l, Language::JavaScript | Language::TypeScript) && mk == "method_definition" {
+                self.this_fields(member, vis_here, item);
             }
 
             if l.method_kinds().contains(&mk) {
@@ -782,6 +807,28 @@ impl<'a> Cx<'a> {
             }
             // Inside a method: `self.y = 0`, `self.y: int = 0`.
             "function_definition" => {
+                // `def __init__(self, name: str)` then `self.name = name`: the
+                // parameter's annotation IS the field's declared type.
+                let mut param_types: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                if let Some(params) = member.child_by_field_name("parameters") {
+                    for i in 0..params.named_child_count() as u32 {
+                        let Some(p) = params.named_child(i) else { continue };
+                        let (name, ty) = match p.kind() {
+                            "typed_parameter" => (
+                                p.named_child(0).map(|n| text(n, self.src).trim().to_string()),
+                                child_text(p, "type", self.src),
+                            ),
+                            "typed_default_parameter" => {
+                                (child_text(p, "name", self.src), child_text(p, "type", self.src))
+                            }
+                            _ => (None, None),
+                        };
+                        if let (Some(n), Some(t)) = (name, ty) {
+                            param_types.insert(n, normalise_type_text(&t));
+                        }
+                    }
+                }
                 let mut stack = vec![member];
                 while let Some(n) = stack.pop() {
                     for i in 0..n.named_child_count() as u32 {
@@ -806,11 +853,18 @@ impl<'a> Cx<'a> {
                         continue;
                     }
                     let Some(attr) = left.child_by_field_name("attribute") else { continue };
-                    found.push((
-                        attr.start_byte(),
-                        text(attr, self.src).trim().to_string(),
-                        normalise_type_text(&child_text(n, "type", self.src).unwrap_or_default()),
-                    ));
+                    let mut ty =
+                        normalise_type_text(&child_text(n, "type", self.src).unwrap_or_default());
+                    if ty.is_empty() {
+                        if let Some(right) = n.child_by_field_name("right") {
+                            if right.kind() == "identifier" {
+                                if let Some(t) = param_types.get(text(right, self.src).trim()) {
+                                    ty = t.clone();
+                                }
+                            }
+                        }
+                    }
+                    found.push((attr.start_byte(), text(attr, self.src).trim().to_string(), ty));
                 }
             }
             _ => return,
@@ -827,6 +881,54 @@ impl<'a> Cx<'a> {
                 continue;
             }
             item.fields.push(ApiField { name, ty, doc: String::new(), visibility });
+        }
+    }
+
+    /// `this.x = ...` inside a JS/TS method: the instance fields a class
+    /// declares by assigning them, which is how most JavaScript declares them.
+    /// Only `this` - `other.x = 1` is somebody else's object. Appended after
+    /// anything already found, so a class-body declaration wins its type.
+    fn this_fields(&self, method: Node, section: Visibility, item: &mut ApiItem) {
+        let mut found: Vec<(usize, String)> = Vec::new();
+        let mut stack = vec![method];
+        while let Some(n) = stack.pop() {
+            for i in 0..n.named_child_count() as u32 {
+                if let Some(child) = n.named_child(i) {
+                    // A nested function or class has its own `this`.
+                    if !matches!(
+                        child.kind(),
+                        "function_declaration" | "function_expression" | "function" | "class_declaration" | "class"
+                    ) {
+                        stack.push(child);
+                    }
+                }
+            }
+            if n.kind() != "assignment_expression" {
+                continue;
+            }
+            let Some(left) = n.child_by_field_name("left") else { continue };
+            if left.kind() != "member_expression" {
+                continue;
+            }
+            let is_this = left
+                .child_by_field_name("object")
+                .is_some_and(|o| o.kind() == "this");
+            if !is_this {
+                continue;
+            }
+            let Some(prop) = left.child_by_field_name("property") else { continue };
+            found.push((prop.start_byte(), text(prop, self.src).trim().to_string()));
+        }
+        found.sort_by_key(|(at, _)| *at);
+        for (_, name) in found {
+            if name.is_empty() || item.fields.iter().any(|f| f.name == name) {
+                continue;
+            }
+            let visibility = self.member_visibility(&name, method, section);
+            if !visibility.is_included(self.include_private) {
+                continue;
+            }
+            item.fields.push(ApiField { name, ty: String::new(), doc: String::new(), visibility });
         }
     }
 
@@ -1370,6 +1472,20 @@ fn leading_doc(node: Node, src: &str, lang: Language) -> String {
                         return t.trim_matches(|c| c == '"' || c == '\'').trim().to_string();
                     }
                 }
+            }
+        }
+    }
+    // `export class X` / `export const x = ...`: the comment is a sibling of
+    // the export statement, not of the declaration wrapped inside it, so the
+    // walk has to start from the wrapper. Reading only the declaration's own
+    // siblings lost the doc of 502 of 870 exports in the web editor.
+    let mut node = node;
+    if matches!(lang, Language::JavaScript | Language::TypeScript) {
+        while let Some(p) = node.parent() {
+            if p.kind() == "export_statement" {
+                node = p;
+            } else {
+                break;
             }
         }
     }
