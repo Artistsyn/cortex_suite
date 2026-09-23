@@ -173,7 +173,8 @@ rebuilds and reloads the graph when the source has moved past it — see
 | Python | tree-sitter | `name_resolved` | classes, fields from the class body and from `self.x = ...` (typed from `__init__` annotations), `Enum` subclasses as enums, typed signatures, docstrings |
 | Go, Java, C#, C / C++, Ruby, PHP | tree-sitter | `name_resolved` | declarations, members, bases and interfaces; Go receivers, C++ out-of-line members and C# `partial` halves attached across files |
 
-Measured on this workspace's own web editor after the 2026-09-23 parity pass:
+Measured on a real FastAPI + React level editor (the reference workspace) after
+the 2026-09-23 parity pass:
 JavaScript types with fields 0% → 100%, JavaScript items with docs 11% → 52%.
 The remaining gap is what the source declares — plain JavaScript has no types to
 extract except what JSDoc states (and JSDoc lines arrive in the item's doc) — not

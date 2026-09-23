@@ -72,7 +72,19 @@ impl Live {
             self.last_replan = Instant::now();
             self.manifest = manifest_now;
             let fresh = self.plan.resolve();
-            if fresh.sources != self.state.sources {
+            // A manifest that stops parsing mid-session is almost always one
+            // being edited (a half-saved file). Dropping every root until it
+            // parses again would empty the index under the agent's feet; keep
+            // the last good roots and say so on each answer instead.
+            if fresh.manifest_error.is_some() && !self.state.sources.is_empty() {
+                if self.state.manifest_error != fresh.manifest_error {
+                    eprintln!(
+                        "quartz-ctx: manifest unreadable ({}) - keeping the last good source list",
+                        fresh.manifest_error.as_deref().unwrap_or("")
+                    );
+                }
+                self.state.manifest_error = fresh.manifest_error;
+            } else if fresh.sources != self.state.sources {
                 let gained: Vec<String> = fresh
                     .sources
                     .iter()
@@ -84,8 +96,10 @@ impl Live {
                 }
                 self.ws = incremental::Workspace::load(&fresh.sources);
                 eprintln!("quartz-ctx: source plan changed — {} API items", self.ws.items().len());
+                self.state = fresh;
+            } else {
+                self.state = fresh;
             }
-            self.state = fresh;
         }
 
         if self.state.sources.is_empty() {
@@ -194,6 +208,22 @@ pub fn serve(
             other         => Err(format!("unknown method: {other}")),
         };
 
+        if method == "tools/call" && !live.ws.items().is_empty() {
+            if let Some(err) = &live.state.manifest_error {
+                let notice = format!(
+                    "\n\n[manifest] the sources manifest cannot be read ({err}) - serving \
+                     the last good source list until it can."
+                );
+                match &mut result {
+                    Ok(r) => {
+                        if let Some(text) = r["content"][0]["text"].as_str() {
+                            r["content"][0]["text"] = json!(format!("{text}{notice}"));
+                        }
+                    }
+                    Err(msg) => msg.push_str(&notice),
+                }
+            }
+        }
         if method == "tools/call" {
             if let Some(notice) = live.parse_error_notice(result.is_err()) {
                 match &mut result {
