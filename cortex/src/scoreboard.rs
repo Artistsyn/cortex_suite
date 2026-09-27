@@ -344,11 +344,12 @@ pub fn transcripts_dir_for(repo_root: &Path) -> Option<PathBuf> {
     // `.cortex/memory.db` has an EMPTY grandparent, and canonicalize("") fails.
     let base = if repo_root.as_os_str().is_empty() { Path::new(".") } else { repo_root };
     let root = base.canonicalize().ok()?;
-    let slug: String = root
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
+    let full = root.to_string_lossy();
+    // Windows canonical paths carry the verbatim prefix `\\?\`, which Claude
+    // Code's folder names do not (`C--Users-...`).
+    let path = full.strip_prefix(r"\\?\").unwrap_or(&full);
+    let slug: String =
+        path.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
     let dir = PathBuf::from(home).join(".claude").join("projects").join(slug);
     dir.is_dir().then_some(dir)

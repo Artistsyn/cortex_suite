@@ -345,7 +345,7 @@ doctor|selfcheck|status|recall|health-report|graph-diff|meta|prune|review|crysta
 consolidate|correction|cluster-sessions|detect-skills|propose-gaps|propose-survival|\
 consolidate-pipeline|consolidate-if-stale|review-proposals|skill-status|skill-approve|\
 skill-reject|recurring-dismiss|proposal-approve|proposal-reject|scoreboard|pattern|anti-pattern|prefs|annotate|context|graph|index|watch|\
-fired|refresh|knowledge-drift|graphify-serve)
+fired|refresh|knowledge-drift|graphify-serve|hooks-init)
     # `fired` is on this list because it was documented as a launcher command
     # and was not on it: an unlisted command falls through to the help text
     # below, which prints and exits 0. Asking "has this mechanism ever actually
@@ -371,6 +371,9 @@ cortex launcher (bash) - workspace: $NAME
   check-mcp     validate both MCP configs (relative paths, no drift)
   status        store summary            doctor        pipeline health
   recall <t>    look something up        health-report self-learning state
+  scoreboard    outcomes, repeat failures, delivery, token bill (--no-tokens to skip the bill)
+  fired         which mechanisms have actually run, and which are silently idle
+  hooks-init    install or upgrade the Claude Code hooks (.claude/settings.local.json)
   skill-status  drafts awaiting review   skill-approve <name>
   -- <args>     pass anything straight through to the binary
 

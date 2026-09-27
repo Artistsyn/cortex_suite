@@ -150,6 +150,20 @@ resolve_challenge(id, verdict, subject, evidence)
 `evidence` is required and a verdict without it is refused. Everything raised
 here is a proposal pending human review; nothing reaches memory directly.
 
+### When a `[cortex]` warning arrives
+
+Hooks put a recorded trap into your context at two moments. The first is after
+an Edit or Write that shares distinctive evidence with a trap. The second is
+after a build or test that fails in a way the store already knows. Read it
+before your next step. If it applies, follow its fix. If it does not, ignore
+it: the matching is lexical, measured at about nine in ten relevant, not
+certain.
+
+A nudge that a failure has now recurred across sessions with nothing recorded
+is a request. Once you know the cause, record it with the printed
+`anti-pattern add ... --resolves '<signature>'` command. That links the trap to
+the failure, so the next occurrence arrives with the fix.
+
 ## 5) Capturing what you learn
 
 Embed markers in your responses as you discover things:
@@ -281,6 +295,8 @@ commands on both.
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
 | `fired` | which mechanisms have actually run, and which are silently idle |
+| `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
+| `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note) |
 | `-- <args>` | pass anything straight through to the binary |
 
 `fired` answers the one question nothing else asks: *has this ever actually

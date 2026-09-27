@@ -1105,7 +1105,7 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
              edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
         ),
         HookOutcome::AlreadyPresent => {
-            println!("cortex compact_output hook already present in .claude/{filename} — no change.")
+            println!("cortex hooks already up to date in .claude/{filename} — no change.")
         }
     }
     Ok(())

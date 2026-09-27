@@ -79,9 +79,15 @@ fact about your code.
    a `command` that does not resolve from the workspace root, and drift between
    `.mcp.json` and `.vscode/mcp.json`. An absolute path is fine — it is required
    when the suite lives outside the workspace — as long as it exists here.
-4. **Restart your editor** so it re-reads the MCP config.
+4. **Restart your editor** so it re-reads the MCP config. On its first start in
+   a Claude Code project, cortex installs its hooks into
+   `.claude/settings.local.json` (§3, "What arrives on its own"). They are yours
+   to remove; set `CORTEX_NO_AUTO_HOOKS=1` to stop it.
 5. **Verify:** ask the agent `get_api_context(hint: "...")`. If it returns your
-   types, you are done.
+   types, the servers are working. Then run a build or test once and check
+   `./.cortex/cortex.sh fired`: "Bash hook" and "test_signal" should read live.
+   "pushes delivered to agents" goes live the first time a recorded trap
+   matches an edit or a failure.
 
 **Requirements:** [Rust](https://rustup.rs), plus a C toolchain for the
 tree-sitter grammars used by the non-Rust extractors:
@@ -389,6 +395,43 @@ printf '%s\n' \
 
 A `tools/list` result means it is genuinely up. Anything else is not.
 
+### 2.14 A hook's plain output never reaches the model
+
+**Symptom:** a hook runs, its log says it fired, and the agent behaves as if
+it said nothing.
+
+Claude Code writes a `PostToolUse` or `PostToolUseFailure` hook's plain stdout
+to its debug log. Only `hookSpecificOutput.additionalContext` JSON is shown to
+the model. An `mcp_tool` hook's text result is parsed exactly like a command
+hook's stdout, so the same rule applies. Plain stdout *is* delivered for
+`UserPromptSubmit` and `SessionStart`, which is why the challenge hook always
+worked and the others never did.
+
+cortex's edit guard and Bash hook ran this way for months: 115 trap warnings
+were computed and recorded as fired, and none was seen. A "compaction" hook
+logged about 686k tokens a fortnight as saved while every agent read the full
+output. **No hook can replace a Bash result** (`updatedMCPToolOutput` works for
+MCP tools only), so any tool that reports hook-side output savings for Bash is
+reporting a counterfactual.
+
+Verify delivery from the host's side, not the hook's. Delivered context appears
+in Claude Code transcripts as `hook_additional_context` attachments, and
+`cortex scoreboard` counts cortex's under "Host-confirmed cortex context
+deliveries". Anything in a `hook_success` attachment's `stdout` was not shown
+to the model.
+
+### 2.15 A command that fails never reaches `PostToolUse`
+
+**Symptom:** failed builds are missing from `test_outcomes`, and the observed pass
+rate looks better than your sessions feel.
+
+A Bash call that exits non-zero fires **`PostToolUseFailure`** instead, with the
+command's output in `${error}` (`"Exit code 101\n<output>"`). An observer
+attached only to `PostToolUse` sees just the failures that a pipe masked
+(`cargo build 2>&1 | tail` exits with `tail`'s status). cortex's hook set v3
+attaches the Bash observer to both events. If `.claude/settings.local.json`
+lacks a `PostToolUseFailure` entry, run `./.cortex/cortex.sh hooks-init`.
+
 ---
 
 ## 3. Daily use
@@ -404,8 +447,13 @@ A `tools/list` result means it is genuinely up. Anything else is not.
 Two reasons:
 
 1. **Tokens.** These tools list every entry regardless, but expand only what
-   matches the hint. On the reference DB that is ~34k tokens down to ~10k per
-   session boot, with nothing dropped.
+   matches the hint; pass the response's `as of` stamp back as `since` and
+   unchanged entries are counted instead of re-listed. Measured on a ~400-entry
+   store (2026-09-27): a first hinted `get_anti_patterns` returns about 10k
+   tokens and a `since` repeat about 2–3k. The one-line index of every entry
+   grows with the store, so the three boot calls together now cost about 25k.
+   That is the reason for the plan's small session-start brief
+   ([docs/cortex-upgrade-plan-2026-09-27.md](docs/cortex-upgrade-plan-2026-09-27.md)).
 2. **Learning.** Only hint-matched retrievals count as *targeted*, and only
    targeted retrievals feed pattern survival scoring.
 
@@ -427,6 +475,54 @@ patterns", detail: "full")`.
 4. ... write code ...
 5. when stuck: recall(topic) BEFORE trying a second approach
 ```
+
+### What arrives on its own
+
+In Claude Code, cortex's hooks put traps in front of the agent at the moment
+they apply. Nobody has to call anything.
+
+| Moment | Hook | What the agent sees |
+|---|---|---|
+| An Edit or Write | `edit_guard` (PostToolUse) | `[cortex] <file> touches a recorded trap #N (matched on: …)` with the fix, when the edit shares **distinctive** evidence with a trap: a code identifier plus one more rare token, or three rare words. Ordinary English, library identifiers (`to_string`, `assert_eq`, …) and prose files (`.md`, `.txt`, `.html`) never count. At most one per file and four per session. |
+| A build or test fails | Bash observer (PostToolUse **and** PostToolUseFailure) | the trap linked to that failure's signature; else a trap its error **message** names (never its file path); else, for a specific failure seen in 3+ sessions with nothing recorded, a nudge carrying the exact `anti-pattern add … --resolves '<signature>'` command. Once per failure, four per session. |
+| Every build or test | Bash observer | nothing: the verdict is recorded (`test_outcomes`), which feeds outcome scoring and recurring-failure detection. |
+
+Every warning ends *"If it does not apply, ignore it."* That's meant: the
+matching is lexical, measured at about nine in ten relevant, not ten in ten.
+
+**Link a trap to its failure.** `anti-pattern add … --resolves '<signature>'`
+records the trap and links it to the failure (`recurring_errors.anti_pattern_id`,
+plus when it was handled). The next occurrence of that exact failure is answered
+with the trap and its fix, and a recurrence *after* recording shows on the
+scoreboard as "hit again after being recorded", which is the one number that
+says whether the store prevents anything.
+
+### Is it working?
+
+```bash
+./.cortex/cortex.sh scoreboard          # --window-days N, --no-tokens, --format json
+./.cortex/cortex.sh fired
+```
+
+Scoreboard v2 labels every number:
+
+- **observed**: recorded by hooks, with no one choosing when.
+- **delivered**: reached the agent.
+- **self-reported**: closeouts; they only run after success, so they are never
+  used as a pass rate.
+
+It reports:
+
+- build/test runs green, and sessions ending green;
+- the share of this window's failures that had happened before it;
+- targeted lookups with identical repeats flagged as a loop, and bulk listings;
+- pushes delivered, plus any edit-guard fire that never reached the agent;
+- the token bill from Claude Code's own transcripts: average context per call,
+  cache reads, the fixed prompt, tool results by source, re-reads until
+  compaction, and cortex contexts the **host** recorded as delivered.
+
+The history behind each metric, and the ones it replaced, is in
+[docs/cortex-upgrade-plan-2026-09-27.md](docs/cortex-upgrade-plan-2026-09-27.md).
 
 ### Capturing knowledge
 
@@ -559,7 +655,10 @@ names.
 | A name returns the wrong type | several indexed types share it | pass `scope=`, or the full unit id |
 | Index has units from deleted sources | indexing never prunes | `cortex prune-index --keep <root> ... --apply` |
 | Empty index for an app | `pub`-only extraction | `include_private: true` (2.11) |
-| 0 items on a non-Rust project | Rust only, today | not yet supported |
+| 0 items on a non-Rust project | the root points at the wrong level, or `include_private` is off | point at the app directory; `include_private: true` (see §7) |
+| `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | restart the session (or reconnect cortex in `/mcp`); see 2.14 |
+| Failed builds missing from the scoreboard | hook set older than v3 (no `PostToolUseFailure` entry) | `./.cortex/cortex.sh hooks-init`; see 2.15 |
+| `hook_non_blocking_error: MCP server 'cortex' not connected` | the server was down (usually mid-deploy) | none needed; hooks are non-blocking and resume when it reconnects |
 
 **Health checks:**
 ```bash
@@ -650,8 +749,9 @@ a library view published its own internals.
   would invent ownership — which is why ~5,500 recorded calls yield ~330 edges.
 - `content_store` exists in the schema but is not populated, so the
   compact/expand handle contract is not yet active.
-- Indexing is full, not incremental. Fine at a few thousand items; a very large
-  monorepo will be slower.
+- `reindex` is a full rebuild. Day-to-day freshness is incremental: only files
+  whose size or mtime moved are re-parsed, and only changed roots are refreshed.
+  The first index of a very large monorepo is the slow part.
 
 ---
 
@@ -665,7 +765,9 @@ cortex_suite/
 ├── quartz-ctx/           API extraction server (Rust)
 ├── templates/            configs, instruction files, and both launchers
 ├── scripts/              setup.ps1 (Windows), setup.sh (macOS/Linux)
-└── docs/GRAPHIFY.md      optional third server: repo-wide structural graph
+└── docs/
+    ├── GRAPHIFY.md                         optional third server: repo-wide structural graph
+    └── cortex-upgrade-plan-2026-09-27.md   audit, research and roadmap (the tracker)
 ```
 
 Both servers are plain Rust binaries with no runtime dependencies. Everything is

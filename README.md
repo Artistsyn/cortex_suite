@@ -22,6 +22,14 @@ The split is enforced, not conventional: quartz-ctx holds no hand-written
 knowledge, and cortex no longer parses code itself — it ingests quartz-ctx's
 output, so both are fed by one extractor and cannot disagree about what a type is.
 
+**Knowledge also arrives without being asked for.** In Claude Code, cortex
+installs hooks that watch the work itself. When an edit touches a recorded trap,
+or a build or test fails in a way the store already knows, the agent is told at
+that moment, in the one hook-output form the model is actually shown. Every
+build/test verdict is recorded as it happens, so "is this getting better?" is
+answered from what was observed, not from what anyone reported. See
+[Memory that arrives on its own](#memory-that-arrives-on-its-own).
+
 ## Languages
 
 Rust through `syn`; Python, TypeScript, JavaScript, Go, Java, C#, C/C++, Ruby and
@@ -127,6 +135,10 @@ config drift between editors, and the PowerShell 5.1 traps.
 - `recall(topic)` — have we solved this before?
 - `set_checkpoint` / `get_checkpoint` — save where a long task stands and pick it
   up again after a context reset
+- **Pushed traps** — at an edit and at a failure, with no call needed (below)
+- `cortex scoreboard` — observed outcomes, repeat failures, what reached the
+  agent, and the token bill actually paid; `cortex fired` — which mechanisms have
+  really run
 - `quartz-ctx generate` — full API sheets in seconds: every type, variant and
   signature, with worked syntax mined from your `examples/` and `#[test]` bodies,
   `file:line` on every item, and a documentation-coverage report that names each
@@ -135,9 +147,59 @@ config drift between editors, and the PowerShell 5.1 traps.
 ## The one habit that matters
 
 **Pass a `hint`.** `get_anti_patterns`, `list_patterns` and `get_preferences`
-require one. These tools list everything regardless — the hint decides what gets
-expanded, and entries sharing no word with it are cut to one line. It cuts a session boot from ~34k tokens to ~10k with nothing dropped,
-and it is the only thing that records which knowledge actually proved useful.
+require one. These tools list everything regardless: the hint decides what gets
+expanded, entries sharing no word with it are cut to one line, and `since`
+makes a repeat call count unchanged entries instead of re-listing them. Measured
+on a ~400-entry store, a first hinted `get_anti_patterns` returns about 10k tokens
+and a `since` repeat about 2–3k. A hinted call is also the only thing that
+records which knowledge actually proved useful. The one-line index grows with the
+store, which is why the next step is a small session-start brief with everything
+else pulled on demand — see [the plan](docs/cortex-upgrade-plan-2026-09-27.md).
+
+## Memory that arrives on its own
+
+A trap in the store only helps if the agent thinks to ask, and it asks least when
+it is most sure. So in Claude Code, cortex installs hooks into
+`.claude/settings.local.json` the first time it serves a project. They are
+versioned, so upgrades re-install themselves; `cortex hooks-init` installs or
+upgrades them by hand.
+
+| Hook | When | What the agent gets |
+|---|---|---|
+| `edit_guard` | after an Edit or Write | one short warning when the edit shares **distinctive** evidence with a recorded trap: a code identifier plus one more rare token, or three rare words. Ordinary English, library identifiers and prose files never count. At most one per file and four per session. |
+| Bash observer | after every command, **including failed ones** (`PostToolUseFailure`) | nothing, usually; every build/test verdict is recorded. When a failure matches a trap — the one linked to it by `anti-pattern add --resolves`, or one its error message names — the agent gets the trap and its fix. A specific failure seen in three sessions with nothing recorded gets a nudge with the exact command to record it. |
+| `note_challenge` | on each user message | records a disputed claim as an open question, to be settled by checking |
+
+Two facts shaped all of this, and both were learned the hard way. Claude Code
+shows the model **only** `hookSpecificOutput.additionalContext` from these hooks:
+plain hook output goes to a debug log, and for months cortex's warnings went
+there. And a command that exits non-zero never reaches `PostToolUse`, so an
+observer that listens only there sees nothing but the failures a pipe happened
+to hide. No hook can shrink a Bash result, so cortex does not claim to save
+tokens that way.
+
+The matching was chosen by replaying real history: over 2,403 recorded edits,
+the guard now speaks on 32% of them instead of 91%, and a labelled sample of its
+warnings went from about half relevant to about nine in ten.
+
+## Is it working?
+
+```bash
+./.cortex/cortex.sh scoreboard     # 14-day window vs the previous one
+./.cortex/cortex.sh fired          # has each mechanism actually run?
+```
+
+Every scoreboard number says whether it is **observed** (recorded by hooks),
+**delivered** (reached the agent) or **self-reported** (closeouts, shown for
+reference only). It covers:
+
+- build/test runs that went green;
+- how many of this window's failures had happened before the window, which is
+  what memory should prevent;
+- lookups, with identical repeats flagged as a loop;
+- pushes delivered, confirmed from the host's own transcript records;
+- the token bill read from Claude Code's transcripts, including where the cost
+  comes from: context size × calls.
 
 ## What you have to review
 
@@ -205,4 +267,5 @@ quartz-ctx/        API extraction server
 templates/         configs and instruction files to copy into your workspace
 scripts/           setup.ps1, setup.sh
 docs/GRAPHIFY.md   optional third server
+docs/cortex-upgrade-plan-2026-09-27.md   audit, research and roadmap (the tracker)
 ```
