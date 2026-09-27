@@ -22,8 +22,9 @@ The split is enforced, not conventional: quartz-ctx holds no hand-written
 knowledge, and cortex no longer parses code itself — it ingests quartz-ctx's
 output, so both are fed by one extractor and cannot disagree about what a type is.
 
-**Knowledge also arrives without being asked for.** In Claude Code, cortex
-installs hooks that watch the work itself. When an edit touches a recorded trap,
+**Knowledge also arrives without being asked for.** In Claude Code, and in
+VS Code Copilot through `hooks-init --vscode`, cortex installs hooks that watch
+the work itself. When an edit touches a recorded trap,
 or a build or test fails in a way the store already knows, the agent is told at
 that moment, in the one hook-output form the model is actually shown. Every
 build/test verdict is recorded as it happens, so "is this getting better?" is
@@ -181,6 +182,23 @@ tokens that way.
 The matching was chosen by replaying real history: over 2,403 recorded edits,
 the guard now speaks on 32% of them instead of 91%, and a labelled sample of its
 warnings went from about half relevant to about nine in ten.
+
+**VS Code Copilot gets the same pushes.** VS Code's agent hooks run commands,
+not MCP tools, so `cortex hook <event>` is the same logic as a plain command. It
+reads the hook's JSON on stdin (Claude Code's or VS Code's shape), and prints
+the reply or nothing. It always exits 0 and never creates a store.
+
+```bash
+./.cortex/cortex.sh hooks-init --vscode     # writes .github/hooks/cortex.json
+```
+
+It reads VS Code's terminal tool (`run_in_terminal`) and its edit tools
+(`replace_string_in_file`, `multi_replace_string_in_file`, `create_file`,
+`apply_patch`, `edit_notebook_file`), plus user prompts. VS Code reports no
+exit codes and marks failed commands successful, so failures are read from the
+output text. Everything else, such as reads and searches, exits before the store
+is opened: about 20 ms. A call that does work takes about 40 ms. It is safe
+under VS Code's concurrent hooks: 90 simultaneous calls all answered correctly.
 
 ## Is it working?
 

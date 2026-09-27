@@ -7,6 +7,7 @@ mod consolidator;
 mod corrections;
 mod consolidator2;
 mod crystallizer;
+mod hook_cli;
 mod git;
 mod graph;
 mod graph_diff;
@@ -379,6 +380,19 @@ enum Command {
         /// Refresh the hook even if an identical one is already present.
         #[arg(long)]
         force: bool,
+        /// Install VS Code's agent hooks instead (.github/hooks/cortex.json).
+        /// They run `cortex hook`, because VS Code runs command hooks only.
+        #[arg(long)]
+        vscode: bool,
+    },
+
+    /// Run cortex's hooks as a command, for hosts that cannot call an MCP tool
+    /// from a hook (VS Code's agent hooks). Reads the hook's JSON on stdin,
+    /// prints the hook reply or nothing, and always exits 0.
+    Hook {
+        /// PostToolUse, PostToolUseFailure or UserPromptSubmit. Defaults to the
+        /// payload's own hook_event_name.
+        event: Option<String>,
     },
 }
 
@@ -829,7 +843,10 @@ fn main() -> Result<()> {
         Command::SessionOrphans                 => run_session_orphans(&db_path),
         Command::HealthReport                   => run_health_report(&db_path),
         Command::Scoreboard { window_days, no_tokens } => run_scoreboard(&db_path, window_days, no_tokens, format),
-        Command::HooksInit { root, shared, force } => run_hooks_init(root, shared, force),
+        Command::HooksInit { root, shared, force, vscode } => {
+            if vscode { run_hooks_init_vscode(root, &db_path) } else { run_hooks_init(root, shared, force) }
+        }
+        Command::Hook { event } => run_hook(&db_path, event.as_deref()),
     }
 }
 
@@ -1108,6 +1125,78 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
             println!("cortex hooks already up to date in .claude/{filename} — no change.")
         }
     }
+    Ok(())
+}
+
+/// `cortex hook`: never fails, never prints anything but the hook reply.
+fn run_hook(db_path: &Path, event: Option<&str>) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let out = hook_cli::run(event, &stdin, db_path);
+    if !out.is_empty() {
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(out.as_bytes());
+        let _ = stdout.flush();
+    }
+    Ok(())
+}
+
+/// The VS Code hook file: `cortex hook` on PostToolUse and UserPromptSubmit.
+///
+/// VS Code runs hooks from the workspace root, so the binary and the store are
+/// written relative to it when they live inside it (portable), absolute when
+/// they do not. The store path is always explicit: a hook that let `--db`
+/// default could bind a second, empty store and split memory in two.
+fn vscode_hooks_config(root: &Path, db_path: &Path) -> Result<Value> {
+    let root = root.canonicalize().with_context(|| format!("no such root: {}", root.display()))?;
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let db = if db_path.is_absolute() { db_path.to_path_buf() } else { std::env::current_dir()?.join(db_path) };
+    let db = db.canonicalize().unwrap_or(db);
+    let shown = |p: &Path| -> String {
+        let s = p.strip_prefix(&root).map(|r| r.to_path_buf()).unwrap_or_else(|_| p.to_path_buf());
+        let s = s.to_string_lossy().into_owned();
+        if s.contains(' ') { format!("\"{s}\"") } else { s }
+    };
+    let (exe, db) = (shown(&exe), shown(&db));
+    let entry = |event: &str| json!([{
+        "type": "command",
+        "command": format!("{exe} --db {db} hook {event}"),
+        "timeout": 10
+    }]);
+    Ok(json!({ "hooks": {
+        "PostToolUse": entry("PostToolUse"),
+        "UserPromptSubmit": entry("UserPromptSubmit")
+    }}))
+}
+
+fn run_hooks_init_vscode(root: Option<PathBuf>, db_path: &Path) -> Result<()> {
+    let root = root.unwrap_or_else(|| PathBuf::from("."));
+    if !db_path.exists() {
+        anyhow::bail!(
+            "no cortex store at {} -- the hooks would have nothing to read; pass --db",
+            db_path.display()
+        );
+    }
+    let config = vscode_hooks_config(&root, db_path)?;
+    let path = root.join(".github").join("hooks").join("cortex.json");
+    let rendered = serde_json::to_string_pretty(&config)? + "\n";
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(rendered.as_str()) {
+        println!("VS Code hooks already up to date: {}", path.display());
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, &rendered).with_context(|| format!("failed to write {}", path.display()))?;
+    // Verify the artifact, not the intent.
+    let back: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let command = back["hooks"]["PostToolUse"][0]["command"].as_str().unwrap_or("");
+    println!(
+        "Wrote {} — VS Code agent hooks for PostToolUse and UserPromptSubmit run:\n  {command}\n\
+         VS Code reads .github/hooks/*.json when chat.useHooks is on (the default) and the\n\
+         workspace is trusted. The same pushes as Claude Code: a recorded trap when an edit\n\
+         or a failing build matches one, and a note when a message disputes a claim.",
+        path.display()
+    );
     Ok(())
 }
 

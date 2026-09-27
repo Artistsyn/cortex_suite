@@ -63,6 +63,25 @@ pub fn dispatch(
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
 }
 
+/// The hook tools, callable without an MCP server. `cortex hook` runs them in
+/// a fresh process per event, because VS Code's agent hooks run commands and
+/// cannot call an MCP tool. Same functions, so the same caps, dedupe,
+/// redaction and delivery rules apply whichever way a hook arrives.
+pub(crate) fn run_hook_tool(
+    tool: &str,
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+    repo_root: &Path,
+) -> Result<String, String> {
+    match tool {
+        "compact_output" => tool_compact_output(args, store, session_id, repo_root),
+        "edit_guard" => tool_edit_guard(args, store, session_id),
+        "note_challenge" => tool_note_challenge(args, store, session_id),
+        other => Err(format!("not a hook tool: {other}")),
+    }
+}
+
 // ── user corrections ────────────────────────────────────────────────────────
 
 /// Note a challenge, and — only when one fires — say the one thing the agent

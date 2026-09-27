@@ -305,7 +305,7 @@ that measure.
 11. **Hook robustness.** 672 historical "not connected" errors were clustered
     on deploy days. Consider command-type hooks that call the CLI (always the
     current binary, no connection dependency; ~50–80 ms per event).
-12. **VS Code Copilot push parity.** Copilot keeps everything it had: all MCP
+12. **VS Code Copilot push parity.** *(Built 2026-09-27; see the end of this item.)* Copilot keeps everything it had: all MCP
     tools via `.vscode/mcp.json`, the pull workflow in
     `copilot-instructions.md`, skills in `.github/prompts`, and its sessions in
     the scoreboard's store metrics. It does not get pushes or build/test
@@ -361,7 +361,24 @@ that measure.
     and prints the `hookSpecificOutput.additionalContext` JSON. There are no
     matchers: it filters by `tool_name` itself. A verification run afterwards
     needs Copilot to report whether it saw a `[cortex]` line, since its
-    transcripts do not record hook output. Caveat: a command hook's session id is the host's, not the
+    transcripts do not record hook output.
+
+    **Built 2026-09-27:** `cortex hook <event>` (`hook_cli.rs`) and
+    `hooks-init --vscode`, installed in FlowMake as `.github/hooks/cortex.json`.
+    Verified:
+    * 10 unit and end-to-end tests.
+    * The real binary driven with the captured payload shapes. A failing
+      Android build returns trap #384; an `ignore_zoom` edit returns #344; a
+      disputing prompt returns the challenge note; reads, `PreToolUse`,
+      passing runs, garbage and a missing store are all silent. Exit 0
+      every time, stderr empty, no store ever created.
+    * About 20 ms for calls that exit early, about 40 ms for calls that do work.
+    * 90 concurrent calls: every reply valid, `quick_check` ok.
+    * Its own heartbeat row: `fired` shows it as "not in use" until
+      VS Code first runs it.
+
+    **Remaining:** one Copilot session in which Copilot confirms it saw a
+    `[cortex]` line. Caveat: a command hook's session id is the host's, not the
     MCP server's, so per-session dedupe works but survival crediting will not
     join until the two are mapped. The same entrypoint would also serve item 11.
 

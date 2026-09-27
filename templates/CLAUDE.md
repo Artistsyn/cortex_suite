@@ -296,7 +296,7 @@ commands on both.
 | `skill-status` | drafts awaiting a human |
 | `fired` | which mechanisms have actually run, and which are silently idle |
 | `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
-| `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note) |
+| `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note); `--vscode` installs the same for VS Code Copilot |
 | `-- <args>` | pass anything straight through to the binary |
 
 `fired` answers the one question nothing else asks: *has this ever actually

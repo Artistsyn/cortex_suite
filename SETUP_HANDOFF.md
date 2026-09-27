@@ -490,6 +490,33 @@ they apply. Nobody has to call anything.
 Every warning ends *"If it does not apply, ignore it."* That's meant: the
 matching is lexical, measured at about nine in ten relevant, not ten in ten.
 
+**VS Code Copilot.** VS Code's agent hooks (Preview) run *command* hooks only:
+
+* no `mcp_tool` hooks, so it cannot run the Claude Code configuration above;
+* no `PostToolUseFailure` event;
+* matchers ignored in Claude-format files.
+
+`cortex hook <event>` is the same logic as a command, and
+`./.cortex/cortex.sh hooks-init --vscode` installs it as
+`.github/hooks/cortex.json`. VS Code runs it when `chat.useHooks` is on (the
+default) and the workspace is trusted. Things worth knowing:
+
+* It reads `run_in_terminal`, whose result is one string with no exit code
+  (Copilot marks failed commands `success` too, so failure is read from the
+  output text), and the edit tools `replace_string_in_file`,
+  `multi_replace_string_in_file`, `create_file`, `apply_patch` and
+  `edit_notebook_file`.
+* It exits in about 20 ms, before opening the store, for everything else;
+  about 40 ms when it has work.
+* Sessions are keyed `vscode:<chat session id>`, so they count in the
+  scoreboard, but survival crediting does not join them to the MCP server's
+  session.
+* `fired` shows "cortex hook (VS Code command hooks)": "not in use" until the
+  first run, live after.
+
+Copilot's transcripts record neither hook output nor token usage, so to confirm
+delivery, ask Copilot whether it saw the `[cortex]` line.
+
 **Link a trap to its failure.** `anti-pattern add … --resolves '<signature>'`
 records the trap and links it to the failure (`recurring_errors.anti_pattern_id`,
 plus when it was handled). The next occurrence of that exact failure is answered
@@ -659,6 +686,7 @@ names.
 | `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | restart the session (or reconnect cortex in `/mcp`); see 2.14 |
 | Failed builds missing from the scoreboard | hook set older than v3 (no `PostToolUseFailure` entry) | `./.cortex/cortex.sh hooks-init`; see 2.15 |
 | `hook_non_blocking_error: MCP server 'cortex' not connected` | the server was down (usually mid-deploy) | none needed; hooks are non-blocking and resume when it reconnects |
+| Copilot never gets `[cortex]` warnings | no `.github/hooks/cortex.json`, `chat.useHooks` off, or the workspace is not trusted | `./.cortex/cortex.sh hooks-init --vscode`; check the setting and Workspace Trust; `fired` shows whether `cortex hook` ever ran |
 
 **Health checks:**
 ```bash

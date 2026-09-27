@@ -154,14 +154,20 @@ fn excerpt(prompt: &str) -> String {
 /// argued" or "the hook was never installed" — and those need opposite
 /// responses. This is the only thing that tells them apart.
 pub fn beat(store: &Store, matched: bool) -> Result<()> {
+    beat_named(store, "note_challenge", matched)
+}
+
+/// The same heartbeat for any hook, under its own row: `fired` reads each
+/// hook's row separately, so one hook's beat can never make another look alive.
+pub fn beat_named(store: &Store, hook: &str, matched: bool) -> Result<()> {
     store.conn().execute(
         "INSERT INTO hook_heartbeat (hook, fired, matched, last_fired)
-         VALUES ('note_challenge', 1, ?1, unixepoch())
+         VALUES (?2, 1, ?1, unixepoch())
          ON CONFLICT(hook) DO UPDATE SET
              fired      = fired + 1,
              matched    = matched + ?1,
              last_fired = unixepoch()",
-        params![i64::from(matched)],
+        params![i64::from(matched), hook],
     )?;
     Ok(())
 }

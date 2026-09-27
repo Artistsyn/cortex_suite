@@ -373,7 +373,8 @@ cortex launcher (bash) - workspace: $NAME
   recall <t>    look something up        health-report self-learning state
   scoreboard    outcomes, repeat failures, delivery, token bill (--no-tokens to skip the bill)
   fired         which mechanisms have actually run, and which are silently idle
-  hooks-init    install or upgrade the Claude Code hooks (.claude/settings.local.json)
+  hooks-init    install or upgrade the Claude Code hooks (.claude/settings.local.json);
+                --vscode for VS Code Copilot (.github/hooks/cortex.json)
   skill-status  drafts awaiting review   skill-approve <name>
   -- <args>     pass anything straight through to the binary
 

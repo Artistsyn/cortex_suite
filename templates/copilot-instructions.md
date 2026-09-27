@@ -55,6 +55,19 @@ you see the same thing. Use both.
 | Unfamiliar compiler error | `semantic_search <description>` first |
 | Compiles but behaves wrong | `recall <behaviour>` — may be a known runtime trap |
 
+## When a `[cortex]` warning arrives
+
+With cortex's VS Code hooks installed (`cortex hooks-init --vscode`), a recorded
+trap arrives in your context at two moments. The first is after an edit that
+shares distinctive evidence with a trap. The second is after a build or test
+whose output shows a failure the store already knows. Read it before your next
+step. If it applies, follow its fix. If it does not, ignore it: the matching
+is lexical, about nine in ten relevant, not certain.
+
+A nudge that a failure has recurred across sessions with nothing recorded is a
+request. Once you know the cause, record it with the printed
+`anti-pattern add ... --resolves '<signature>'` command.
+
 ## API facts
 
 - `get_item(name)` returns the full definition including methods from **every**
