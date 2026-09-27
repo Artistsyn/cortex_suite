@@ -232,7 +232,7 @@ fn failing_test_name(output: &str) -> Option<String> {
 /// nothing to do with the error, and because the sample was never updated on
 /// conflict it stayed wrong forever. That is how `rust:E0425` came to be
 /// illustrated by a function name that never appeared in an E0425.
-fn error_excerpt(output: &str) -> String {
+pub(crate) fn error_excerpt(output: &str) -> String {
     let from = output
         .find("error[E")
         .or_else(|| output.find("panicked at "))
@@ -313,10 +313,20 @@ pub fn recurring(store: &Store, min: i64) -> Result<Vec<(String, i64, String)>> 
 /// it: recording the trap did not, and there was no command to dismiss one, so
 /// every failure seen in three sessions was listed at every closeout forever.
 /// Returns whether a failure with that signature existed.
-pub fn mark_recurring_handled(store: &Store, signature: &str) -> Result<bool> {
+///
+/// `resolved_by` is the trap recorded for it, when there is one. Flipping the
+/// flag alone kept nothing: the next occurrence of the same failure could not be
+/// answered with the trap written for it, and whether it RECURRED AFTER being
+/// recorded -- the one number that says the store prevents anything -- could
+/// not be computed. `handled_at` keeps the first time it was handled.
+pub fn mark_recurring_handled(store: &Store, signature: &str, resolved_by: Option<i64>) -> Result<bool> {
     let n = store.conn().execute(
-        "UPDATE recurring_errors SET proposed = 1 WHERE signature = ?1",
-        params![signature],
+        "UPDATE recurring_errors
+         SET proposed        = 1,
+             handled_at      = COALESCE(handled_at, unixepoch()),
+             anti_pattern_id = COALESCE(?2, anti_pattern_id)
+         WHERE signature = ?1",
+        params![signature, resolved_by],
     )?;
     Ok(n > 0)
 }
@@ -451,12 +461,31 @@ mod tests {
         }
         assert_eq!(recurring(&store, 3).unwrap().len(), 2);
 
-        assert!(mark_recurring_handled(&store, "rust:E0063:inner_cone_angle_deg").unwrap());
+        assert!(mark_recurring_handled(&store, "rust:E0063:inner_cone_angle_deg", Some(42)).unwrap());
         let left: Vec<String> = recurring(&store, 3).unwrap().into_iter().map(|(s, _, _)| s).collect();
         assert_eq!(left, vec!["rust:E0425:parse_header"]);
 
+        // The link and the moment are kept, so a later occurrence can be answered
+        // with the trap and counted as a recurrence AFTER it was recorded.
+        let (link, at): (Option<i64>, Option<i64>) = store.conn().query_row(
+            "SELECT anti_pattern_id, handled_at FROM recurring_errors WHERE signature = ?1",
+            params!["rust:E0063:inner_cone_angle_deg"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(link, Some(42));
+        assert!(at.is_some());
+
+        // Dismissing without a trap never erases a link already recorded.
+        assert!(mark_recurring_handled(&store, "rust:E0063:inner_cone_angle_deg", None).unwrap());
+        let link: Option<i64> = store.conn().query_row(
+            "SELECT anti_pattern_id FROM recurring_errors WHERE signature = ?1",
+            params!["rust:E0063:inner_cone_angle_deg"],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(link, Some(42));
+
         assert!(
-            !mark_recurring_handled(&store, "no:such:signature").unwrap(),
+            !mark_recurring_handled(&store, "no:such:signature", None).unwrap(),
             "an unknown signature must say it matched nothing"
         );
     }

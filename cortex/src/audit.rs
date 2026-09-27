@@ -31,12 +31,24 @@ pub struct Mechanism {
 
 /// Everything with a heartbeat worth watching, and how often to expect one.
 pub const MECHANISMS: &[Mechanism] = &[
+    // The Bash observer. It used to be labelled "token saving", and for months
+    // it computed compacted copies no agent ever received; it now records what
+    // it saw and claims nothing (see push.rs).
     Mechanism {
-        label: "compact_output (token saving)",
+        label: "Bash hook (observes commands)",
         table: "compression_savings",
         ts_col: "saved_at",
         expect_days: 2.0,
         when_idle: "the Bash hook is not installed or not reaching the server",
+    },
+    // Output, not heartbeat: a push is recorded only when it went out as
+    // hook additionalContext -- the one form the model is shown.
+    Mechanism {
+        label: "pushes delivered to agents",
+        table: "push_log",
+        ts_col: "pushed_at",
+        expect_days: 30.0,
+        when_idle: "no trap has reached an agent; hooks must return additionalContext JSON (a server older than push.rs returns plain text, which the host discards)",
     },
     Mechanism {
         label: "test_signal (outcome scoring)",

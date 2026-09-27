@@ -19,7 +19,6 @@ mod mcp;
 mod meta;
 mod miner;
 mod model;
-mod output_filter;
 mod test_signal;
 #[cfg(test)]
 mod test_support;
@@ -28,6 +27,7 @@ mod recall_match;
 mod redact;
 mod prefs;
 mod protocol;
+mod push;
 mod reasoner;
 mod scoreboard;
 mod search;
@@ -354,12 +354,17 @@ enum Command {
     /// Print a one-line system health report.
     HealthReport,
 
-    /// Self-learning KPI scoreboard: pass rate, gap rate, marker capture,
-    /// pattern reuse, telemetry coverage — each with a trend vs the previous window.
+    /// Self-learning scoreboard: observed build/test outcomes, repeat failures,
+    /// what knowledge was delivered to agents, capture, store health, and the
+    /// token bill actually paid (from Claude Code transcripts) — each with a
+    /// trend vs the previous window.
     Scoreboard {
         /// Rolling window length in days (compared against the previous window of the same length).
         #[arg(long, default_value_t = 14)]
         window_days: u32,
+        /// Skip the token bill (it reads this workspace's Claude Code transcripts).
+        #[arg(long)]
+        no_tokens: bool,
     },
 
     /// Install the lossless compact_output hook into Claude Code settings.
@@ -823,7 +828,7 @@ fn main() -> Result<()> {
         }
         Command::SessionOrphans                 => run_session_orphans(&db_path),
         Command::HealthReport                   => run_health_report(&db_path),
-        Command::Scoreboard { window_days }     => run_scoreboard(&db_path, window_days, format),
+        Command::Scoreboard { window_days, no_tokens } => run_scoreboard(&db_path, window_days, no_tokens, format),
         Command::HooksInit { root, shared, force } => run_hooks_init(root, shared, force),
     }
 }
@@ -873,9 +878,23 @@ fn is_workspace_cortex_dir(dir: &Path) -> bool {
     || dir.join("index-sources.json").is_file()
 }
 
-fn run_scoreboard(db_path: &Path, window_days: u32, format: OutputFormat) -> Result<()> {
+fn run_scoreboard(db_path: &Path, window_days: u32, no_tokens: bool, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
-    let sb = scoreboard::compute(&store, window_days)?;
+    let mut sb = scoreboard::compute(&store, window_days)?;
+    if !no_tokens {
+        // The workspace is the directory holding .cortex/.
+        let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+        match scoreboard::transcripts_dir_for(repo_root) {
+            Some(dir) => match scoreboard::token_ledger(&dir, window_days) {
+                Ok(ledger) => sb.tokens = Some(ledger),
+                Err(e) => eprintln!("[cortex] token bill unavailable: {e}"),
+            },
+            None => eprintln!(
+                "[cortex] token bill skipped: no Claude Code transcripts for this workspace \
+                 (set CORTEX_TRANSCRIPTS_DIR to point at them)"
+            ),
+        }
+    }
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&sb)?),
         OutputFormat::Text => print!("{}", scoreboard::format_text(&sb)),
@@ -920,6 +939,26 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
             }
         }]
     });
+    // The same observer on FAILED commands. A Bash call that exits non-zero
+    // never reaches PostToolUse -- Claude Code routes it to PostToolUseFailure,
+    // with the output in `error` -- so without this, a plain `cargo build`
+    // that failed was invisible: no verdict, no recurring-failure count, no
+    // recall. Only failures masked by a pipe (`| tail`) were ever seen, which
+    // biased every observed pass rate upward. Found 2026-09-27: a command that
+    // exited 1 left no row while its neighbours in the same minute did.
+    let failure_hook = json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "mcp_tool",
+            "server": "cortex",
+            "tool": "compact_output",
+            "input": {
+                "command": "${tool_input.command}",
+                "error": "${error}",
+                "hook_event_name": "PostToolUseFailure"
+            }
+        }]
+    });
 
     let mut root_obj: serde_json::Map<String, Value> = if settings_path.exists() {
         let text = std::fs::read_to_string(&settings_path)
@@ -938,6 +977,9 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         .ok_or_else(|| anyhow::anyhow!("`hooks` in {filename} is not an object"))?;
     hooks_obj
         .entry("PostToolUse".to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    hooks_obj
+        .entry("PostToolUseFailure".to_string())
         .or_insert_with(|| Value::Array(vec![]));
     hooks_obj
         .entry("UserPromptSubmit".to_string())
@@ -997,15 +1039,17 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         obj.get(key).and_then(|v| v.as_array()).cloned().unwrap_or_default()
     };
     let post_now = array_of(hooks_obj, "PostToolUse");
+    let failure_now = array_of(hooks_obj, "PostToolUseFailure");
     let prompt_now = array_of(hooks_obj, "UserPromptSubmit");
     let up_to_date = post_now.iter().find(|e| is_compact(e)).is_some_and(|e| *e == compact_hook)
         && post_now.iter().find(|e| is_guard(e)).is_some_and(|e| *e == guard_hook)
+        && failure_now.iter().find(|e| is_compact(e)).is_some_and(|e| *e == failure_hook)
         && prompt_now.iter().find(|e| is_challenge(e)).is_some_and(|e| *e == challenge_hook);
     if !force && up_to_date {
         return Ok(HookOutcome::AlreadyPresent);
     }
 
-    // PostToolUse: output compaction and the edit guard.
+    // PostToolUse: the Bash observer and the edit guard.
     let arr = hooks_obj
         .get_mut("PostToolUse")
         .and_then(|v| v.as_array_mut())
@@ -1013,6 +1057,14 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     arr.retain(|e| !is_compact(e) && !is_guard(e));
     arr.push(compact_hook);
     arr.push(guard_hook);
+
+    // PostToolUseFailure: the same observer, for commands that exited non-zero.
+    let fail_arr = hooks_obj
+        .get_mut("PostToolUseFailure")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("`hooks.PostToolUseFailure` in {filename} is not an array"))?;
+    fail_arr.retain(|e| !is_compact(e));
+    fail_arr.push(failure_hook);
 
     // UserPromptSubmit is a SEPARATE event array. Pushing this onto PostToolUse
     // would be accepted by the JSON and then never fire — exactly the shipped-
@@ -1036,9 +1088,11 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
     let filename = if shared { "settings.json" } else { "settings.local.json" };
     match outcome {
         HookOutcome::Written => println!(
-            "Wrote .claude/{filename} — three cortex hooks installed:\n\
-             \x20 compact_output on PostToolUse(Bash) — losslessly strips build/test progress \
-             noise (stdout + stderr) and tees the full log to .cortex/tee/.\n\
+            "Wrote .claude/{filename} — cortex hooks installed:\n\
+             \x20 compact_output on PostToolUse(Bash) and PostToolUseFailure(Bash) — reads every \
+             build/test verdict (stdout + stderr, or the failure's error), and when a failure \
+             matches a recorded trap, tells the agent (hook additionalContext). It does not \
+             shrink output: a hook cannot replace a Bash result.\n\
              \x20 edit_guard on PostToolUse(Edit|Write) — names a recorded trap when an edit \
              touches one. Silent otherwise, and capped at one warning per file and four per \
              session, so it cannot become wallpaper.\n\
@@ -1047,8 +1101,8 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
              QUESTION, never a finding: nothing reaches memory until someone checks who was \
              right, and even then it arrives as a proposal.\n\
              Restart Claude Code (or reload the session) for them to take effect.\n\
-             Note: these are Claude Code hooks. VS Code Copilot cannot auto-rewrite tool output \
-             or observe edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
+             Note: these are Claude Code hooks. VS Code Copilot cannot observe tool output or \
+             edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
         ),
         HookOutcome::AlreadyPresent => {
             println!("cortex compact_output hook already present in .claude/{filename} — no change.")
@@ -1085,7 +1139,10 @@ fn auto_install_hook_on_serve(repo: &Path) {
     // every machine that ever ran cortex already has the unversioned sentinel,
     // so the install is skipped forever and the new mechanism reports NEVER in
     // the audit with no explanation. Bump this whenever the hook set changes.
-    const HOOK_SET_VERSION: u32 = 2; // 2: added note_challenge on UserPromptSubmit
+    // 2: added note_challenge on UserPromptSubmit
+    // 3: added the Bash observer on PostToolUseFailure (failed commands never
+    //    reach PostToolUse), and hook tools now answer in additionalContext JSON
+    const HOOK_SET_VERSION: u32 = 3;
     let cortex_dir = repo.join(".cortex");
     let sentinel = cortex_dir.join(format!(".claude-hooks-installed.v{HOOK_SET_VERSION}"));
     if sentinel.exists() {
@@ -1104,11 +1161,11 @@ fn auto_install_hook_on_serve(repo: &Path) {
             let _ = std::fs::write(&sentinel, chrono::Utc::now().to_rfc3339());
             match outcome {
                 HookOutcome::Written => eprintln!(
-                    "  hooks: installed compact_output into .claude/settings.local.json \
-                     (lossless output compaction; active next Claude Code session)"
+                    "  hooks: installed cortex hooks into .claude/settings.local.json \
+                     (build/test observer, edit guard, challenge note; active next Claude Code session)"
                 ),
                 HookOutcome::AlreadyPresent => eprintln!(
-                    "  hooks: compact_output already configured; recorded install sentinel"
+                    "  hooks: cortex hooks already configured; recorded install sentinel"
                 ),
             }
         }
@@ -2802,8 +2859,8 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
         return match cmd {
             AntiPatternCmd::List => crystallizer::list_anti_patterns(&store),
             AntiPatternCmd::Add { description, wrong, correct, tags, resolves } => {
-                crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags)?;
-                resolve_recurring(&store, resolves.as_deref()).map(|_| ())
+                let id = crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags)?;
+                resolve_recurring(&store, resolves.as_deref(), Some(id)).map(|_| ())
             }
             AntiPatternCmd::Remove { id } => crystallizer::remove_anti_pattern(&store, id),
             AntiPatternCmd::Supersede { id, by } => run_supersede(&store, "anti_patterns", id, by),
@@ -2827,7 +2884,7 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
                 hash: None,
                 superseded_by: None,
             })?;
-            let resolved = resolve_recurring(&store, resolves.as_deref())?;
+            let resolved = resolve_recurring(&store, resolves.as_deref(), Some(id))?;
             print_json(&json!({"ok": true, "action": "add", "id": id, "created": created, "description": description, "resolved_recurring": resolved}))
         }
         AntiPatternCmd::Remove { id } => {
@@ -4182,6 +4239,51 @@ mod tests {
         (d, p)
     }
 
+    /// The installer rewrites a person's real settings file, so what it writes
+    /// is pinned here: every hook on the right EVENT (a hook on the wrong event
+    /// array is accepted by the JSON and never fires), idempotent, merge-safe,
+    /// and able to upgrade a file written by an older hook set.
+    #[test]
+    fn hook_install_puts_each_hook_on_its_event_and_upgrades_old_files() {
+        let d = crate::test_support::TempDir::new("hook_install").expect("temp dir");
+        let settings = d.path().join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        // A v2-era file: no PostToolUseFailure, plus someone else's hook.
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo mine"}]},
+               {"matcher":"Bash","hooks":[{"type":"mcp_tool","server":"cortex","tool":"compact_output",
+                 "input":{"command":"${tool_input.command}","stdout":"${tool_response.stdout}","stderr":"${tool_response.stderr}"}}]}]},
+               "model":"keep-me"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let tools_on = |event: &str| -> Vec<String> {
+            v["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+                .filter_map(|h| h["tool"].as_str().map(str::to_string))
+                .collect()
+        };
+        assert_eq!(tools_on("PostToolUse"), vec!["compact_output", "edit_guard"]);
+        assert_eq!(tools_on("PostToolUseFailure"), vec!["compact_output"]);
+        assert_eq!(tools_on("UserPromptSubmit"), vec!["note_challenge"]);
+        let failure = &v["hooks"]["PostToolUseFailure"][0]["hooks"][0]["input"];
+        assert_eq!(failure["error"], "${error}", "a failed command's output arrives in `error`");
+        assert_eq!(failure["hook_event_name"], "PostToolUseFailure");
+        // Merge-safe: the other hook and the other key survive, once each.
+        let mine = v["hooks"]["PostToolUse"].as_array().unwrap().iter()
+            .filter(|e| e["hooks"][0]["command"] == "echo mine").count();
+        assert_eq!(mine, 1);
+        assert_eq!(v["model"], "keep-me");
+
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::AlreadyPresent);
+    }
+
     #[test]
     fn phase4_pattern_revert_reflects_in_status_full() {
         let (_guard, db_path) = temp_db("phase4_status");
@@ -4360,7 +4462,7 @@ fn run_consolidate_if_stale(staleness_hours: u32, db_path: &Path) -> Result<()> 
 
 fn run_recurring_dismiss(signature: &str, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
-    if crate::test_signal::mark_recurring_handled(&store, signature)? {
+    if crate::test_signal::mark_recurring_handled(&store, signature, None)? {
         println!("[cortex] recurring failure `{signature}` marked handled; closeout will not raise it again.");
         Ok(())
     } else {
@@ -4369,10 +4471,11 @@ fn run_recurring_dismiss(signature: &str, db_path: &Path) -> Result<()> {
 }
 
 /// `anti-pattern add --resolves <signature>`: recording the trap is what handling
-/// a recurring failure means, so it also clears the failure from review.
-fn resolve_recurring(store: &Store, signature: Option<&str>) -> Result<bool> {
+/// a recurring failure means, so it also clears the failure from review -- and
+/// links the two, so the next occurrence is answered with this trap.
+fn resolve_recurring(store: &Store, signature: Option<&str>, trap: Option<i64>) -> Result<bool> {
     let Some(sig) = signature else { return Ok(false) };
-    let found = crate::test_signal::mark_recurring_handled(store, sig)?;
+    let found = crate::test_signal::mark_recurring_handled(store, sig, trap)?;
     if found {
         println!("[cortex] recurring failure `{sig}` marked handled.");
     } else {

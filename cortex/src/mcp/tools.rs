@@ -168,6 +168,9 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<Stri
     }
 
     let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    if crate::push::is_prose_file(file_path) {
+        return Ok(String::new());
+    }
     // One warning per file per session. "Never the same trap twice" is not
     // enough on its own: a file gets edited fifteen times in a row during real
     // work, and a fresh trap on each of those edits is the wallpaper outcome by
@@ -182,23 +185,22 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<Stri
 
     // Score the ADDED text against each trap. `wrong` carries the shape to
     // avoid, so it is the part worth matching; the description gives the topic.
+    //
+    // Overlap alone is not evidence: a large edit shares common words with most
+    // of the store, which is how a C# grammar trap was raised on a game's
+    // difficulty table. `best_trap` also requires a DISTINCTIVE shared word --
+    // one found in at most a few traps.
     let tokens = hint_tokens(added);
     if tokens.is_empty() {
         return Ok(String::new());
     }
     let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
-    let best = aps
-        .iter()
-        .filter(|ap| ap.id.is_some_and(|id| !already.contains(&id)))
-        .map(|ap| {
-            let hay =
-                format!("{} {} {}", ap.description, ap.wrong, ap.tags.join(" ")).to_lowercase();
-            (text_hint_score(&hay, &tokens), ap)
-        })
-        .filter(|(s, _)| *s >= EDIT_GUARD_MIN_SCORE)
-        .max_by_key(|(s, _)| *s);
-
-    let Some((score, ap)) = best else { return Ok(String::new()) };
+    let bar = crate::push::Bar { min_score: EDIT_GUARD_MIN_SCORE, ..crate::push::EDIT_BAR };
+    let identifiers = crate::push::identifier_tokens(added);
+    let Some(m) = crate::push::best_trap(&aps, &tokens, &identifiers, &already, bar) else {
+        return Ok(String::new());
+    };
+    let (score, ap) = (m.score, m.ap);
     let Some(id) = ap.id else { return Ok(String::new()) };
     let _ = store.record_edit_guard_fire(session_id, id, file_path);
 
@@ -206,23 +208,30 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<Stri
     // entry is one get_anti_patterns call away and the description names it.
     let file = if file_path.is_empty() { "this edit" } else { file_path };
     let file = file.rsplit(['/', '\\']).next().unwrap_or(file);
-    Ok(format!(
-        "[cortex] {file} touches a recorded trap (match {score}):\n  {}\n  → {}\n",
-        ap.description.trim(),
-        ap.correct.trim(),
-    ))
+    let text = format!(
+        "[cortex] {file} touches a recorded trap #{id} (matched on: {}; overlap {score}):\n  {}\n  → {}\n  (If it does not apply to this edit, ignore it.)",
+        m.distinctive.join(", "),
+        crate::push::clip(&ap.description, 300),
+        crate::push::clip(&ap.correct, 420),
+    );
+    // Recorded as DELIVERED only in the form the host shows the model -- the
+    // plain-text version of this warning was logged for months and never seen.
+    let _ = store.record_push(session_id, "edit_guard", &id.to_string(), Some(id), text.len());
+    Ok(crate::push::deliver(args, &text))
 }
 
 // ── compact_output ──────────────────────────────────────────────────────────
 //
-// Lossless compaction of command output. The agent (or a PostToolUse hook)
-// hands us the command plus its stdout/stderr; we strip only provably-redundant
-// content (build/download progress, per-test `... ok` lines, duplicate lines)
-// and return the compacted text, tee'ing the full original to `.cortex/tee/`
-// whenever anything was dropped. Every diagnostic is preserved verbatim.
+// The PostToolUse(Bash) observer. The name is kept because every installed hook
+// calls it by name; the job changed. It reads each command's stdout and stderr
+// for the build/test verdict (test_signal) and for failures the store already
+// knows, and answers the second with `additionalContext` -- the only hook output
+// the model sees. It no longer compacts: a hook cannot replace a Bash result,
+// so the compacted copies it used to return were written to a debug log and
+// never reached the agent (see push.rs).
 //
-// This tool never executes anything — it only reformats text the caller already
-// obtained, so it adds no execution surface and cannot bypass permissions.
+// This tool never executes anything, so it adds no execution surface and cannot
+// bypass permissions.
 fn tool_compact_output(
     args: &Value,
     store: &Store,
@@ -230,19 +239,18 @@ fn tool_compact_output(
     repo_root: &Path,
 ) -> Result<String, String> {
     let command = args["command"].as_str().ok_or("missing `command`")?;
-    let stdout = args.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
-    let stderr = args.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
-    // Some callers may still pass a single combined `output`; accept it too.
-    let combined_fallback = args.get("output").and_then(|v| v.as_str()).unwrap_or("");
+    let field = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
 
     // cargo/rustc write diagnostics to STDERR and test results to STDOUT, so we
     // must consider both streams — an stdout-only filter would miss every error.
-    let raw: String = match (stdout.is_empty(), stderr.is_empty()) {
-        (false, false) => format!("{stdout}\n{stderr}"),
-        (false, true) => stdout.to_string(),
-        (true, false) => stderr.to_string(),
-        (true, true) => combined_fallback.to_string(),
-    };
+    // A command that exited non-zero arrives from PostToolUseFailure instead,
+    // with its output in `error`; some callers pass one combined `output`.
+    let raw: String = ["stdout", "stderr", "error", "output"]
+        .iter()
+        .map(|k| field(k))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
 
     if raw.is_empty() {
         return Ok(String::new());
@@ -255,7 +263,8 @@ fn tool_compact_output(
     // from a test run was how many characters it saved. Reading the verdict here
     // costs one substring scan and removes the dependency on anyone remembering
     // to close the session out.
-    if let Some(passed) = crate::test_signal::classify(command, &raw) {
+    let verdict = crate::test_signal::classify(command, &raw);
+    if let Some(passed) = verdict {
         if !passed {
             // Count it by identity. A single failure is not knowledge; the same
             // failure across sessions is.
@@ -272,34 +281,37 @@ fn tool_compact_output(
         }
     }
 
-    let kind = crate::output_filter::detect_command(command);
-    let tee_dir = repo_root.join(".cortex").join("tee");
-    let filtered = crate::output_filter::filter_output(kind, &raw, Some(&tee_dir));
+    // NOTHING HERE CAN SHRINK THE OUTPUT THE AGENT READS, and nothing pretends
+    // to any more. Claude Code shows the model the Bash result itself; a
+    // PostToolUse hook can ADD context but can replace output only for MCP
+    // tools (`updatedMCPToolOutput`). This tool used to window and tee every
+    // large output and log the difference as "tokens saved": 5,810 compacted
+    // copies sat in transcripts as hook attachments the model never received,
+    // 4,548 tee files were never read, and the scoreboard reported ~686k tokens
+    // a fortnight saved that were not. The observed volume is still logged --
+    // as volume, with nothing claimed.
+    let observed = raw.chars().count();
+    let _ = store.log_compression_saving(session_id, command, observed, observed);
+    let _ = repo_root;
 
-    // Server-side observability (stderr → server log, never shown to the model).
-    if filtered.dropped_lines > 0 {
-        eprintln!(
-            "[cortex] compact_output: {} → {} chars, {} redundant line(s) removed (lossless={}){}",
-            filtered.original_chars,
-            filtered.filtered_chars,
-            filtered.dropped_lines,
-            filtered.lossless,
-            match &filtered.tee_path {
-                Some(p) => format!(", full log: {}", p.display()),
-                None => String::new(),
+    // What the agent CAN be told: that this failure is one the store already
+    // knows. Delivered as additionalContext, once per failure per session.
+    if verdict == Some(false) {
+        if let Some(p) = crate::push::failure_recall(store, &raw) {
+            let under_cap = store
+                .push_count(session_id, "failure_recall")
+                .map(|n| n < crate::push::FAILURE_PUSH_SESSION_CAP)
+                .unwrap_or(false);
+            if under_cap
+                && store
+                    .record_push(session_id, "failure_recall", &p.key, p.anti_pattern_id, p.text.len())
+                    .unwrap_or(false)
+            {
+                return Ok(crate::push::deliver(args, &p.text));
             }
-        );
+        }
     }
-
-    // Telemetry: record the saving (non-fatal — never break the tool over it).
-    let _ = store.log_compression_saving(
-        session_id,
-        command,
-        filtered.original_chars,
-        filtered.filtered_chars,
-    );
-
-    Ok(filtered.text)
+    Ok(String::new())
 }
 
 // ── semantic_search ───────────────────────────────────────────────────────────
@@ -2994,7 +3006,7 @@ mod tests {
         assert!(out.contains(&format!("--resolves {quoted}")), "{out}");
         assert!(out.contains(&crate::cache::launcher_command(&format!("recurring-dismiss {quoted}"))), "{out}");
 
-        assert!(crate::test_signal::mark_recurring_handled(&store, sig).unwrap());
+        assert!(crate::test_signal::mark_recurring_handled(&store, sig, None).unwrap());
         assert!(!super::review_queue_line(&store).contains("recurring failure"), "a handled failure must leave the queue");
 
         let _ = std::fs::remove_file(&tmp);
@@ -3492,13 +3504,99 @@ mod delta_mode_tests {
 
         let first = tool_edit_guard(&args, &store, &session).unwrap();
         let second = tool_edit_guard(&args, &store, &session).unwrap();
+        // This runs against the LIVE store: clean up before asserting, so a
+        // failure does not leave a fire and a "delivered" push behind to be
+        // counted on the scoreboard as real.
+        for table in ["edit_guard_fires", "push_log"] {
+            let _ = store.conn().execute(
+                &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                rusqlite::params![session],
+            );
+        }
         if !first.is_empty() {
             assert!(second.is_empty(), "a repeated warning trains the reader to ignore it");
+            // Delivered in the one form the host shows the model.
+            let v: serde_json::Value = serde_json::from_str(&first).expect("hook JSON");
+            let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+            assert!(ctx.contains("touches a recorded trap"), "{first}");
         }
-        let _ = store.conn().execute(
-            "DELETE FROM edit_guard_fires WHERE session_id = ?1",
-            rusqlite::params![session],
-        );
+    }
+
+    /// Replay real edits through the guard, old rule vs current, on a COPY of a
+    /// store. Evaluation, not a regression test: run it before changing how the
+    /// guard matches, and read the output.
+    ///
+    ///   CORTEX_REPLAY_EDITS=edits.jsonl CORTEX_REPLAY_DB=copy.db \
+    ///     cargo test replay_edit_guard -- --ignored --nocapture
+    ///
+    /// Each line of edits.jsonl: {"file_path", "added" | "content", ...}. The
+    /// store is written to (fires, pushes), which is why it must be a copy.
+    #[test]
+    #[ignore]
+    fn replay_edit_guard_against_real_edits() {
+        let (Ok(edits), Ok(db)) =
+            (std::env::var("CORTEX_REPLAY_EDITS"), std::env::var("CORTEX_REPLAY_DB"))
+        else {
+            eprintln!("set CORTEX_REPLAY_EDITS and CORTEX_REPLAY_DB");
+            return;
+        };
+        let store = Store::open(std::path::Path::new(&db)).unwrap();
+        let aps = store.all_anti_patterns().unwrap();
+        let (mut old_fired, mut new_fired, mut same) = (0, 0, 0);
+        for (i, line) in std::fs::read_to_string(&edits).unwrap().lines().enumerate() {
+            let e: serde_json::Value = serde_json::from_str(line).unwrap();
+            let added = e["added"].as_str().filter(|s| !s.is_empty())
+                .or_else(|| e["content"].as_str()).unwrap_or("");
+            // The rule as it was: most shared words, no evidence required.
+            let tokens = hint_tokens(added);
+            let old = if added.len() < 120 { None } else {
+                aps.iter().map(|ap| {
+                    let hay = format!("{} {} {}", ap.description, ap.wrong, ap.tags.join(" ")).to_lowercase();
+                    (text_hint_score(&hay, &tokens), ap)
+                }).filter(|(s, _)| *s >= EDIT_GUARD_MIN_SCORE).max_by_key(|(s, _)| *s)
+            };
+            let out = tool_edit_guard(
+                &serde_json::json!({ "file_path": e["file_path"], "added": added, "format": "text" }),
+                &store,
+                &format!("replay_{i}_{}", std::process::id()),
+            ).unwrap();
+            let new_id = out.split("recorded trap #").nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse::<i64>().ok());
+            let old_id = old.and_then(|(_, ap)| ap.id);
+            old_fired += old_id.is_some() as i32;
+            new_fired += new_id.is_some() as i32;
+            same += (old_id.is_some() && old_id == new_id) as i32;
+            let file = e["file_path"].as_str().unwrap_or("").rsplit('/').next().unwrap_or("");
+            let desc = |id: Option<i64>| id.and_then(|id| aps.iter().find(|a| a.id == Some(id)))
+                .map(|a| a.description.chars().take(90).collect::<String>()).unwrap_or_else(|| "-".into());
+            let on = out.split("matched on: ").nth(1).and_then(|s| s.split(';').next()).unwrap_or("");
+            println!("{i}\t{file}\told #{:?} {}\tnew #{:?} [{on}] {}", old_id, desc(old_id), new_id, desc(new_id));
+        }
+        println!("old rule fired {old_fired}, new rule fired {new_fired}, same trap {same}");
+    }
+
+    #[test]
+    fn a_guard_warning_asked_for_as_text_is_plain_text() {
+        let store = crate::test_support::TempStore::new("guard_text").unwrap();
+        crate::crystallizer::add_anti_pattern(
+            &store,
+            "A HUD button does nothing while zoomed because ignore_zoom objects use the base scale",
+            "hit-test an ignore_zoom object against the raw pointer position from on_mouse_press",
+            "convert the pointer with screen_to_virtual before hit-testing ignore_zoom objects",
+            vec![],
+        )
+        .unwrap();
+        let added = "fn on_mouse_press(pos: (f32, f32)) { // hit-test the ignore_zoom pause button \
+                     against the raw pointer position without screen_to_virtual }";
+        let text = tool_edit_guard(
+            &serde_json::json!({ "file_path": "menu.rs", "added": added, "format": "text" }),
+            &store,
+            "s_text",
+        )
+        .unwrap();
+        assert!(text.starts_with("[cortex] menu.rs touches a recorded trap"), "{text}");
+        assert!(text.contains("ignore_zoom"), "the evidence is named: {text}");
     }
 
     #[test]

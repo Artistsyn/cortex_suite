@@ -1123,8 +1123,81 @@ impl Store {
         self.ensure_compression_family_column()?;
         self.ensure_edit_guard_file_column()?;
         self.ensure_upgrade_columns()?;
+        self.ensure_push_delivery_schema()?;
 
         Ok(())
+    }
+
+    /// `push_log`, plus the link from a recurring failure to the trap that
+    /// resolves it (idempotent, additive only).
+    ///
+    /// Every hook mechanism produced text that was never shown to the agent:
+    /// Claude Code writes a PostToolUse hook's plain stdout to its debug log, and
+    /// only `hookSpecificOutput.additionalContext` reaches the model. A push is
+    /// therefore recorded when it is DELIVERED in that form, so "how much memory
+    /// actually reached an agent" is a query rather than an assumption.
+    ///
+    /// `recurring_errors` gains `anti_pattern_id` and `handled_at`: recording a
+    /// trap with `--resolves` used to flip a flag and keep nothing else, so a
+    /// later occurrence of the same failure could not be answered with the trap
+    /// that was written for it, and "did it recur after we recorded it" -- the
+    /// one number that says whether the store prevents anything -- could not be
+    /// computed at all.
+    fn ensure_push_delivery_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS push_log (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id      TEXT    NOT NULL,
+                 mechanism       TEXT    NOT NULL,
+                 key             TEXT    NOT NULL,
+                 anti_pattern_id INTEGER,
+                 chars           INTEGER NOT NULL DEFAULT 0,
+                 pushed_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+                 UNIQUE (session_id, mechanism, key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_push_log_pushed ON push_log(pushed_at);",
+        )?;
+        let mut stmt = self.conn.prepare("PRAGMA table_info(recurring_errors)")?;
+        let cols: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !cols.contains("anti_pattern_id") {
+            self.conn
+                .execute("ALTER TABLE recurring_errors ADD COLUMN anti_pattern_id INTEGER", [])?;
+        }
+        if !cols.contains("handled_at") {
+            self.conn
+                .execute("ALTER TABLE recurring_errors ADD COLUMN handled_at INTEGER", [])?;
+        }
+        Ok(())
+    }
+
+    /// Record a push that was delivered to the agent. Returns false when the
+    /// same (session, mechanism, key) was already pushed -- the caller must then
+    /// stay silent, because a repeated warning is wallpaper.
+    pub fn record_push(
+        &self,
+        session_id: &str,
+        mechanism: &str,
+        key: &str,
+        anti_pattern_id: Option<i64>,
+        chars: usize,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO push_log (session_id, mechanism, key, anti_pattern_id, chars)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, mechanism, key, anti_pattern_id, chars as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// How many pushes of one mechanism this session has already received.
+    pub fn push_count(&self, session_id: &str, mechanism: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM push_log WHERE session_id = ?1 AND mechanism = ?2",
+            params![session_id, mechanism],
+            |r| r.get(0),
+        )?)
     }
 
     /// `file` on edit_guard_fires (idempotent).

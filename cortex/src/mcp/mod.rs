@@ -726,18 +726,23 @@ fn tools_list() -> Value {
             },
             {
                 "name": "compact_output",
-                "description": "Losslessly compact command output. Pass the command plus its stdout \
-                                and stderr; returns the same output with only provably-redundant lines \
-                                removed (build/download progress, per-test `... ok` lines == cargo -q, \
-                                duplicate lines). Every error, warning, note, panic, and failure block is \
-                                kept verbatim with its file:line. The full original is saved to .cortex/tee/ \
-                                whenever anything is dropped. Does not execute anything.",
+                "description": "PostToolUse(Bash) observer, installed automatically as a hook; you \
+                                do not call this yourself. Reads the command's stdout and stderr for \
+                                the build/test verdict, and when a failure matches a recorded trap \
+                                (or keeps recurring with none recorded) returns it as hook \
+                                additionalContext. Returns an EMPTY string otherwise. It does not \
+                                compact output: a hook cannot replace a Bash result. Pass \
+                                format=\"text\" for plain text instead of hook JSON. Does not execute \
+                                anything.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "The command that produced the output (used to pick the filter)." },
                         "stdout":  { "type": "string", "description": "The command's stdout stream." },
-                        "stderr":  { "type": "string", "description": "The command's stderr stream (cargo/rustc write diagnostics here)." }
+                        "stderr":  { "type": "string", "description": "The command's stderr stream (cargo/rustc write diagnostics here)." },
+                        "error":   { "type": "string", "description": "A failed command's error text (PostToolUseFailure's ${error})." },
+                        "format":  { "type": "string", "enum": ["hook", "text"], "description": "hook (default): hookSpecificOutput JSON; text: plain text." },
+                        "hook_event_name": { "type": "string", "description": "Hook event running this tool (default PostToolUse)." }
                     },
                     "required": ["command"]
                 }
@@ -747,15 +752,19 @@ fn tools_list() -> Value {
                 "description": "Check an edit against recorded anti-patterns and return a short \
                                 warning if it touches a known trap, or an EMPTY string if it does \
                                 not — silence is the expected outcome. Installed automatically as a \
-                                PostToolUse(Edit|Write) hook; you do not call this yourself. At most \
-                                one trap per edit, never the same trap twice in a session, at most \
-                                four per session.",
+                                PostToolUse(Edit|Write) hook; you do not call this yourself. A trap \
+                                must share a DISTINCTIVE word with the edit, not just common ones. At \
+                                most one trap per edit, never the same trap twice in a session, at \
+                                most four per session. Returns hook additionalContext JSON (the only \
+                                hook output the model sees); pass format=\"text\" for plain text.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "file_path": { "type": "string", "description": "File being edited, for the message." },
                         "added":     { "type": "string", "description": "Text the edit introduces (Edit's new_string)." },
-                        "content":   { "type": "string", "description": "Whole-file content (Write's content), when there is no diff." }
+                        "content":   { "type": "string", "description": "Whole-file content (Write's content), when there is no diff." },
+                        "format":    { "type": "string", "enum": ["hook", "text"], "description": "hook (default): hookSpecificOutput JSON; text: plain text." },
+                        "hook_event_name": { "type": "string", "description": "Hook event running this tool (default PostToolUse)." }
                     }
                 }
             },
