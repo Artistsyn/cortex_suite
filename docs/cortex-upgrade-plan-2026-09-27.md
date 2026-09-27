@@ -327,7 +327,12 @@ that measure.
 
     Before shipping, capture VS Code's exact tool names and input fields with an
     audit hook, including how a failed terminal command is reported without a
-    failure event. Caveat: a command hook's session id is the host's, not the
+    failure event. **Audit hook installed 2026-09-27** in the FlowMake workspace
+    (`.github/hooks/cortex-audit.*`: every documented event; logs to
+    `.cortex/vscode-hook-audit.jsonl`; no stdout, exit 0, ~20 ms, 20 MB cap;
+    tested with bash and pwsh). Next: one Copilot agent session that edits a
+    file and runs a passing and a failing command, then
+    `python3 .github/hooks/cortex-audit-summary.py`. Caveat: a command hook's session id is the host's, not the
     MCP server's, so per-session dedupe works but survival crediting will not
     join until the two are mapped. The same entrypoint would also serve item 11.
 
