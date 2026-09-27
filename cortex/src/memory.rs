@@ -1123,8 +1123,184 @@ impl Store {
         self.ensure_compression_family_column()?;
         self.ensure_edit_guard_file_column()?;
         self.ensure_upgrade_columns()?;
+        self.ensure_push_delivery_schema()?;
 
         Ok(())
+    }
+
+    /// `push_log`, plus the link from a recurring failure to the trap that
+    /// resolves it (idempotent, additive only).
+    ///
+    /// Every hook mechanism produced text that was never shown to the agent:
+    /// Claude Code writes a PostToolUse hook's plain stdout to its debug log, and
+    /// only `hookSpecificOutput.additionalContext` reaches the model. A push is
+    /// therefore recorded when it is DELIVERED in that form, so "how much memory
+    /// actually reached an agent" is a query rather than an assumption.
+    ///
+    /// `recurring_errors` gains `anti_pattern_id` and `handled_at`: recording a
+    /// trap with `--resolves` used to flip a flag and keep nothing else, so a
+    /// later occurrence of the same failure could not be answered with the trap
+    /// that was written for it, and "did it recur after we recorded it" -- the
+    /// one number that says whether the store prevents anything -- could not be
+    /// computed at all.
+    ///
+    /// `edit_guard_offers` holds edit-guard warnings given at PreToolUse and not
+    /// yet confirmed by the call's PostToolUse (see `offer_edit_guard`).
+    /// `offered_at` is REAL unix seconds, compared only numerically and read by
+    /// nothing else.
+    fn ensure_push_delivery_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS push_log (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id      TEXT    NOT NULL,
+                 mechanism       TEXT    NOT NULL,
+                 key             TEXT    NOT NULL,
+                 anti_pattern_id INTEGER,
+                 chars           INTEGER NOT NULL DEFAULT 0,
+                 pushed_at       INTEGER NOT NULL DEFAULT (unixepoch()),
+                 UNIQUE (session_id, mechanism, key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_push_log_pushed ON push_log(pushed_at);
+             CREATE TABLE IF NOT EXISTS edit_guard_offers (
+                 session_id      TEXT    NOT NULL,
+                 tool_use_id     TEXT    NOT NULL,
+                 anti_pattern_id INTEGER,
+                 file            TEXT    NOT NULL DEFAULT '',
+                 chars           INTEGER NOT NULL DEFAULT 0,
+                 offered_at      REAL    NOT NULL,
+                 UNIQUE (session_id, tool_use_id, file)
+             );
+             CREATE INDEX IF NOT EXISTS idx_edit_guard_offers_session
+                 ON edit_guard_offers(session_id, offered_at);",
+        )?;
+        let mut stmt = self.conn.prepare("PRAGMA table_info(recurring_errors)")?;
+        let cols: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !cols.contains("anti_pattern_id") {
+            self.conn
+                .execute("ALTER TABLE recurring_errors ADD COLUMN anti_pattern_id INTEGER", [])?;
+        }
+        if !cols.contains("handled_at") {
+            self.conn
+                .execute("ALTER TABLE recurring_errors ADD COLUMN handled_at INTEGER", [])?;
+        }
+        Ok(())
+    }
+
+    /// Record a push that was delivered to the agent. Returns false when the
+    /// same (session, mechanism, key) was already pushed -- the caller must then
+    /// stay silent, because a repeated warning is wallpaper.
+    pub fn record_push(
+        &self,
+        session_id: &str,
+        mechanism: &str,
+        key: &str,
+        anti_pattern_id: Option<i64>,
+        chars: usize,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO push_log (session_id, mechanism, key, anti_pattern_id, chars)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, mechanism, key, anti_pattern_id, chars as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Offer an edit-guard warning to one tool call at PreToolUse.
+    ///
+    /// VS Code starts a PostToolUse hook and renders the tool result into the
+    /// next request without waiting for it, so a warning given there reaches the
+    /// model one request late; PreToolUse is awaited and its context rides the
+    /// same tool result. But a warning given before the tool runs is not yet
+    /// delivered: if the tool throws, VS Code drops the context. So an offer is
+    /// only recorded here, and becomes a delivered push when the call's
+    /// PostToolUse arrives (`take_edit_guard_offers`) -- a failed edit cannot
+    /// silence the retry.
+    ///
+    /// Returns false when another call in this session was offered the same
+    /// trap, or a trap for the same file, within `window` seconds: the parallel
+    /// edits of one model round, which would otherwise all carry one warning.
+    /// A retry comes after a model round trip, outside the window. The check
+    /// and the insert are one statement, so concurrent hooks cannot both win.
+    #[allow(clippy::too_many_arguments)]
+    pub fn offer_edit_guard(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+        anti_pattern_id: i64,
+        file: &str,
+        chars: usize,
+        now: f64,
+        window: f64,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO edit_guard_offers
+                 (session_id, tool_use_id, anti_pattern_id, file, chars, offered_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM edit_guard_offers
+                 WHERE session_id = ?1 AND tool_use_id <> ?2 AND anti_pattern_id IS NOT NULL
+                   AND (anti_pattern_id = ?3 OR file = ?4) AND offered_at > ?6 - ?7
+             )",
+            params![session_id, tool_use_id, anti_pattern_id, file, chars as i64, now, window],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Mark a tool call as seen by the PreToolUse edit guard, whether or not
+    /// anything was offered, so its PostToolUse knows not to judge it again.
+    /// Also drops offers a day old: their tools never completed.
+    pub fn note_edit_guard_seen(&self, session_id: &str, tool_use_id: &str, now: f64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edit_guard_offers (session_id, tool_use_id, offered_at)
+             VALUES (?1, ?2, ?3)",
+            params![session_id, tool_use_id, now],
+        )?;
+        self.conn.execute(
+            "DELETE FROM edit_guard_offers WHERE offered_at < ?1",
+            params![now - 86_400.0],
+        )?;
+        Ok(())
+    }
+
+    /// The warnings offered to one tool call at PreToolUse, as
+    /// (anti_pattern_id, file, chars), removed as they are read. None when
+    /// PreToolUse never saw the call; an empty list when it saw it and offered
+    /// nothing.
+    pub fn take_edit_guard_offers(
+        &self,
+        session_id: &str,
+        tool_use_id: &str,
+    ) -> Result<Option<Vec<(i64, String, usize)>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT anti_pattern_id, file, chars FROM edit_guard_offers
+             WHERE session_id = ?1 AND tool_use_id = ?2",
+        )?;
+        let rows: Vec<(Option<i64>, String, i64)> = stmt
+            .query_map(params![session_id, tool_use_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        self.conn.execute(
+            "DELETE FROM edit_guard_offers WHERE session_id = ?1 AND tool_use_id = ?2",
+            params![session_id, tool_use_id],
+        )?;
+        Ok(Some(
+            rows.into_iter()
+                .filter_map(|(id, file, chars)| id.map(|id| (id, file, chars.max(0) as usize)))
+                .collect(),
+        ))
+    }
+
+    /// How many pushes of one mechanism this session has already received.
+    pub fn push_count(&self, session_id: &str, mechanism: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM push_log WHERE session_id = ?1 AND mechanism = ?2",
+            params![session_id, mechanism],
+            |r| r.get(0),
+        )?)
     }
 
     /// `file` on edit_guard_fires (idempotent).

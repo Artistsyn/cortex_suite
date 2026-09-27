@@ -209,7 +209,7 @@ pub fn add_anti_pattern(
     wrong: &str,
     correct: &str,
     tags: Vec<String>,
-) -> Result<()> {
+) -> Result<i64> {
     let ap = AntiPattern {
         id: None,
         description: description.to_string(),
@@ -226,7 +226,7 @@ pub fn add_anti_pattern(
     } else {
         println!("An identical anti-pattern is already stored (id: {}) — nothing added.", id);
     }
-    Ok(())
+    Ok(id)
 }
 
 pub fn remove_anti_pattern(store: &Store, id: i64) -> Result<()> {

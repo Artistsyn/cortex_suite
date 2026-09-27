@@ -27,16 +27,39 @@ pub struct Mechanism {
     pub expect_days: f64,
     /// What it means when this one goes quiet.
     pub when_idle: &'static str,
+    /// Rows to count, when the table is shared (a SQL condition, or "" for all).
+    /// hook_heartbeat holds one row per hook, and reading the whole table would
+    /// let one hook's beat make another look alive.
+    pub filter: &'static str,
+    /// Only some workspaces use it (VS Code's command hooks): never having run
+    /// is "not in use", not a fault to repeat at every closeout.
+    pub optional: bool,
 }
 
 /// Everything with a heartbeat worth watching, and how often to expect one.
 pub const MECHANISMS: &[Mechanism] = &[
+    // The Bash observer. It used to be labelled "token saving", and for months
+    // it computed compacted copies no agent ever received; it now records what
+    // it saw and claims nothing (see push.rs).
     Mechanism {
-        label: "compact_output (token saving)",
+        label: "Bash hook (observes commands)",
         table: "compression_savings",
         ts_col: "saved_at",
         expect_days: 2.0,
         when_idle: "the Bash hook is not installed or not reaching the server",
+        filter: "",
+        optional: false,
+    },
+    // Output, not heartbeat: a push is recorded only when it went out as
+    // hook additionalContext -- the one form the model is shown.
+    Mechanism {
+        label: "pushes delivered to agents",
+        table: "push_log",
+        ts_col: "pushed_at",
+        expect_days: 30.0,
+        when_idle: "no trap has reached an agent; hooks must return additionalContext JSON (a server older than push.rs returns plain text, which the host discards)",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "test_signal (outcome scoring)",
@@ -44,6 +67,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "observed_at",
         expect_days: 2.0,
         when_idle: "builds are running but their verdicts are not being read",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "edit_guard (push retrieval)",
@@ -52,6 +77,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         // Designed to be rare — silence for a day is correct, a month is not.
         expect_days: 30.0,
         when_idle: "no edit has matched a trap; check the hook is installed",
+        filter: "",
+        optional: false,
     },
     // The HOOK, not its output. `challenges` stays empty whenever nobody
     // disagrees, which is most of the time and is correct — so watching that
@@ -62,6 +89,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "last_fired",
         expect_days: 2.0,
         when_idle: "the UserPromptSubmit hook is not installed or not reaching the server",
+        filter: "hook = 'note_challenge'",
+        optional: false,
     },
     Mechanism {
         label: "user corrections captured",
@@ -72,6 +101,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         // watched separately.
         expect_days: 60.0,
         when_idle: "no claim has been disputed; not a fault if the hook above is live",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "retrieval telemetry",
@@ -79,6 +110,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "retrieved_at",
         expect_days: 2.0,
         when_idle: "knowledge is not being consulted at all",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "knowledge markers committed",
@@ -86,6 +119,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "extracted_at",
         expect_days: 14.0,
         when_idle: "sessions are ending without capturing what they learned",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "closeout outcomes applied",
@@ -93,6 +128,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "applied_at",
         expect_days: 14.0,
         when_idle: "expected once test_signal scores sessions instead",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "skill candidates mined",
@@ -100,6 +137,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "last_seen_at",
         expect_days: 21.0,
         when_idle: "the consolidation pipeline is not clustering sessions",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "proposals raised",
@@ -107,6 +146,8 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "created_at",
         expect_days: 30.0,
         when_idle: "the self-learning loop is producing nothing to review",
+        filter: "",
+        optional: false,
     },
     Mechanism {
         label: "query gaps recorded",
@@ -114,6 +155,19 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "last_seen_at",
         expect_days: 21.0,
         when_idle: "either coverage is perfect or gap logging is broken",
+        filter: "",
+        optional: false,
+    },
+    // `cortex hook`, the command-hook entrypoint VS Code's agent hooks run. Its
+    // own heartbeat row, so it can never be mistaken for note_challenge's.
+    Mechanism {
+        label: "cortex hook (VS Code command hooks)",
+        table: "hook_heartbeat",
+        ts_col: "last_fired",
+        expect_days: 14.0,
+        when_idle: "VS Code's hooks are not reaching cortex; `cortex hooks-init --vscode` installs them",
+        filter: "hook = 'cli_hook'",
+        optional: true,
     },
 ];
 
@@ -132,6 +186,7 @@ pub enum Status {
 
 pub struct Reading {
     pub label: &'static str,
+    pub optional: bool,
     pub rows: i64,
     pub age_days: Option<f64>,
     pub status: Status,
@@ -154,9 +209,10 @@ fn read_one(store: &Store, m: &Mechanism) -> Reading {
         "SELECT COUNT(*),
                 MAX(CASE WHEN typeof({c}) IN ('integer','real') THEN CAST({c} AS INTEGER)
                          ELSE CAST(strftime('%s', {c}) AS INTEGER) END)
-         FROM {t}",
+         FROM {t}{w}",
         c = m.ts_col,
-        t = m.table
+        t = m.table,
+        w = if m.filter.is_empty() { String::new() } else { format!(" WHERE {}", m.filter) },
     );
     let row: rusqlite::Result<(i64, Option<i64>)> =
         store.conn().query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)));
@@ -164,6 +220,7 @@ fn read_one(store: &Store, m: &Mechanism) -> Reading {
     match row {
         Err(e) => Reading {
             label: m.label,
+            optional: m.optional,
             rows: 0,
             age_days: None,
             status: Status::CannotCheck(e.to_string()),
@@ -179,7 +236,7 @@ fn read_one(store: &Store, m: &Mechanism) -> Reading {
             } else {
                 Status::Live
             };
-            Reading { label: m.label, rows, age_days, status, when_idle: m.when_idle }
+            Reading { label: m.label, optional: m.optional, rows, age_days, status, when_idle: m.when_idle }
         }
     }
 }
@@ -189,8 +246,11 @@ fn read_one(store: &Store, m: &Mechanism) -> Reading {
 /// Returns an empty string when everything is live, so this can be appended to
 /// a report every session without becoming noise.
 pub fn render_problems(readings: &[Reading]) -> String {
-    let bad: Vec<&Reading> =
-        readings.iter().filter(|r| !matches!(r.status, Status::Live)).collect();
+    let bad: Vec<&Reading> = readings
+        .iter()
+        .filter(|r| !matches!(r.status, Status::Live))
+        .filter(|r| !(r.optional && r.status == Status::NeverFired))
+        .collect();
     if bad.is_empty() {
         return String::new();
     }
@@ -212,6 +272,7 @@ pub fn render_full(readings: &[Reading]) -> String {
     let mut out = String::from("MECHANISM                          ROWS      LAST FIRED\n");
     for r in readings {
         let when = match (&r.status, r.age_days) {
+            (Status::NeverFired, _) if r.optional => "not in use".to_string(),
             (Status::NeverFired, _) => "NEVER".to_string(),
             (Status::CannotCheck(_), _) => "cannot check".to_string(),
             (_, Some(d)) if d < 1.0 => format!("{:.1}h ago", d * 24.0),
@@ -221,12 +282,13 @@ pub fn render_full(readings: &[Reading]) -> String {
         let flag = match r.status {
             Status::Live => " ",
             Status::Idle => "!",
+            Status::NeverFired if r.optional => "-",
             Status::NeverFired => "x",
             Status::CannotCheck(_) => "?",
         };
         out.push_str(&format!("{flag} {:32} {:<9} {}\n", r.label, r.rows, when));
     }
-    out.push_str("\n  ! idle beyond its expected window   x never fired   ? cannot check\n");
+    out.push_str("\n  ! idle beyond its expected window   x never fired   ? cannot check   - optional, not in use\n");
     out
 }
 
@@ -244,6 +306,7 @@ mod tests {
     fn a_healthy_report_says_nothing() {
         let readings = vec![Reading {
             label: "x",
+            optional: false,
             rows: 5,
             age_days: Some(0.1),
             status: Status::Live,
@@ -256,6 +319,7 @@ mod tests {
     fn a_mechanism_that_never_fired_is_named() {
         let readings = vec![Reading {
             label: "test_signal",
+            optional: false,
             rows: 0,
             age_days: None,
             status: Status::NeverFired,
@@ -273,12 +337,41 @@ mod tests {
         // run must say so, not return a clean bill of health.
         let readings = vec![Reading {
             label: "gone",
+            optional: false,
             rows: 0,
             age_days: None,
             status: Status::CannotCheck("no such table".into()),
             when_idle: "",
         }];
         assert!(render_problems(&readings).contains("cannot check"));
+    }
+
+    #[test]
+    fn an_optional_mechanism_that_never_ran_is_not_in_use_not_broken() {
+        let r = |optional| Reading {
+            label: "cortex hook (VS Code command hooks)",
+            optional,
+            rows: 0,
+            age_days: None,
+            status: Status::NeverFired,
+            when_idle: "install it",
+        };
+        assert!(render_problems(&[r(true)]).is_empty(), "no VS Code hooks is not a fault");
+        assert!(render_full(&[r(true)]).contains("not in use"));
+        assert!(!render_problems(&[r(false)]).is_empty(), "a required mechanism still reports");
+    }
+
+    #[test]
+    fn one_hooks_heartbeat_never_makes_another_look_alive() {
+        let store = crate::test_support::TempStore::new("audit_filter").unwrap();
+        store.conn().execute(
+            "INSERT INTO hook_heartbeat (hook, fired, matched, last_fired) VALUES ('cli_hook', 1, 0, unixepoch())",
+            [],
+        ).unwrap();
+        let readings = read_all(&store);
+        let get = |label: &str| readings.iter().find(|r| r.label.starts_with(label)).unwrap();
+        assert_eq!(get("cortex hook").status, Status::Live);
+        assert_eq!(get("note_challenge").status, Status::NeverFired, "the cli beat is not note_challenge's");
     }
 
     #[test]
