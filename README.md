@@ -197,8 +197,19 @@ It reads VS Code's terminal tool (`run_in_terminal`) and its edit tools
 `apply_patch`, `edit_notebook_file`), plus user prompts. VS Code reports no
 exit codes and marks failed commands successful, so failures are read from the
 output text. Everything else, such as reads and searches, exits before the store
-is opened: about 20 ms. A call that does work takes about 40 ms. It is safe
-under VS Code's concurrent hooks: 90 simultaneous calls all answered correctly.
+is opened: about 3 ms of its own, 6–30 ms as VS Code's hook log reports it. A
+call that does work takes about 35 ms. It is safe under VS Code's concurrent
+hooks: 90 simultaneous calls all answered correctly.
+
+The timing differs from Claude Code, which waits for every hook. VS Code waits
+for PreToolUse but starts PostToolUse and moves on, so a PostToolUse reply is
+attached to the tool's result after the next request has already gone out: the
+model sees it one request late, and never if that request ends the turn. The
+edit guard therefore answers at PreToolUse, since the edit's text is all it
+reads, and counts a warning as delivered only when the edit's PostToolUse shows
+the edit went through, so a failed edit cannot silence its retry. A failing
+command's output exists only afterwards, so in VS Code that note arrives one
+request later than it does in Claude Code.
 
 ## Is it working?
 

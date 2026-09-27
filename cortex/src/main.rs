@@ -390,8 +390,8 @@ enum Command {
     /// from a hook (VS Code's agent hooks). Reads the hook's JSON on stdin,
     /// prints the hook reply or nothing, and always exits 0.
     Hook {
-        /// PostToolUse, PostToolUseFailure or UserPromptSubmit. Defaults to the
-        /// payload's own hook_event_name.
+        /// PreToolUse, PostToolUse, PostToolUseFailure or UserPromptSubmit.
+        /// Defaults to the payload's own hook_event_name.
         event: Option<String>,
     },
 }
@@ -1142,7 +1142,9 @@ fn run_hook(db_path: &Path, event: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// The VS Code hook file: `cortex hook` on PostToolUse and UserPromptSubmit.
+/// The VS Code hook file: `cortex hook` on PreToolUse, PostToolUse and
+/// UserPromptSubmit. PreToolUse carries the edit guard: VS Code waits for it,
+/// but not for PostToolUse, whose reply reaches the model a request late.
 ///
 /// VS Code runs hooks from the workspace root, so the binary and the store are
 /// written relative to it when they live inside it (portable), absolute when
@@ -1165,6 +1167,7 @@ fn vscode_hooks_config(root: &Path, db_path: &Path) -> Result<Value> {
         "timeout": 10
     }]);
     Ok(json!({ "hooks": {
+        "PreToolUse": entry("PreToolUse"),
         "PostToolUse": entry("PostToolUse"),
         "UserPromptSubmit": entry("UserPromptSubmit")
     }}))
@@ -1191,7 +1194,7 @@ fn run_hooks_init_vscode(root: Option<PathBuf>, db_path: &Path) -> Result<()> {
     let back: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     let command = back["hooks"]["PostToolUse"][0]["command"].as_str().unwrap_or("");
     println!(
-        "Wrote {} — VS Code agent hooks for PostToolUse and UserPromptSubmit run:\n  {command}\n\
+        "Wrote {} — VS Code agent hooks for PreToolUse, PostToolUse and UserPromptSubmit run:\n  {command}\n\
          VS Code reads .github/hooks/*.json when chat.useHooks is on (the default) and the\n\
          workspace is trusted. The same pushes as Claude Code: a recorded trap when an edit\n\
          or a failing build matches one, and a note when a message disputes a claim.",
@@ -4371,6 +4374,22 @@ mod tests {
         assert_eq!(v["model"], "keep-me");
 
         assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::AlreadyPresent);
+    }
+
+    /// VS Code shows a PostToolUse reply a request late, so the edit guard needs
+    /// PreToolUse registered too; the store path is explicit and root-relative.
+    #[test]
+    fn vscode_hook_file_registers_every_event_cortex_answers() {
+        let d = crate::test_support::TempDir::new("vscode_hooks").expect("temp dir");
+        let db = d.join("memory.db");
+        std::fs::File::create(&db).unwrap();
+        let cfg = vscode_hooks_config(d.path(), &db).unwrap();
+        for event in ["PreToolUse", "PostToolUse", "UserPromptSubmit"] {
+            let hook = &cfg["hooks"][event][0];
+            assert_eq!(hook["type"], "command", "{event}");
+            let command = hook["command"].as_str().unwrap_or_default();
+            assert!(command.ends_with(&format!(" --db memory.db hook {event}")), "{event}: {command}");
+        }
     }
 
     #[test]

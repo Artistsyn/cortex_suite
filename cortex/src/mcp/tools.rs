@@ -174,6 +174,30 @@ const EDIT_GUARD_MIN_SCORE: usize = 3;
 /// most four in total, and a match threshold higher than ordinary retrieval
 /// uses. Silence is the expected outcome and returns an empty string.
 fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
+    let Some(hit) = edit_guard_match(args, store, session_id, &[])? else {
+        return Ok(String::new());
+    };
+    edit_guard_record(store, session_id, hit.id, &hit.file, hit.text.len());
+    Ok(crate::push::deliver(args, &hit.text))
+}
+
+/// A trap the edit guard would raise for one edit, before anything is recorded.
+pub(crate) struct GuardHit {
+    pub id: i64,
+    pub file: String,
+    pub text: String,
+}
+
+/// Everything the edit guard decides and nothing it records, so a host that
+/// must warn before the edit lands (VS Code, at PreToolUse) can record the
+/// warning only once the edit has gone through. `exclude` holds traps already
+/// raised elsewhere in the same hook call.
+pub(crate) fn edit_guard_match(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+    exclude: &[i64],
+) -> Result<Option<GuardHit>, String> {
     // Edit sends new_string; Write sends content. Either may be absent.
     let added = args
         .get("added")
@@ -183,24 +207,25 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<Stri
         .unwrap_or("");
     // A one-line tweak carries no context to judge; matching it produces noise.
     if added.len() < 120 {
-        return Ok(String::new());
+        return Ok(None);
     }
 
     let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
     if crate::push::is_prose_file(file_path) {
-        return Ok(String::new());
+        return Ok(None);
     }
     // One warning per file per session. "Never the same trap twice" is not
     // enough on its own: a file gets edited fifteen times in a row during real
     // work, and a fresh trap on each of those edits is the wallpaper outcome by
     // a slower route. Caught by a test that expected silence and got a warning.
     if store.edit_guard_warned_file(session_id, file_path).unwrap_or(false) {
-        return Ok(String::new());
+        return Ok(None);
     }
-    let already = store.edit_guard_fired_ids(session_id).unwrap_or_default();
+    let mut already = store.edit_guard_fired_ids(session_id).unwrap_or_default();
     if already.len() >= EDIT_GUARD_SESSION_CAP {
-        return Ok(String::new());
+        return Ok(None);
     }
+    already.extend_from_slice(exclude);
 
     // Score the ADDED text against each trap. `wrong` carries the shape to
     // avoid, so it is the part worth matching; the description gives the topic.
@@ -211,17 +236,16 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<Stri
     // one found in at most a few traps.
     let tokens = hint_tokens(added);
     if tokens.is_empty() {
-        return Ok(String::new());
+        return Ok(None);
     }
     let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
     let bar = crate::push::Bar { min_score: EDIT_GUARD_MIN_SCORE, ..crate::push::EDIT_BAR };
     let identifiers = crate::push::identifier_tokens(added);
     let Some(m) = crate::push::best_trap(&aps, &tokens, &identifiers, &already, bar) else {
-        return Ok(String::new());
+        return Ok(None);
     };
     let (score, ap) = (m.score, m.ap);
-    let Some(id) = ap.id else { return Ok(String::new()) };
-    let _ = store.record_edit_guard_fire(session_id, id, file_path);
+    let Some(id) = ap.id else { return Ok(None) };
 
     // Short by construction. The point is to interrupt, not to teach; the full
     // entry is one get_anti_patterns call away and the description names it.
@@ -233,10 +257,16 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<Stri
         crate::push::clip(&ap.description, 300),
         crate::push::clip(&ap.correct, 420),
     );
-    // Recorded as DELIVERED only in the form the host shows the model -- the
-    // plain-text version of this warning was logged for months and never seen.
-    let _ = store.record_push(session_id, "edit_guard", &id.to_string(), Some(id), text.len());
-    Ok(crate::push::deliver(args, &text))
+    Ok(Some(GuardHit { id, file: file_path.to_string(), text }))
+}
+
+/// Record a warning as raised and DELIVERED. Delivered only in the form the host
+/// shows the model -- the plain-text version of this warning was logged for
+/// months and never seen -- and, for a warning given before its edit, only once
+/// the edit went through.
+pub(crate) fn edit_guard_record(store: &Store, session_id: &str, id: i64, file: &str, chars: usize) {
+    let _ = store.record_edit_guard_fire(session_id, id, file);
+    let _ = store.record_push(session_id, "edit_guard", &id.to_string(), Some(id), chars);
 }
 
 // ── compact_output ──────────────────────────────────────────────────────────

@@ -377,10 +377,48 @@ that measure.
     * Its own heartbeat row: `fired` shows it as "not in use" until
       VS Code first runs it.
 
-    **Remaining:** one Copilot session in which Copilot confirms it saw a
-    `[cortex]` line. Caveat: a command hook's session id is the host's, not the
-    MCP server's, so per-session dedupe works but survival crediting will not
-    join until the two are mapped. The same entrypoint would also serve item 11.
+    **First live session, 2026-09-27: the reply arrived one request late.**
+    Copilot (gpt-5.4-mini) created a probe file with `apply_patch` and said no
+    `[cortex]` context arrived. Everything up to VS Code worked: its hooks log
+    shows cortex's reply (trap #344), and `push_log` recorded it. The drop is in
+    Copilot Chat 0.61's tool loop. The function that runs the PostToolUse hook
+    and appends its `additionalContext` to the tool result (as
+    `<PostToolUse-context>`) is called without `await`, and the result is
+    rendered into the next request straight away. That request started at
+    about 22:56:54.429 (4,444 ms, ending 58.873). The hook started at 54.436
+    and replied at 54.470. PreToolUse is awaited, and its context is appended
+    to the same result synchronously.
+
+    **Fix:** `cortex hook PreToolUse` runs the edit guard, since the edit's text
+    is all it reads. The warning is kept as an offer (`edit_guard_offers`) and
+    becomes a delivered push at that call's PostToolUse, which VS Code runs
+    only when the tool succeeded, so an edit that throws cannot use up the
+    warning. Parallel edits in one round share one warning (a 1 s window,
+    checked and claimed in one statement). Failure recall needs the output, so
+    it stays on PostToolUse and is one request late in VS Code.
+    `hooks-init --vscode` now registers PreToolUse. Without it (an old hook
+    file, or Claude Code), PostToolUse judges the edit as before.
+
+    Verified:
+    * 5 new tests (warn before, count after; a failed edit's retry; parallel
+      edits; the PostToolUse-only path; the hook file). 282 pass.
+    * The captured `apply_patch` call replayed through the binary against a
+      snapshot of the live store. PreToolUse returns #344 with no
+      `permissionDecision`, and nothing is counted. PostToolUse is silent and
+      records one push.
+
+    **Verified live, 2026-09-27 (a new chat, mai-code-1.1-flash):** the
+    `create_file` result carried the `<PreToolUse-context>` note, Copilot quoted
+    trap #344 word for word, and `push_log` recorded one push with no offers
+    left. VS Code's saved chat (`workspaceStorage/<hash>/chatSessions/<id>.jsonl`,
+    `requests[n].result.metadata.toolCallResults`) confirms both halves. There,
+    the first chat's `apply_patch` result holds the late `<PostToolUse-context>`
+    note its model never saw, and the new chat's result holds the PreToolUse note
+    its model quoted.
+
+    **Remaining caveat:** a command hook's session id is the host's, not the MCP
+    server's, so per-session dedupe works but survival crediting will not join
+    until the two are mapped. The same entrypoint would also serve item 11.
 
 ### Tranche 3 (research-grade)
 

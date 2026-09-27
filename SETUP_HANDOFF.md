@@ -506,16 +506,33 @@ default) and the workspace is trusted. Things worth knowing:
   output text), and the edit tools `replace_string_in_file`,
   `multi_replace_string_in_file`, `create_file`, `apply_patch` and
   `edit_notebook_file`.
-* It exits in about 20 ms, before opening the store, for everything else;
-  about 40 ms when it has work.
+* It exits before opening the store for everything else: about 3 ms of its
+  own, 6–30 ms as VS Code's hook log reports it. About 35 ms when it has work.
+* VS Code waits for PreToolUse hooks but not for PostToolUse ones. A
+  PostToolUse reply is attached to the tool's result after the next request
+  has gone out, so the model sees it one request late (Copilot Chat 0.61, read
+  from its source: `executePostToolUseHook` is not awaited). So the edit guard
+  answers at **PreToolUse**, and the warning counts as delivered only when that
+  edit's PostToolUse arrives, which VS Code sends only if the edit succeeded.
+  A failed edit therefore cannot silence its retry. Failure recall needs the
+  command's output, so it stays on PostToolUse and arrives a request late.
 * Sessions are keyed `vscode:<chat session id>`, so they count in the
   scoreboard, but survival crediting does not join them to the MCP server's
   session.
 * `fired` shows "cortex hook (VS Code command hooks)": "not in use" until the
   first run, live after.
 
-Copilot's transcripts record neither hook output nor token usage, so to confirm
-delivery, ask Copilot whether it saw the `[cortex]` line.
+Copilot's transcripts record neither hook output nor token usage. Two places
+do, without asking the model:
+
+* VS Code's hooks log shows every hook's input and output:
+  `~/Library/Application Support/Code/logs/<stamp>/window1/exthost/GitHub.copilot-chat/GitHub Copilot Chat Hooks.log`
+  (`%APPDATA%\Code\logs\...` on Windows).
+* The saved chat, `workspaceStorage/<hash>/chatSessions/<chat id>.jsonl`, keeps
+  each tool result as the model got it. The results are under
+  `requests[n].result.metadata.toolCallResults`. A `<PreToolUse-context>` block
+  there was in the model's input. A `<PostToolUse-context>` block proves only
+  that it was attached, not that it arrived in time.
 
 **Link a trap to its failure.** `anti-pattern add … --resolves '<signature>'`
 records the trap and links it to the failure (`recurring_errors.anti_pattern_id`,
@@ -687,6 +704,7 @@ names.
 | Failed builds missing from the scoreboard | hook set older than v3 (no `PostToolUseFailure` entry) | `./.cortex/cortex.sh hooks-init`; see 2.15 |
 | `hook_non_blocking_error: MCP server 'cortex' not connected` | the server was down (usually mid-deploy) | none needed; hooks are non-blocking and resume when it reconnects |
 | Copilot never gets `[cortex]` warnings | no `.github/hooks/cortex.json`, `chat.useHooks` off, or the workspace is not trusted | `./.cortex/cortex.sh hooks-init --vscode`; check the setting and Workspace Trust; `fired` shows whether `cortex hook` ever ran |
+| Copilot says an edit's warning never arrived, though `push_log` has it | a `cortex.json` written before PreToolUse was registered: VS Code shows a PostToolUse reply one request late | rerun `./.cortex/cortex.sh hooks-init --vscode`, which adds PreToolUse |
 
 **Health checks:**
 ```bash
