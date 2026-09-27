@@ -330,9 +330,38 @@ that measure.
     failure event. **Audit hook installed 2026-09-27** in the FlowMake workspace
     (`.github/hooks/cortex-audit.*`: every documented event; logs to
     `.cortex/vscode-hook-audit.jsonl`; no stdout, exit 0, ~20 ms, 20 MB cap;
-    tested with bash and pwsh). Next: one Copilot agent session that edits a
-    file and runs a passing and a failing command, then
-    `python3 .github/hooks/cortex-audit-summary.py`. Caveat: a command hook's session id is the host's, not the
+    tested with bash and pwsh).
+
+    **Captured and analysed 2026-09-27.** One Copilot agent session (13 hook
+    records), cross-checked against Copilot's own transcripts for this
+    workspace (12 sessions, 4,643 tool calls):
+
+    | Fact | Evidence |
+    |---|---|
+    | Common input fields | `session_id` (UUID), `hook_event_name`, `timestamp`, `cwd` (the workspace root), `transcript_path`, and `tool_use_id` on tool events |
+    | Terminal tool | `run_in_terminal`, `tool_input` = `{command, explanation, goal, mode}` (the tool's own arguments, identical to the transcript's) |
+    | Terminal result | `tool_response` is **one string**: the terminal's text (prompt, command echo, output). Sometimes it is prefixed "Note: The tool simplified the command to `…`". **No exit code** anywhere. |
+    | Failed commands | Reported as ordinary `PostToolUse`. Copilot's own transcript marks them `success=True` too (it means "the tool ran"). Failure can only be read from the output text, which `test_signal::classify` already does. |
+    | Edit tools (from transcripts) | `replace_string_in_file` {filePath, oldString, newString} ×858; `multi_replace_string_in_file` {replacements[]: {filePath, oldString, newString}} ×54; `apply_patch` {input: "*** Begin Patch…" with `+` lines} ×51; `create_file` {filePath, content} ×21; `edit_notebook_file` {filePath, newCode} ×3 |
+    | Concurrency | Hooks run **concurrently** (one call's PostToolUse overlaps the next call's PreToolUse). A shared append-only log interleaved two records, so the audit now writes one file per call. The cortex hook must be concurrency-safe; the SQLite store with a busy timeout is. |
+    | Copilot transcripts | JSONL records: `session.start`, `user.message`, `assistant.turn_*`, `assistant.message`, `tool.execution_start` (arguments) and `tool.execution_complete` (only `success`). **No tool output and no token usage**, so they cannot confirm delivery or give a bill. `COPILOT_OTEL_FILE_EXPORTER_PATH` suggests an OpenTelemetry file that might. |
+    | Environment | `VSCODE_*` variables and `COPILOT_OTEL_FILE_EXPORTER_PATH`; no Claude-style project-dir variable. Use `cwd` from the payload. |
+
+    Entrypoint design, confirmed by the above: `cortex hook <event>` reads the
+    payload on stdin and normalises it.
+    * Terminal: Claude `Bash` → `tool_input.command` plus `tool_response.stdout`
+      and `.stderr` (or `error` on PostToolUseFailure); VS Code
+      `run_in_terminal` → `tool_input.command` plus the `tool_response` string.
+    * Edit text: Claude `Edit.new_string`, `Write.content`,
+      `MultiEdit.edits[].new_string`; VS Code `replace_string_in_file.newString`,
+      `create_file.content`, `multi_replace_string_in_file.replacements[].newString`,
+      the `+` lines of `apply_patch.input`, and `edit_notebook_file.newCode`.
+
+    It runs the same `push.rs` logic, keys dedupe on `<host>:<session_id>`,
+    and prints the `hookSpecificOutput.additionalContext` JSON. There are no
+    matchers: it filters by `tool_name` itself. A verification run afterwards
+    needs Copilot to report whether it saw a `[cortex]` line, since its
+    transcripts do not record hook output. Caveat: a command hook's session id is the host's, not the
     MCP server's, so per-session dedupe works but survival crediting will not
     join until the two are mapped. The same entrypoint would also serve item 11.
 
