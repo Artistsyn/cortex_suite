@@ -305,6 +305,31 @@ that measure.
 11. **Hook robustness.** 672 historical "not connected" errors were clustered
     on deploy days. Consider command-type hooks that call the CLI (always the
     current binary, no connection dependency; ~50–80 ms per event).
+12. **VS Code Copilot push parity.** Copilot keeps everything it had: all MCP
+    tools via `.vscode/mcp.json`, the pull workflow in
+    `copilot-instructions.md`, skills in `.github/prompts`, and its sessions in
+    the scoreboard's store metrics. It does not get pushes or build/test
+    observation, and never did. VS Code's
+    [agent hooks (Preview)](https://code.visualstudio.com/docs/agent-customization/hooks):
+    * read `.github/hooks/*.json`, and `.claude/settings*.json` only with
+      `chat.useClaudeHooks`;
+    * support **only `command` hooks**, not `mcp_tool`;
+    * have **no PostToolUseFailure** event;
+    * ignore matchers in Claude-format files;
+    * share the `hookSpecificOutput.additionalContext` output contract.
+
+    Plan:
+    * a host-agnostic `cortex hook <event>` CLI entrypoint that reads the hook
+      JSON on stdin (Claude's `Bash`/`Edit`/`Write` and VS Code's
+      terminal/edit tool names), runs the same `push.rs` logic, and prints the
+      JSON;
+    * `hooks-init --vscode`, which writes `.github/hooks/cortex.json`.
+
+    Before shipping, capture VS Code's exact tool names and input fields with an
+    audit hook, including how a failed terminal command is reported without a
+    failure event. Caveat: a command hook's session id is the host's, not the
+    MCP server's, so per-session dedupe works but survival crediting will not
+    join until the two are mapped. The same entrypoint would also serve item 11.
 
 ### Tranche 3 (research-grade)
 
