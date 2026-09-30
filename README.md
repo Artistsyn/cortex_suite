@@ -298,6 +298,10 @@ things the loop cannot talk its way past:
   `backfill`, after a backup, and `undo --class backfill` takes them all back.
   Coverage on this workspace went from 65% to 99%.
 
+Skill drafts are triaged the same way (`cortex knowledge skills`). A detector
+template with its placeholders is rejected. An authored, concrete draft goes out
+as a trial, and is kept only if something invokes it within 60 days.
+
 Once a week a scheduled session (`cortex-weekly-maintenance`) judges look-alike
 pairs and writes the digest (`cortex knowledge digest`). Its verdicts count only
 after it agrees with hand labels it cannot see, at 90% or better. Cue changes are

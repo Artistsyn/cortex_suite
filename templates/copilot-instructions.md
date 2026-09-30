@@ -48,9 +48,10 @@ you see the same thing. Use both.
 
 ## When you get stuck
 
+A failed build or test that matches a recorded trap is pushed to you by the failure hook; the rows below cover what it cannot see.
+
 | Situation | Call |
 |---|---|
-| First approach failed | `recall <error keyword>` before trying a second |
 | Two attempts failed | Stop. `recall` or `semantic_search` before a third |
 | Unfamiliar compiler error | `semantic_search <description>` first |
 | Compiles but behaves wrong | `recall <behaviour>` — may be a known runtime trap |

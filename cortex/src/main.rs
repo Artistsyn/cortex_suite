@@ -42,6 +42,7 @@ mod knowledge_sim;
 mod reconcile;
 mod maintenance;
 mod cue_miner;
+mod skill_triage;
 mod watcher;
 
 use std::collections::{HashSet, VecDeque};
@@ -836,6 +837,15 @@ enum KnowledgeCmd {
     },
     /// The week in one page (also written to .cortex/loop-digest.md).
     Digest,
+    /// Issue the maintenance queue as the weekly run would, and print it.
+    /// It WRITES queue rows: run it against a copy of the store to preview.
+    Queue,
+    /// Skill drafts: reject noise, publish credible ones as trials, retire
+    /// trials nobody used in 60 days (plan L5). Runs in consolidation too.
+    Skills {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Challenge-cue tuning from labelled prompts (plan L4). Default: run the
     /// miner on every labelled miss. `--fires` lists what fires, for labelling.
     Cues {
@@ -3399,6 +3409,21 @@ fn run_knowledge(cmd: KnowledgeCmd, db_path: &Path) -> Result<()> {
                     println!("  {:<15} {:<44} {detail}", format!("{:?}", v.standing), v.candidate.describe());
                 }
             }
+            Ok(())
+        }
+        KnowledgeCmd::Skills { dry_run } => {
+            let prefs = prefs::load(&root.join(".cortex/prefs.toml")).unwrap_or_default();
+            let skills_dir = root.join(&prefs.skills.skills_dir);
+            let t = skill_triage::run(&store, &root, &skills_dir, scoreboard::transcripts_dir_for(&root).as_deref(), dry_run)?;
+            let s = t.summary();
+            println!("{}", if s.is_empty() { "No drafts to triage and no trials due.".to_string() } else { s });
+            if dry_run {
+                println!("(dry run: nothing changed)");
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Queue => {
+            println!("{}", maintenance::queue(&store, &root)?);
             Ok(())
         }
         KnowledgeCmd::Digest => {

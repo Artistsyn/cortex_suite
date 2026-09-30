@@ -1,6 +1,6 @@
 # Self-learning loop: automate the learning, keep the evaluators out of its reach
 
-**Date:** 2026-09-30. **Status:** approved 2026-09-30. **L0, L1 and L2 are built and live; L3 is built and waits for its first run; L4's first test failed** (below). L5 follows; L6 waits 8 weeks. Each phase states what it builds, the measurement that accepts it, the measurement that kills it, and what it costs.
+**Date:** 2026-09-30. **Status:** approved 2026-09-30. **L0, L1 and L2 are built and live; L3 is built and waits for its first run; L4's first test failed; L5 skills are automated, and its instruction A/B was measured and deferred** (below). L6 waits 8 weeks. Each phase states what it builds, the measurement that accepts it, the measurement that kills it, and what it costs.
 
 ## Status: L0 and L1, built 2026-09-30
 
@@ -64,7 +64,7 @@ Seeding opened 85 pairs on the live store. They are marked as announced, so they
 |---|---|
 | `loop_queue`, `loop_judge`, `loop_digest` MCP tools | `maintenance.rs` |
 | Blind calibration | the queue mixes 30 hand-labelled pairs with real open pairs under opaque item numbers; tests check it never names which is which |
-| Trust rule | verdicts on real pairs act only at >= 90% agreement over >= 20 calibration answers, scored by action (merge / keep / dispute), and only while `.cortex/corpora/pair_labels.json` still matches its registered hash (`pair-labels@007db6eab668`) |
+| Trust rule | verdicts on real pairs act only at >= 90% agreement over >= 20 calibration answers, scored by action (merge / keep / dispute), and only while `.cortex/corpora/pair_labels.json` still matches its registered hash (evaluator `pair-labels`; `cortex knowledge evaluator check pair-labels`) |
 | Cost | the run's own cost read from its transcript (marker `cortex-weekly-maintenance`); STOP after two over-budget runs |
 | Scheduled task `cortex-weekly-maintenance` | Mondays 09:02, a fresh session, at most 30 calls |
 
@@ -84,7 +84,7 @@ Built:
 - A candidate generator (capitalised words; 1-4-word n-grams in every list).
 - The replay gate.
 - `cortex knowledge cues [--before] [--fires]`.
-- 47 prompts labelled (24 limit disputes, 16 other disputes, 7 none), registered as `challenge-labels@4ad6f578b5b1`.
+- 47 prompts labelled (24 limit disputes, 16 other disputes, 7 none), registered with the corpus as evaluator `challenge-labels`. Backing the corpus up on 2026-09-30 found a pasted API key in it; the key was redacted and the evaluator re-registered.
 
 What the test showed, starting from the lists as they were before the hand fix:
 
@@ -102,6 +102,35 @@ What the test showed, starting from the lists as they were before the hand fix:
 So cue changes are not automated. The miner stays as the replay tool for tuning by hand or by an agent. It shows at once which general candidates break a labelled prompt, and it says honestly when there is no evidence either way.
 
 The next test is recorded on wall #14: the calibrated maintenance judge proposes a few dispute-language candidates per miss, and they go through the same gate. Promotion would still need forward evidence from shadow mode and a runtime cue overlay; neither is built, on purpose, until that test says the proposals are worth it.
+
+## Status: L5, and the L3-L4 bridge (2026-09-30, overnight)
+
+**Skills: automated.** `skill_triage.rs` runs in the consolidation pipeline and as `cortex knowledge skills [--dry-run]`.
+
+- **Rules, backtested on every skill decision so far (15 of 15 agree):**
+  - A detector template still holding its "[Edit: ...]" placeholders, or with no concrete "use when", is rejected. That covers all 3 you rejected and both drafts that were waiting.
+  - An authored draft with no placeholder, a concrete "use when" and more than 1,500 characters is published as a trial. That covers all 10 you approved.
+  - Anything else stays in the review queue.
+- **Trials:** one invoked within 60 days is approved; invocations are counted from transcripts (the Skill tool, or `/<name>`). One nobody used is retired: unpublished, with its draft kept.
+- **Live:** the two waiting templates were rejected (ledger #105, #106).
+
+**The L3-L4 bridge: built.** The weekly queue now carries wall #14's recorded test once. The 3 real misses of the pre-refinement cues go to the calibrated judge as MISS items; it proposes up to 5 cues each, and the replay gate scores them. Proposals are reported in the digest and change nothing. The scheduled task's prompt was updated to match. A preview on a copy of the store issued 48 items: 30 calibration, 15 real pairs and 3 misses, with nothing in the text saying which items are checked.
+
+**Instruction A/B: measured, then not built.** The plan's first candidate was CLAUDE.md's "recall before trying a second approach".
+
+| Measure (last 14 days, 16 sessions, keys consistent) | Result |
+|---|---|
+| Failed build or test runs followed by another run | 466 |
+| Memory consulted in between | 8 (1.7%) |
+
+- The rule is almost never followed, as the manual itself notes of optional instructions.
+- Enforcing it would cost about 50k input-equivalents per lookup inside a long session, roughly 23M a fortnight.
+- The failure hook already pushes a known trap automatically, and repeats after a trap is recorded stand at 0.
+- An A/B test would measure compliance, not benefit.
+
+So no A/B machinery is built until there is a behaviour whose BENEFIT can be measured at this volume.
+
+**Decided 2026-09-30:** the row was removed from both CLAUDE.md files and both Copilot instruction files. In its place is one line saying the failure hook pushes a recorded trap that matches a failure.
 
 **One slip on my side, recorded as a correction:** the first replay ran a CLI built before the fix; `cargo test` builds a separate binary.
 

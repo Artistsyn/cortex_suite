@@ -915,6 +915,28 @@ fn loop_tools() -> Vec<Value> {
                             },
                             "required": ["item", "verdict"]
                         }
+                    },
+                    "proposals": {
+                        "type": "array",
+                        "description": "For MISS items: up to 5 cues each.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "item": { "type": "integer" },
+                                "cues": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "list": { "type": "string", "enum": ["dispute", "limit", "emphasis", "phrase"] },
+                                            "text": { "type": "string" }
+                                        },
+                                        "required": ["list", "text"]
+                                    }
+                                }
+                            },
+                            "required": ["item", "cues"]
+                        }
                     }
                 },
                 "required": ["answers"]

@@ -280,23 +280,48 @@ pub struct Verdict {
     pub accepted: bool,
 }
 
+/// One candidate for the miss at `trigger`, judged by the gate. A candidate
+/// that does not even fix its miss stands as `OnlyItsTrigger` at best, and is
+/// flagged by `eval.fixed` not containing the trigger.
+pub fn judge_candidate(corpus: &Corpus, labels: &HashMap<usize, Label>, base: &CueSet, trigger: usize, c: Candidate) -> Verdict {
+    let eval = evaluate(corpus, labels, base, &c);
+    let standing = if !eval.broke.is_empty() {
+        Standing::Breaks
+    } else if !eval.unlabelled.is_empty() {
+        Standing::WaitsOnLabels
+    } else if eval.fixed.contains(&trigger) && eval.fixed.iter().any(|&i| i != trigger) {
+        Standing::Promotable
+    } else {
+        Standing::OnlyItsTrigger
+    };
+    Verdict { candidate: c, eval, accepted: standing == Standing::Promotable, standing }
+}
+
+/// A proposed cue as a person or a judge writes it: which list, and the text.
+pub fn parse_proposal(list: &str, text: &str) -> Option<Candidate> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let placement = match list.trim().to_lowercase().as_str() {
+        "dispute" | "generic" => Placement::Generic,
+        "limit" => Placement::Limit,
+        "emphasis" => Placement::Emphasis,
+        "phrase" | "word" => Placement::Phrase,
+        _ => return None,
+    };
+    let text = match placement {
+        Placement::Emphasis => format!(" {} ", text.trim_matches(' ')),
+        _ => text.to_lowercase(),
+    };
+    Some(Candidate { placement, text })
+}
+
 /// Every candidate from the miss at `trigger` that fixes it, judged by the gate.
 pub fn mine(corpus: &Corpus, labels: &HashMap<usize, Label>, base: &CueSet, trigger: usize) -> Vec<Verdict> {
     let mut out: Vec<Verdict> = candidates(&corpus.prompts[trigger].1)
         .into_iter()
-        .map(|c| {
-            let eval = evaluate(corpus, labels, base, &c);
-            let standing = if !eval.broke.is_empty() {
-                Standing::Breaks
-            } else if !eval.unlabelled.is_empty() {
-                Standing::WaitsOnLabels
-            } else if eval.fixed.iter().any(|&i| i != trigger) {
-                Standing::Promotable
-            } else {
-                Standing::OnlyItsTrigger
-            };
-            Verdict { candidate: c, eval, accepted: standing == Standing::Promotable, standing }
-        })
+        .map(|c| judge_candidate(corpus, labels, base, trigger, c))
         .filter(|v| v.eval.fixed.contains(&trigger))
         .collect();
     // Best standing first, then the most general (fewest words): a general cue

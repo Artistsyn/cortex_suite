@@ -255,7 +255,22 @@ fn tool_loop_judge(args: &Value, store: &Store, repo_root: &Path) -> Result<Stri
         .iter()
         .filter_map(|a| Some((a.get("item")?.as_i64()?, a.get("verdict")?.as_str()?.to_string())))
         .collect();
-    crate::maintenance::judge(store, repo_root, &answers).map_err(|e| e.to_string())
+    let proposals: Vec<(i64, Vec<(String, String)>)> = args
+        .get("proposals")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            let cues = p
+                .get("cues")?
+                .as_array()?
+                .iter()
+                .filter_map(|c| Some((c.get("list")?.as_str()?.to_string(), c.get("text")?.as_str()?.to_string())))
+                .collect();
+            Some((p.get("item")?.as_i64()?, cues))
+        })
+        .collect();
+    crate::maintenance::judge_with_proposals(store, repo_root, &answers, &proposals).map_err(|e| e.to_string())
 }
 
 /// Settle the disputes on an entry with a fact.

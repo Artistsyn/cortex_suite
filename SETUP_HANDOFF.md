@@ -634,6 +634,8 @@ What you do instead, about a minute a week:
 ./.cortex/cortex.sh knowledge status     # automatic commit, audit precision, capture health
 ./.cortex/cortex.sh knowledge undo ap:<id>        # take one entry back (nothing is deleted)
 ./.cortex/cortex.sh knowledge undo --class backfill   # take a whole group back
+./.cortex/cortex.sh knowledge digest           # the week in one page (also .cortex/loop-digest.md)
+./.cortex/cortex.sh knowledge skills --dry-run  # what skill triage would reject, trial or retire
 ```
 
 A wrong or useless verdict retracts the entry on the spot. More than 3 bad

@@ -43,6 +43,8 @@ pub struct PipelineResult {
     pub drift_based_proposals:  usize,
     pub meta_proposals_staged:  usize,
     pub last_run_updated:       bool,
+    /// What skill triage did this run (L5): rejections, trials, retirements.
+    pub skill_triage:           String,
 }
 
 impl PipelineResult {
@@ -122,6 +124,16 @@ pub fn run(
                 eprintln!("[consolidator] warn: could not draft skill {}: {e}", candidate.name);
             }
         }
+    }
+
+    // ── Stage 3b: Triage skill drafts and review trials (L5) ─────────────────
+    // Noise is rejected, credible drafts become trials, unused trials retire.
+    // Everything it cannot place stays in the review queue for a person.
+    let skills_dir = repo_root.join(&prefs.skills.skills_dir);
+    let transcripts = crate::scoreboard::transcripts_dir_for(repo_root);
+    match crate::skill_triage::run(store, repo_root, &skills_dir, transcripts.as_deref(), false) {
+        Ok(t) => result.skill_triage = t.summary(),
+        Err(e) => eprintln!("[consolidator] warn: skill triage failed: {e}"),
     }
 
     // ── Stage 4: Gap-driven proposals (Phase 2: gated) ───────────────────────

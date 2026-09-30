@@ -121,9 +121,10 @@ Three calls beat one debug cycle.
 
 Consult memory at every "I'm not sure" moment, not only at session start.
 
+A failed build or test that matches a recorded trap is pushed to you by the failure hook; the rows below cover what it cannot see.
+
 | Situation | Call |
 |---|---|
-| First approach failed | `recall <error keyword>` **before** trying a second |
 | Two attempts failed | STOP. `recall` / `semantic_search` before a third |
 | Unfamiliar compiler error | `semantic_search <description>` before reading source |
 | Compiles but behaves wrong | `recall <behaviour>` — may be a known runtime trap |

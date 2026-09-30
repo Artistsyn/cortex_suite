@@ -21,6 +21,19 @@ use serde_json::Value;
 use crate::memory::Store;
 
 pub const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS loop_cue_proposals (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    item        INTEGER NOT NULL,
+    miss_line   INTEGER NOT NULL,
+    placement   TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    fixes_miss  INTEGER NOT NULL,
+    standing    TEXT NOT NULL,
+    fixed       INTEGER NOT NULL,
+    broke       INTEGER NOT NULL,
+    unlabelled  INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+);
 CREATE TABLE IF NOT EXISTS loop_queue (
     item        INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL,
@@ -31,6 +44,13 @@ CREATE TABLE IF NOT EXISTS loop_queue (
     acted       TEXT NOT NULL DEFAULT ''
 );
 ";
+
+/// The challenge-cue corpus and its labels (plan L4), registered together.
+pub const CUE_CORPUS: &str = ".cortex/corpora/prompts.jsonl";
+pub const CUE_LABELS: &str = ".cortex/corpora/challenge_labels.json";
+pub const CUE_EVALUATOR: &str = "challenge-labels";
+/// Cues a judge may propose per miss.
+pub const CUES_PER_MISS: usize = 5;
 
 /// Where the calibration labels live, relative to the workspace.
 pub const LABELS_FILE: &str = ".cortex/corpora/pair_labels.json";
@@ -164,6 +184,13 @@ pub fn queue(store: &Store, repo_root: &Path) -> Result<String> {
     for p in pairs {
         refs.push(("pair".into(), p.to_string()));
     }
+    // Wall #14's recorded test: the misses the cue lists had before the hand
+    // fix of 2026-09-30, for a judge that never saw that fix to propose cues.
+    // Asked once; only while the corpus and its labels are unchanged.
+    let misses = cue_test_misses(store, repo_root).unwrap_or_default();
+    for m in &misses {
+        refs.push(("cue-miss".into(), m.to_string()));
+    }
     if refs.is_empty() {
         return Ok("Nothing to judge this week.".into());
     }
@@ -183,7 +210,26 @@ pub fn queue(store: &Store, repo_root: &Path) -> Result<String> {
          -- related, but both stand\nThen call loop_judge once with every answer.\n\n",
         issued.len()
     );
+    let corpus = if misses.is_empty() { None } else { crate::cue_miner::load_corpus(&repo_root.join(CUE_CORPUS)).ok() };
+    if corpus.is_some() {
+        out.push_str(&format!(
+            "MISS items are messages that disputed a limit the assistant stated, which the reminder \
+             hook failed to notice. For each, propose up to {CUES_PER_MISS} cues that would catch it AND \
+             other messages disputing a limit: short dispute language (2-5 words), or one capitalised \
+             word used for emphasis. Not phrases only this message would contain. Give each a list: \
+             dispute (disputes something), limit (disputes a limit on its own), emphasis (a capitalised \
+             word), phrase (limit vocabulary that counts only beside a dispute phrase). Send them as \
+             loop_judge proposals.\n\n"
+        ));
+    }
     for (item, kind, r) in issued {
+        if kind == "cue-miss" {
+            if let Some(c) = &corpus {
+                let text: String = c.prompts[r.parse::<usize>()?].1.chars().take(700).collect();
+                out.push_str(&format!("Item {item} (MISS)\n  {}\n\n", text.replace('\n', " ")));
+            }
+            continue;
+        }
         let (table, older, newer) = if kind == "calibration" {
             let l = &labels[r.parse::<usize>()?];
             (l.kind.clone(), l.older, l.newer)
@@ -206,6 +252,20 @@ pub fn queue(store: &Store, repo_root: &Path) -> Result<String> {
 /// Record the judge's answers. Calibration items are scored; real pairs are
 /// acted on only if the judge is calibrated, and otherwise kept as suggestions.
 pub fn judge(store: &Store, repo_root: &Path, answers: &[(i64, String)]) -> Result<String> {
+    judge_with_proposals(store, repo_root, answers, &[])
+}
+
+/// `judge`, plus cue proposals for MISS items: `(item, [(list, text)])`.
+pub fn judge_with_proposals(
+    store: &Store,
+    repo_root: &Path,
+    answers: &[(i64, String)],
+    proposals: &[(i64, Vec<(String, String)>)],
+) -> Result<String> {
+    let mut proposal_report = String::new();
+    if !proposals.is_empty() {
+        proposal_report = score_proposals(store, repo_root, proposals)?;
+    }
     let labels = load_labels(repo_root)?;
     let mut real: Vec<(i64, i64, String)> = Vec::new();
     let (mut scored, mut agreed) = (0, 0);
@@ -221,6 +281,9 @@ pub fn judge(store: &Store, repo_root: &Path, answers: &[(i64, String)]) -> Resu
         let Some((kind, r, previous)) = row else { bail!("no queued item {item}") };
         if previous.is_some() {
             continue;
+        }
+        if kind == "cue-miss" {
+            bail!("item {item} is a MISS item: send cue proposals for it, not a verdict");
         }
         store.conn().execute(
             "UPDATE loop_queue SET verdict = ?2, answered_at = unixepoch() WHERE item = ?1",
@@ -240,10 +303,11 @@ pub fn judge(store: &Store, repo_root: &Path, answers: &[(i64, String)]) -> Resu
         }
     }
     let (n, agree) = calibration(store);
-    let mut out = format!(
+    let mut out = proposal_report;
+    out.push_str(&format!(
         "Calibration: {agreed}/{scored} agreed this run; {agree}/{n} overall ({:.0}%).\n",
         if n > 0 { 100.0 * agree as f64 / n as f64 } else { 0.0 }
-    );
+    ));
     match calibrated(store) {
         Ok(()) => {
             out.push_str("The judge is calibrated: its verdicts on real pairs act.\n");
@@ -269,6 +333,74 @@ pub fn judge(store: &Store, repo_root: &Path, answers: &[(i64, String)]) -> Resu
                 )?;
             }
         }
+    }
+    Ok(out)
+}
+
+/// The misses of the pre-2026-09-30 cue lists on the labelled corpus, if the
+/// corpus is present, its evaluator unchanged, and they were never asked.
+fn cue_test_misses(store: &Store, repo_root: &Path) -> Option<Vec<usize>> {
+    crate::loop_ledger::evaluator_stamp(store, CUE_EVALUATOR).ok()?;
+    let asked: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM loop_queue WHERE kind = 'cue-miss' AND verdict IS NOT NULL", [], |r| r.get(0))
+        .ok()?;
+    if asked > 0 {
+        return None;
+    }
+    let corpus = crate::cue_miner::load_corpus(&repo_root.join(CUE_CORPUS)).ok()?;
+    let labels = crate::cue_miner::load_labels(&repo_root.join(CUE_LABELS)).ok()?;
+    Some(crate::cue_miner::misses(&corpus, &labels, &crate::cue_miner::CueSet::before_refinement()))
+}
+
+/// Judge the proposed cues with the replay gate, against the lists as they
+/// were before the hand fix: wall #14's test.
+fn score_proposals(store: &Store, repo_root: &Path, proposals: &[(i64, Vec<(String, String)>)]) -> Result<String> {
+    let stamp = match crate::loop_ledger::evaluator_stamp(store, CUE_EVALUATOR) {
+        Ok(s) => s,
+        Err(e) => return Ok(format!("Cue proposals not scored: {e}\n")),
+    };
+    let corpus = crate::cue_miner::load_corpus(&repo_root.join(CUE_CORPUS))?;
+    let labels = crate::cue_miner::load_labels(&repo_root.join(CUE_LABELS))?;
+    let base = crate::cue_miner::CueSet::before_refinement();
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut promotable = Vec::new();
+    for (item, cues) in proposals {
+        let row: Option<(String, String)> = store
+            .conn()
+            .query_row("SELECT kind, ref FROM loop_queue WHERE item = ?1", params![item], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok();
+        let Some((kind, r)) = row else { bail!("no queued item {item}") };
+        if kind != "cue-miss" {
+            bail!("item {item} is not a MISS item");
+        }
+        let miss: usize = r.parse()?;
+        store.conn().execute(
+            "UPDATE loop_queue SET verdict = 'proposed', answered_at = unixepoch(), acted = ?2 WHERE item = ?1 AND verdict IS NULL",
+            params![item, format!("{} cue(s)", cues.len().min(CUES_PER_MISS))],
+        )?;
+        for (list, text) in cues.iter().take(CUES_PER_MISS) {
+            let Some(c) = crate::cue_miner::parse_proposal(list, text) else { continue };
+            let v = crate::cue_miner::judge_candidate(&corpus, &labels, &base, miss, c);
+            let fixes = v.eval.fixed.contains(&miss);
+            let standing = if fixes { format!("{:?}", v.standing) } else { "MissesItsTrigger".to_string() };
+            store.conn().execute(
+                "INSERT INTO loop_cue_proposals (item, miss_line, placement, text, fixes_miss, standing, fixed, broke, unlabelled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    item, miss as i64, format!("{:?}", v.candidate.placement), v.candidate.text, fixes, standing,
+                    v.eval.fixed.len() as i64, v.eval.broke.len() as i64, v.eval.unlabelled.len() as i64
+                ],
+            )?;
+            if v.accepted {
+                promotable.push(v.candidate.describe());
+            }
+            *counts.entry(standing).or_default() += 1;
+        }
+    }
+    let mut out = format!("Cue proposals (wall #14 test, judged by {stamp}): {counts:?}\n");
+    for p in &promotable {
+        out.push_str(&format!("  promotable: {p}\n"));
     }
     Ok(out)
 }
@@ -368,6 +500,24 @@ pub fn digest(store: &Store, repo_root: &Path, transcripts: Option<PathBuf>) -> 
             Err(why) => format!("suggestions only ({why})"),
         }
     ));
+    let proposed: Vec<(String, i64)> = store
+        .conn()
+        .prepare("SELECT standing, COUNT(*) FROM loop_cue_proposals GROUP BY standing ORDER BY standing")
+        .and_then(|mut s| {
+            let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    if !proposed.is_empty() {
+        o.push_str(&format!(
+            "- Cue proposals from the judge (wall #14 test): {}. Promotion still needs shadow evidence; nothing was changed.\n",
+            proposed.iter().map(|(s, n)| format!("{s} {n}")).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let trials = crate::skill_triage::trial_count(store);
+    if trials > 0 {
+        o.push_str(&format!("- Skills on trial: {trials} (approved if invoked within {} days, retired if not).\n", crate::skill_triage::TRIAL_DAYS));
+    }
     let capture: Option<(i64, i64, i64)> = store
         .conn()
         .query_row("SELECT fired, matched, last_fired FROM hook_heartbeat WHERE hook = 'capture_markers'", [], |r| {
@@ -505,6 +655,46 @@ mod tests {
         assert!(s.all_anti_patterns().unwrap().iter().any(|a| a.id == Some(real_old)), "nothing was applied");
         let v: String = s.conn().query_row("SELECT verdict FROM loop_pairs", [], |r| r.get(0)).unwrap();
         assert_eq!(v, "suggested conflict");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_miss_is_asked_once_and_its_proposals_are_judged_by_the_gate() {
+        let (s, root) = setup("cue_test");
+        let prompts = [
+            "So, but I want to give some pushback that we COULD further automate this",
+            "I'm open for pushback and other suggestions",
+            "we COULD try the other build later, no rush",
+            "carry on",
+        ];
+        let corpus: String = prompts.iter().map(|p| serde_json::json!({"ts": "2026-09-30T00:00", "text": p}).to_string() + "\n").collect();
+        std::fs::write(root.join(CUE_CORPUS), corpus).unwrap();
+        std::fs::write(root.join(CUE_LABELS), r#"{"labels": {"0": "limit", "1": "none", "2": "none", "3": "none"}}"#).unwrap();
+        crate::loop_ledger::register_evaluator(&s, CUE_EVALUATOR, &[root.join(CUE_CORPUS), root.join(CUE_LABELS)]).unwrap();
+
+        let text = queue(&s, &root).unwrap();
+        assert!(text.contains("(MISS)") && text.contains("give some pushback"), "{text}");
+        let miss_item: i64 = s.conn().query_row("SELECT item FROM loop_queue WHERE kind = 'cue-miss'", [], |r| r.get(0)).unwrap();
+        // A verdict is refused for a MISS item.
+        assert!(judge(&s, &root, &[(miss_item, "duplicate".into())]).is_err());
+        let proposals = vec![(miss_item, vec![
+            ("dispute".to_string(), "give some pushback".to_string()),
+            ("dispute".to_string(), "pushback".to_string()),
+            ("emphasis".to_string(), "COULD".to_string()),
+        ])];
+        let out = judge_with_proposals(&s, &root, &[], &proposals).unwrap();
+        assert!(out.contains("Cue proposals"), "{out}");
+        let standing = |t: &str| -> String {
+            s.conn().query_row("SELECT standing FROM loop_cue_proposals WHERE text = ?1", params![t], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(standing("give some pushback"), "OnlyItsTrigger");
+        assert_eq!(standing("pushback"), "Breaks", "fires on the invitation");
+        assert_eq!(standing(" COULD "), "Breaks", "fires on a message that disputes nothing");
+        // Asked once.
+        let again = queue(&s, &root).unwrap();
+        assert!(!again.contains("(MISS)"), "{again}");
+        let d = digest(&s, &root, None).unwrap();
+        assert!(d.contains("Cue proposals from the judge"), "{d}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
