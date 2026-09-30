@@ -573,21 +573,76 @@ The history behind each metric, and the ones it replaced, is in
 Embed markers in your responses as you discover things:
 
 ```
-[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
+[CORTEX-AP: description="..." tags="..."]wrong: ...
+correct: ...[/CORTEX-AP]
 [CORTEX-PATTERN: name="..." intent="..." trust="verified"]body[/CORTEX-PATTERN]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
+[CORTEX-WALL: claim="..." provenance="hardware" cheapest_test="..."]
+measured: what was measured @ where @ 2026-09-30
+[/CORTEX-WALL]
 ```
+
+`correct:` must start its own line; the split is per line.
 
 A pattern takes an optional `kind="constraint|policy|fact"` (default
 `procedure`). Constraints and policies are served in their own sections ahead
 of ordinary patterns in `get_context`.
 
-Then at the end of a verified task, the agent presents a summary and you reply
-`KNOWLEDGE COMMITTED` to commit them.
+A **WALL** records a limit: an agent accepted, declared, disputed or tested
+it. It needs:
 
-> On Claude Code the agent **must** pass its markers as `markers_text` to
-> `closeout_session`. There is no chat store to scrape outside VS Code, so
-> omitting it commits nothing and reports success.
+- a `provenance`: physics, hardware, platform, library-default,
+  library-version, our-design, implementation, authority or budget;
+- at least one evidence line, `kind: text @ source @ date`, with kind one of
+  measured, vendor-doc, paper, implementation, authority or inferred. A
+  vendor-doc or paper needs a date.
+
+An open wall must name `cheapest_test`. Closeout refuses a WALL that breaks
+these rules and says why in its report. The same rules apply to the
+`record_wall` and `update_wall` tools. A verdict (holds or moved) changes only
+with a new measurement or a dated source.
+
+**Seeding a workspace:** `cortex walls import walls.json`, a JSON array of
+`{claim, provenance, evidence: [{kind, text, source, date}], status, topic,
+untested, cheapest_test, revisit_when, revisit_after}`. Claims already on
+record are skipped. `cortex walls list` prints the ledger and its base rate.
+
+**Settling a limit dispute:** when a challenge disputed a limit,
+`resolve_challenge` requires `wall_id`, so the answer lands in the ledger. The
+only exception is the verdict `unresolved`.
+
+**When a dependency moves,** the ledger speaks up on its own. An edit to
+`Cargo.toml`, `Cargo.lock` or `package.json` (the edit hook), or `cargo update`
+output reporting `Updating <crate> vA -> vB` (the Bash observer), pushes every
+open or held wall bound to that package, once per wall per session. To bind a
+wall, name the package in `revisit_when`, e.g. "an openxr crate release". A
+`library-version` or `library-default` wall is also bound when its claim or
+topic names the package. Open walls whose `cheapest_test` states 30 minutes or
+less are flagged in retrieval: write the estimate as "(~20 min)", "(~1 h)" or
+"half a day".
+
+Markers commit themselves. On Claude Code the Stop and PreCompact hooks capture
+them from the transcript as they are written (installed by `cortex hooks-init`);
+in VS Code, `closeout_session` reads them from the chat. Nothing waits for you to
+approve each one: before 2026-09-30 that approval passed 99.3-100% of what reached
+it, while the protocol around it lost 123 of 411 markers across compactions.
+
+What you do instead, about a minute a week:
+
+```bash
+./.cortex/cortex.sh knowledge audit      # 5 random automatic commits: r / w / u / s
+./.cortex/cortex.sh knowledge status     # automatic commit, audit precision, capture health
+./.cortex/cortex.sh knowledge undo ap:<id>        # take one entry back (nothing is deleted)
+./.cortex/cortex.sh knowledge undo --class backfill   # take a whole group back
+```
+
+A wrong or useless verdict retracts the entry on the spot. More than 3 bad
+verdicts in the last 20 switch automatic commit off; markers are then staged, and
+the agent asks for `KNOWLEDGE COMMITTED` as before, until
+`cortex knowledge auto-commit on`.
+
+> `markers_text` is optional on Claude Code once the capture hooks are
+> installed. `cortex knowledge status` says whether the capture hook has run.
 
 ### What the system asks of you, and when
 

@@ -218,7 +218,10 @@ foreach ($doc in @(
     # Both launchers regardless of platform: a mixed team shares one workspace,
     # so the macOS developer needs cortex.sh from the same checkout.
     @{ src = 'templates\cortex.ps1';             dst = '.cortex\cortex.ps1';                   label = 'cortex.ps1' },
-    @{ src = 'templates\cortex.sh';              dst = '.cortex\cortex.sh';                    label = 'cortex.sh' }
+    @{ src = 'templates\cortex.sh';              dst = '.cortex\cortex.sh';                    label = 'cortex.sh' },
+    # The frontier skill, at the path each host reads.
+    @{ src = 'templates\skills\frontier\SKILL.md';   dst = '.claude\skills\frontier\SKILL.md';   label = 'frontier skill (Claude Code)' },
+    @{ src = 'templates\skills\frontier.prompt.md';  dst = '.github\prompts\frontier.prompt.md';  label = 'frontier prompt (Copilot)' }
 )) {
     $dstPath = Join-Path $Workspace $doc.dst
     New-Item -ItemType Directory -Force -Path (Split-Path $dstPath -Parent) | Out-Null

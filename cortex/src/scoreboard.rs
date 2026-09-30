@@ -143,6 +143,14 @@ pub struct Scoreboard {
     pub skills_candidate: i64,
     pub skills_drafted: i64,
     pub skills_approved: i64,
+    /// The self-learning loop (docs/self-learning-loop-2026-09-30.md).
+    pub loop_auto_commit: bool,
+    pub loop_counts: Vec<(String, String, i64)>,
+    pub loop_audited: i64,
+    pub loop_bad_in_window: i64,
+    pub loop_unaudited: i64,
+    /// Capture hook: runs, runs that found markers, last run (unix seconds).
+    pub capture_hook: Option<(i64, i64, i64)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenLedger>,
 }
@@ -327,6 +335,19 @@ pub fn compute(store: &Store, window_days: u32) -> Result<Scoreboard> {
         skills_candidate: count("SELECT COUNT(*) FROM skill_candidates WHERE status = 'candidate'"),
         skills_drafted: count("SELECT COUNT(*) FROM skill_candidates WHERE status = 'drafted'"),
         skills_approved: count("SELECT COUNT(*) FROM skill_candidates WHERE status = 'approved'"),
+        loop_auto_commit: crate::loop_ledger::auto_commit_enabled(store),
+        loop_counts: crate::loop_ledger::counts(store),
+        loop_audited: crate::loop_ledger::audit_stats(store).0,
+        loop_bad_in_window: crate::loop_ledger::audit_stats(store).1,
+        loop_unaudited: crate::loop_ledger::unaudited(store),
+        capture_hook: store
+            .conn()
+            .query_row(
+                "SELECT fired, matched, last_fired FROM hook_heartbeat WHERE hook = 'capture_markers'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok(),
         tokens: None,
     })
 }
@@ -652,11 +673,33 @@ pub fn format_text(sb: &Scoreboard) -> String {
 
     o.push_str("\n  CAPTURE\n");
     o.push_str(&format!(
-        "    Markers committed: {} (prev {})   per worked session: {:.1}\n",
+        "    Markers logged: {} (prev {})   per worked session: {:.1}\n",
         c.markers_captured,
         p.markers_captured,
         ratio(c.markers_captured, c.sessions_worked)
     ));
+
+    o.push_str(&format!(
+        "\n  LOOP (automatic learning, audited by sample)\n\
+         \x20   Automatic commit: {}   audited: {}   wrong/useless in the last {}: {} (off above {})   unaudited: {}\n",
+        if sb.loop_auto_commit { "on" } else { "OFF" },
+        sb.loop_audited,
+        crate::loop_ledger::AUDIT_WINDOW,
+        sb.loop_bad_in_window,
+        crate::loop_ledger::AUDIT_MAX_BAD,
+        sb.loop_unaudited
+    ));
+    if !sb.loop_counts.is_empty() {
+        let parts: Vec<String> = sb.loop_counts.iter().map(|(c, st, n)| format!("{c}/{st} {n}")).collect();
+        o.push_str(&format!("    Ledger: {}\n", parts.join(", ")));
+    }
+    match sb.capture_hook {
+        Some((fired, matched, last)) => o.push_str(&format!(
+            "    Capture hook: ran {fired}x, found markers {matched}x, last {:.1}h ago\n",
+            (Utc::now().timestamp() - last) as f64 / 3600.0
+        )),
+        None => o.push_str("    ! Capture hook has never run: markers reach the store only at closeout\n"),
+    }
 
     o.push_str(&format!(
         "\n  STORE (live entries only): {} patterns ({} retired), {} anti-patterns ({} retired)\n\

@@ -404,6 +404,14 @@ fn propose_survival_gated(
     proposals_dir: &Path,
     rejected_log: &Path,
 ) -> Result<usize> {
+    // Fenced off (docs/self-learning-loop-2026-09-30.md, L2). Survival counts
+    // failed builds in any session that happened to retrieve a pattern: a
+    // correlation, not evidence against it, so it no longer raises removal
+    // proposals. It stays on display; an entry is disputed only by events
+    // (reconcile.rs), and retired only on a fact.
+    let _ = (store, proposals_dir, rejected_log);
+    return Ok(0);
+    #[allow(unreachable_code)]
     let mut stmt = store.conn().prepare(
         "SELECT id, name, intent, body, use_count, reverted_count, survival_rate
          FROM patterns

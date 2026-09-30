@@ -92,6 +92,36 @@ pub const MECHANISMS: &[Mechanism] = &[
         filter: "hook = 'note_challenge'",
         optional: false,
     },
+    // The capture hook, not its output: most turns write no marker, so only
+    // the heartbeat can tell a working hook from an uninstalled one.
+    Mechanism {
+        label: "capture_markers hook (is it running)",
+        table: "hook_heartbeat",
+        ts_col: "last_fired",
+        expect_days: 2.0,
+        when_idle: "the Stop/PreCompact capture hooks are not installed or not reaching the server (`cortex hooks-init`, then restart Claude Code); knowledge then reaches the store only at closeout",
+        filter: "hook = 'capture_markers'",
+        optional: false,
+    },
+    Mechanism {
+        label: "automatic commits recorded (loop ledger)",
+        table: "loop_changes",
+        ts_col: "created_at",
+        expect_days: 14.0,
+        when_idle: "nothing has been committed automatically; `cortex knowledge status`",
+        filter: "",
+        optional: false,
+    },
+    // A request, not a fault: this is the person's side of the loop.
+    Mechanism {
+        label: "sample audit of automatic commits",
+        table: "loop_audits",
+        ts_col: "audited_at",
+        expect_days: 14.0,
+        when_idle: "nobody has audited automatically committed knowledge: `cortex knowledge audit` (5 entries, about a minute)",
+        filter: "",
+        optional: false,
+    },
     Mechanism {
         label: "user corrections captured",
         table: "challenges",

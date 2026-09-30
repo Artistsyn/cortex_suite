@@ -1,3 +1,26 @@
+
+    #[test]
+    fn a_marker_closed_with_another_types_tag_keeps_its_remedy() {
+        let text = "[CORTEX-AP: description=\"bounce emitters miss the sky\" tags=\"bake\"]wrong: lamps only.\n\
+                    correct: add the sky's irradiance to each emitter.[/CORTEX-PATTERN]\n\n\
+                    [CORTEX-PATTERN: name=\"next\" intent=\"i\"]body[/CORTEX-PATTERN]";
+        let ms = parse_markers(text);
+        let ap = ms.iter().find_map(|m| match m {
+            KnowledgeMarker::AntiPattern { correct, .. } => Some(correct.clone()),
+            _ => None,
+        });
+        assert_eq!(ap.as_deref(), Some("add the sky's irradiance to each emitter."));
+        assert!(ms.iter().any(|m| matches!(m, KnowledgeMarker::Pattern { name, .. } if name == "next")),
+                "the following marker still parses");
+    }
+
+    #[test]
+    fn a_marker_with_no_closing_tag_does_not_swallow_the_next_one() {
+        let text = "[CORTEX-AP: description=\"one\"]wrong: a\n\
+                    [CORTEX-AP: description=\"two\"]wrong: b\ncorrect: c[/CORTEX-AP]";
+        let names: Vec<String> = parse_markers(text).iter().map(|m| m.display_name()).collect();
+        assert!(names.contains(&"one".to_string()) && names.contains(&"two".to_string()), "{names:?}");
+    }
 /// Phase 0C: CORTEX-* knowledge marker parser.
 ///
 /// Parses structured XML-like tags that agents embed in their responses:
@@ -20,6 +43,11 @@
 ///   [CORTEX-PREFS-NOTE: tags="..."]
 ///   note text
 ///   [/CORTEX-PREFS-NOTE]
+///
+///   [CORTEX-WALL: claim="..." provenance="hardware" status="open" topic="..." untested="..." cheapest_test="..." revisit="..."]
+///   measured: what was measured @ where @ 2026-09-17
+///   paper: what it says (2025)
+///   [/CORTEX-WALL]
 ///
 ///   [CORTEX-SKILL-CANDIDATE: name="..." trigger="..."]
 ///   summary text
@@ -68,6 +96,9 @@ pub enum KnowledgeMarker {
         trigger: String,
         summary: String,
     },
+    /// A limit, with whose limit it is and its evidence. Validated at commit by
+    /// the same rules as record_wall, and refused with the reason if it fails.
+    Wall(crate::walls::NewWall),
 }
 
 impl KnowledgeMarker {
@@ -80,6 +111,7 @@ impl KnowledgeMarker {
             KnowledgeMarker::Adr { .. }            => "adr",
             KnowledgeMarker::PrefsNote { .. }      => "prefs_note",
             KnowledgeMarker::SkillCandidate { .. } => "skill_candidate",
+            KnowledgeMarker::Wall(_)               => "wall",
         }
     }
 
@@ -92,6 +124,7 @@ impl KnowledgeMarker {
             KnowledgeMarker::Adr { title, .. }           => title.clone(),
             KnowledgeMarker::PrefsNote { body, .. }      => body.chars().take(60).collect(),
             KnowledgeMarker::SkillCandidate { name, .. } => name.clone(),
+            KnowledgeMarker::Wall(w)                     => w.claim.chars().take(60).collect(),
         }
     }
 }
@@ -100,6 +133,13 @@ impl KnowledgeMarker {
 
 /// Parse all CORTEX-* markers from arbitrary text (typically an assistant response).
 pub fn parse_markers(text: &str) -> Vec<KnowledgeMarker> {
+    parse_markers_with_raw(text).into_iter().map(|(m, _)| m).collect()
+}
+
+/// `parse_markers`, also returning each marker's source text exactly as
+/// written, so a marker captured from a transcript can be committed later, or
+/// traced back, without re-deriving it from the parsed fields.
+pub fn parse_markers_with_raw(text: &str) -> Vec<(KnowledgeMarker, String)> {
     let mut results = Vec::new();
 
     let marker_types = [
@@ -109,6 +149,7 @@ pub fn parse_markers(text: &str) -> Vec<KnowledgeMarker> {
         "CORTEX-ADR",
         "CORTEX-PREFS-NOTE",
         "CORTEX-SKILL-CANDIDATE",
+        "CORTEX-WALL",
     ];
 
     for mtype in &marker_types {
@@ -130,9 +171,21 @@ pub fn parse_markers(text: &str) -> Vec<KnowledgeMarker> {
             // Find the closing tag.
             let body_start = header_end_abs + 1;
             let close_pos  = find_case_insensitive(text, &close_tag, body_start);
-            let (body, next_search) = if let Some(cp) = close_pos {
+            // A marker closed with ANOTHER type's tag (`[CORTEX-AP ...]
+            // ... [/CORTEX-PATTERN]`) used to lose everything after its first
+            // line, remedy included: an anti-pattern was stored with the
+            // placeholder "see body above" while its real remedy sat in the
+            // transcript. Accept any closing tag that comes before the next
+            // marker opens.
+            let next_open = find_case_insensitive(text, "[CORTEX-", body_start).unwrap_or(text.len());
+            let close_pos = close_pos.filter(|&cp| cp <= next_open).map(|cp| (cp, close_tag.len())).or_else(|| {
+                find_case_insensitive(text, "[/CORTEX-", body_start)
+                    .filter(|&cp| cp < next_open)
+                    .and_then(|cp| text[cp..].find(']').map(|end| (cp, end + 1)))
+            });
+            let (body, next_search) = if let Some((cp, close_len)) = close_pos {
                 let body = unescape_flattened_body(text[body_start..cp].trim());
-                (body, cp + close_tag.len())
+                (body, cp + close_len)
             } else {
                 // No closing tag — take the rest of the line as body.
                 let end = text[body_start..].find('\n')
@@ -142,7 +195,7 @@ pub fn parse_markers(text: &str) -> Vec<KnowledgeMarker> {
             };
 
             if let Some(marker) = build_marker(mtype, &attrs, &body) {
-                results.push(marker);
+                results.push((marker, text[open_pos..next_search].to_string()));
             }
 
             search_from = next_search;
@@ -424,6 +477,34 @@ fn build_marker(mtype: &str, attrs: &HashMap<String, String>, body: &str) -> Opt
                 summary: body.to_string(),
             })
         }
+        "CORTEX-WALL" => {
+            let claim = get("claim");
+            if claim.is_empty() && body.is_empty() { return None; }
+            // Evidence from the `evidence` attribute (`;`-separated) and from
+            // body lines of the form `kind: text @ source @ date`.
+            let evidence: Vec<_> = get("evidence")
+                .split(';')
+                .chain(body.lines())
+                .filter_map(crate::walls::parse_evidence_line)
+                .collect();
+            let first = |keys: &[&str]| {
+                keys.iter().map(|k| get(k)).find(|v| !v.is_empty()).unwrap_or_default()
+            };
+            let topic = first(&["topic", "tags"]);
+            Some(KnowledgeMarker::Wall(crate::walls::NewWall {
+                claim: if claim.is_empty() { body.lines().next().unwrap_or("").to_string() } else { claim },
+                provenance: get("provenance"),
+                evidence,
+                status: Some(get("status")).filter(|s| !s.is_empty()),
+                topic: if topic.is_empty() { vec![] } else { vec![topic] },
+                untested: get("untested"),
+                cheapest_test: first(&["cheapest_test", "cheapest-test", "test"]),
+                revisit_when: first(&["revisit", "revisit_when"]),
+                revisit_after: Some(get("revisit_after")).filter(|s| !s.is_empty()),
+                challenge_id: first(&["challenge", "challenge_id"]).trim_start_matches('#').parse().ok(),
+                links: get("links"),
+            }))
+        }
         _ => None,
     }
 }
@@ -489,6 +570,24 @@ fn parse_adr_body(body: &str) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_wall_marker_reads_attributes_and_evidence_lines_even_json_escaped() {
+        let text = "[CORTEX-WALL: claim=\"Probe arrays cap at 256 layers\" provenance=\"library-default\" \
+                    status=\"moved\" topic=\"quest,probes\" evidence=\"measured: Adreno 740 reports 2048 @ 2026-09-24\"]\n\
+                    vendor-doc: wgpu downlevel_defaults is 256 @ docs.rs @ 2026\n[/CORTEX-WALL]";
+        for input in [text.to_string(), text.replace('"', "\\\"")] {
+            let markers = parse_markers(&input);
+            let Some(KnowledgeMarker::Wall(w)) = markers.first() else { panic!("no wall in {input}") };
+            assert_eq!(w.claim, "Probe arrays cap at 256 layers");
+            assert_eq!(w.provenance, "library-default");
+            assert_eq!(w.status.as_deref(), Some("moved"));
+            assert_eq!(w.evidence.len(), 2, "{:?}", w.evidence);
+            assert_eq!(w.evidence[0].date, "2026-09-24");
+            assert_eq!((w.evidence[1].source.as_str(), w.evidence[1].date.as_str()), ("docs.rs", "2026"));
+        }
+    }
+
     use super::*;
 
     #[test]

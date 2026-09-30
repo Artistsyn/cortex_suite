@@ -13,6 +13,9 @@ short — a long manual gets skimmed.
 - **Assess, don't act uninvited.** If the user is describing a problem, the
   deliverable is your assessment. Report and stop.
 - **Match effort to the task.** Deep reasoning for hard work, fast for routine.
+- **A limit is a claim with a provenance.** Before accepting one — including one
+  you retrieved — say whose limit it is and what cheap check would move it
+  (`get_walls`, the `frontier` skill).
 
 ## 1) Tool routing — structure vs judgment
 
@@ -53,6 +56,10 @@ it is never stale.
   where a long task stands across compaction; `scope="any"` after a restart
 - `list_memory_handles` / `expand_memory(id)` — every pattern as one line, then
   only the bodies you need
+- `get_walls(hint)` / `record_wall` / `update_wall` — limits on record: whose
+  limit each is, its evidence, and the cheapest test that would decide it. Check
+  before accepting or declaring a limit; a verdict changes only with a new fact
+  (a measurement or a dated source)
 
 **Decision rule:**
 - What the code *is* → **quartz-ctx**
@@ -150,6 +157,14 @@ resolve_challenge(id, verdict, subject, evidence)
 `evidence` is required and a verdict without it is refused. Everything raised
 here is a proposal pending human review; nothing reaches memory directly.
 
+- `not_a_challenge` — the hook fired on a message that disputed nothing. Stores
+  nothing, and labels the false fire the cues are tuned from.
+
+**When the user disputes something and no challenge reminder arrived**, the hook
+missed it. Call `note_challenge(prompt=<their message>, source="agent")`, adding
+`limit=true` when they disputed a limit. That records the miss (the other label
+the cues learn from) and hands you the settling procedure.
+
 ### When a `[cortex]` warning arrives
 
 Hooks put a recorded trap into your context at two moments. The first is after
@@ -174,7 +189,15 @@ Embed markers in your responses as you discover things:
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
 [CORTEX-ADR: title="..." tags="..."]Context: ... Decision: ...[/CORTEX-ADR]
 [CORTEX-PREFS-NOTE: tags="..."]note[/CORTEX-PREFS-NOTE]
+[CORTEX-WALL: claim="..." provenance="hardware" cheapest_test="..."]measured: what @ where @ 2026-09-30[/CORTEX-WALL]
 ```
+
+A WALL records a limit. Closeout refuses one without a `provenance` (physics,
+hardware, platform, library-default, library-version, our-design,
+implementation, authority, budget) and at least one evidence line
+`kind: text @ source @ date` (measured, vendor-doc, paper, implementation,
+authority, inferred; sources need a date). An open wall must name
+`cheapest_test`.
 
 A pattern takes an optional `kind="constraint|policy|fact"` (default
 `procedure`). Constraints and policies are served in their own sections ahead
@@ -186,15 +209,22 @@ When a task is **verifiably** complete (build passes, tests pass), end with:
 ✓ TASK COMPLETE: [one line]
 Verified: [compile/test output]
 Knowledge captured: [list]
-
-Reply KNOWLEDGE COMMITTED to commit, anything else to skip.
 ```
 
-On `KNOWLEDGE COMMITTED`, call `closeout_session(outcome_type="build_pass",
-inline_approve=true, markers_text=<your markers>)`.
+then call `closeout_session(outcome_type="build_pass")` to log the outcome.
 
-**`markers_text` is required on Claude Code.** There is no chat store to scrape
-outside VS Code, so omitting it commits nothing while reporting success.
+**Markers commit themselves.** The Stop and PreCompact hooks capture every
+`[CORTEX-*]` marker from the transcript when it is written and commit it through
+the same gates (`cortex hooks-init` installs them). Nothing waits for a closeout a
+compaction can outrun: that lost 123 of 411 markers before 2026-09-30. A person
+audits a random sample (`cortex knowledge audit`) instead of approving each
+entry, and `cortex knowledge undo ap:<id>` takes any one back. `markers_text` is
+optional; pass it only if `cortex knowledge status` says the capture hook has
+never run.
+
+If the audit has switched automatic commit **off** (`cortex knowledge status`),
+markers are staged instead: end with "Reply KNOWLEDGE COMMITTED to commit", and
+on that reply call `closeout_session(outcome_type="build_pass", inline_approve=true)`.
 
 Tag entries so they are findable by concept, not just exact API name: include the
 API name, the behaviour, the domain, and the colloquial term people actually use.

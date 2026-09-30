@@ -211,6 +211,102 @@ the edit went through, so a failed edit cannot silence its retry. A failing
 command's output exists only afterwards, so in VS Code that note arrives one
 request later than it does in Claude Code.
 
+### Limits on record: the walls ledger
+
+An agent's most expensive mistake is not a bug. It accepts a limit that
+isn't one, then writes it down, and every later session reads it as settled.
+Measured on the author's workspace: every limit that was later tested did not
+hold as stated. wgpu's 256-layer default had been reported as a hardware
+limit, and a multiview restriction disappeared in a newer release. The check
+that moved each one was cheap.
+(`docs/frontier-plan-2026-09-29.md`.)
+
+cortex keeps limits as **walls**. Each wall carries:
+
+- **whose limit it is:** physics, hardware, platform, library default, library
+  version, our design, existing implementations, authority or budget (the last
+  six are movable);
+- **its evidence**, each item dated;
+- **while open, the cheapest test** that would decide it.
+
+Two rules are enforced, not suggested:
+
+- **Evidence.** A wall can't be recorded without a provenance and evidence.
+  Evidence that is only inferred, only an authority, or only someone else's
+  implementation leaves it open.
+- **Verdicts.** A verdict changes only with a new fact, a measurement or a dated
+  source, in either direction. Challenged models flip about half their answers
+  either way.
+
+Walls reach agents at the moments they decide:
+
+- **In retrieval.** `get_context` and `get_anti_patterns` serve the walls a task
+  touches, each one line, together with how often limits here moved when
+  checked. `get_walls(hint)` lists them; `record_wall` and `update_wall` change
+  them.
+- **When the user pushes back.** When you dispute a limit ("more doable than you
+  wrote off", "was 30 even the latest version?"), the challenge hook injects the
+  wall audit with the walls on record, instead of a generic reminder. The cues
+  were chosen by replaying 2,195 real messages: 26 fire, and 24 of them were real
+  limit pushbacks.
+- **When the dispute is settled.** It must name the wall it was about.
+- **In the review block.** Walls whose revisit date has come are listed there.
+- **When a dependency moves.** An edit to `Cargo.toml`, `Cargo.lock` or
+  `package.json`, or a `cargo update` whose output reports a new version,
+  pushes every open or held wall bound to that package back to the agent, once
+  per session. "Bound" means the package is named in its revisit condition, or
+  in the claim or topic of a version-bound wall.
+- **Cheap tests are flagged.** An open wall whose cheapest test takes 30 minutes
+  or less is called out ("Cheap to settle now: #2 (~20 min)").
+
+`setup.sh` / `setup.ps1` also install the `frontier` skill, which walks the audit:
+`.claude/skills/frontier/SKILL.md` for Claude Code and
+`.github/prompts/frontier.prompt.md` for Copilot.
+
+To record a limit from a session, use a `[CORTEX-WALL: ...]` marker. From the
+command line: `cortex walls list | show <id> | import <file.json>`.
+
+### Knowledge that commits itself
+
+Knowledge used to wait for you to reply `KNOWLEDGE COMMITTED` at the end of a task.
+Measured on 2026-09-30, that approval passed 99.3-100% of what reached it. The
+protocol around it lost 123 of 411 markers across context compactions, before any
+closeout could include them. So the safety moved from approving each entry to
+things the loop cannot talk its way past:
+
+- **Captured when written.** On Claude Code, the Stop and PreCompact hooks read
+  the transcript from where they last stopped and commit each `[CORTEX-*]` marker
+  through the closeout gates. Fenced code and placeholder examples are skipped.
+- **Every automatic change is a row** in a ledger (`cortex knowledge changes`),
+  with what it replaced and why. Nothing is deleted: a retracted entry keeps its
+  row and leaves every serving path, including the response cache.
+- **Restatements merge, older drafts don't win.** A marker that restates a live
+  entry (the same pattern name with new text, or cosine >= 0.9) replaces it only
+  if it was written later. Catching up on a transcript meets drafts that a later
+  version had already replaced.
+- **You audit a sample.** `cortex knowledge audit` shows 5 random automatic
+  commits; wrong or useless retracts on the spot, and more than 3 bad in the
+  last 20 switch automatic commit off.
+- **Look-alikes are reconciled, not alarmed.** A new entry that reads close to an
+  older one (cosine 0.25-0.9) opens a pair: its author hears on the next prompt, and
+  anyone served either entry sees one line until `resolve_pair` says duplicate,
+  refinement, conflict or compatible. Entries are *disputed* only by events: a
+  challenge that proved one wrong, a wall it cites that moved, or its failure
+  coming back after its fix was delivered. A conflict is settled only by a fact.
+- **Backfill.** `cortex knowledge backfill` finds markers written in past
+  transcripts that never reached the store; `--write` commits them tagged
+  `backfill`, after a backup, and `undo --class backfill` takes them all back.
+  Coverage on this workspace went from 65% to 99%.
+
+Once a week a scheduled session (`cortex-weekly-maintenance`) judges look-alike
+pairs and writes the digest (`cortex knowledge digest`). Its verdicts count only
+after it agrees with hand labels it cannot see, at 90% or better. Cue changes are
+still made by hand; `cortex knowledge cues` replays any candidate over every real
+prompt first. An automated miner was tested and found nothing it could promote.
+
+The design, the evidence behind it and the later phases are in
+[docs/self-learning-loop-2026-09-30.md](docs/self-learning-loop-2026-09-30.md).
+
 ## Is it working?
 
 ```bash
@@ -232,8 +328,9 @@ reference only). It covers:
 
 ## What you have to review
 
-The consolidation pipeline runs itself at closeout when it has gone stale, but
-nothing it produces is committed without you. Drafted skills and pending
+Knowledge entries commit automatically; your part is the weekly sample audit
+(`cortex knowledge audit`, above). The consolidation pipeline runs itself at
+closeout when it has gone stale, and nothing it produces is committed without you. Drafted skills and pending
 proposals are listed under **AWAITING YOUR REVIEW** in the closeout report and in
 `get_session_health`, each with the command that resolves it. Read a draft before
 approving it — see [SETUP_HANDOFF.md](SETUP_HANDOFF.md#3-daily-use).

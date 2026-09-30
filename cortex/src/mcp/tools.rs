@@ -52,7 +52,17 @@ pub fn dispatch(
         "compact_output"          => tool_compact_output(args, store, session_id, repo_root),
         "edit_guard"              => tool_edit_guard(args, store, session_id),
         "note_challenge"          => tool_note_challenge(args, store, session_id),
+        "capture_markers"         => tool_capture_markers(args, store, repo_root),
+        "resolve_pair"            => tool_resolve_pair(args, store),
+        "loop_queue"              => crate::maintenance::queue(store, repo_root).map_err(|e| e.to_string()),
+        "loop_judge"              => tool_loop_judge(args, store, repo_root),
+        "loop_digest"             => crate::maintenance::digest(store, repo_root, crate::scoreboard::transcripts_dir_for(repo_root))
+                                        .map_err(|e| e.to_string()),
+        "settle_dispute"          => tool_settle_dispute(args, store),
         "resolve_challenge"       => tool_resolve_challenge(args, store),
+        "get_walls"               => tool_get_walls(args, store),
+        "record_wall"             => tool_record_wall(args, store),
+        "update_wall"             => tool_update_wall(args, store),
         "set_checkpoint"          => tool_set_checkpoint(args, store, session_id),
         "get_checkpoint"          => tool_get_checkpoint(args, store, session_id),
         "list_memory_handles"     => tool_list_memory_handles(store),
@@ -78,6 +88,7 @@ pub(crate) fn run_hook_tool(
         "compact_output" => tool_compact_output(args, store, session_id, repo_root),
         "edit_guard" => tool_edit_guard(args, store, session_id),
         "note_challenge" => tool_note_challenge(args, store, session_id),
+        "capture_markers" => tool_capture_markers(args, store, repo_root),
         other => Err(format!("not a hook tool: {other}")),
     }
 }
@@ -113,31 +124,154 @@ fn tool_note_challenge(
             prompt.trim()
         ));
     }
-    let outcome = crate::corrections::note(store, session_id, prompt);
+    // The agent noting a dispute itself. When the cues would have fired, it is
+    // an ordinary challenge; when they would not, it is a MISS -- the label cue
+    // tuning learns from -- and the agent still gets the procedure.
+    let from_agent = args.get("source").and_then(Value::as_str) == Some("agent");
+    if from_agent && crate::corrections::detect(prompt).is_none() {
+        let limit = args.get("limit").and_then(Value::as_bool).unwrap_or(false);
+        return match crate::corrections::note_missed(store, session_id, prompt, limit) {
+            Ok(Some((id, _))) if limit => Ok(format!(
+                "[cortex] Recorded as challenge {id}, a limit dispute the hook's cues missed.\n\n{}",
+                limit_audit(store, id, prompt)
+            )),
+            Ok(Some((id, _))) => Ok(format!(
+                "[cortex] Recorded as challenge {id}, a dispute the hook's cues missed. Settle it by \
+                 CHECKING, then call resolve_challenge(id={id}, ...)."
+            )),
+            Ok(None) => Ok("[cortex] Already noted in this session.".into()),
+            Err(e) => Err(e.to_string()),
+        };
+    }
+    let outcome = crate::corrections::note_with_cue(store, session_id, prompt);
     // Beat before branching: the heartbeat is about the HOOK running, and it
     // must be recorded on the silent path too — that is the only path there is,
-    // almost always.
-    let _ = crate::corrections::beat(store, matches!(outcome, Ok(Some(_))));
+    // almost always. The agent's own calls are not the hook running.
+    if !from_agent {
+        let _ = crate::corrections::beat(store, matches!(outcome, Ok(Some(_))));
+    }
 
+    // Pairs opened since the last prompt: the author hears while they still
+    // know why they wrote the new entry.
+    let notices = if from_agent { String::new() } else { crate::reconcile::pending_notices(store) };
+    let with_notices = |text: String| -> String {
+        match (text.is_empty(), notices.is_empty()) {
+            (_, true) => text,
+            (true, false) => notices.clone(),
+            (false, false) => format!("{text}\n\n{notices}"),
+        }
+    };
     match outcome {
-        Ok(Some(id)) => Ok(format!(
+        // A pushback against a limit gets the procedure, not just a reminder:
+        // the user has been the only thing catching limits that did not hold,
+        // and a bare "are you sure?" flips right answers as often as wrong ones.
+        Ok(Some((id, cue))) if crate::corrections::is_limit_cue(cue) => {
+            Ok(with_notices(limit_audit(store, id, prompt)))
+        }
+        Ok(Some((id, _))) => Ok(with_notices(format!(
             "[cortex] That reads as a challenge to something you said. Settle it by \
              CHECKING — run the command, read the file — not from memory of the \
              exchange, then call resolve_challenge(id={id}, ...). If it never gets \
              settled, `unresolved` is the honest answer and stores nothing."
-        )),
+        ))),
         // Already noted, or not a challenge. Both are silent.
-        Ok(None) => Ok(String::new()),
+        Ok(None) => Ok(with_notices(String::new())),
         // A logging failure must never block the user's message.
-        Err(_) => Ok(String::new()),
+        Err(_) => Ok(with_notices(String::new())),
     }
+}
+
+/// Capture the knowledge markers written since the last capture of a
+/// transcript (plan L1). Called by the Stop and PreCompact hooks, which can
+/// neither take context nor be allowed to block a turn, so a hook call always
+/// answers with nothing; what happened is in `loop_changes`, the heartbeat, and
+/// `loop.capture_error` when something is wrong. Called directly, it reports.
+fn tool_capture_markers(args: &Value, store: &Store, repo_root: &Path) -> Result<String, String> {
+    let raw = args["transcript_path"].as_str().unwrap_or("");
+    let from_hook = args.get("hook_event_name").and_then(Value::as_str).is_some_and(|e| !e.is_empty());
+    let path = match crate::capture::checked_transcript(raw) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = crate::corrections::beat_named(store, "capture_markers", false);
+            let _ = store.set_meta("loop.capture_error", &e.to_string());
+            return Ok(if from_hook { String::new() } else { e.to_string() });
+        }
+    };
+    let prefs = repo_root.join(".cortex").join("prefs.toml");
+    let prefs = prefs.exists().then_some(prefs.as_path());
+    let mut reports = Vec::new();
+    let mut found = 0usize;
+    match crate::capture::capture(store, &path, prefs) {
+        Ok(c) => {
+            found += c.markers;
+            reports.push(c.summary());
+            let _ = store.set_meta("loop.capture_error", "");
+        }
+        Err(e) => {
+            let _ = store.set_meta("loop.capture_error", &e.to_string());
+            reports.push(format!("capture failed: {e}"));
+        }
+    }
+    if from_hook {
+        // The unread end of sessions that have since ended.
+        for c in crate::capture::sweep_tails(store, prefs, &path) {
+            found += c.markers;
+            reports.push(c.summary());
+        }
+    }
+    let _ = crate::corrections::beat_named(store, "capture_markers", found > 0);
+    if from_hook {
+        return Ok(String::new());
+    }
+    let text: Vec<String> = reports.into_iter().filter(|r| !r.is_empty()).collect();
+    Ok(if text.is_empty() { "no new markers".into() } else { text.join("\n") })
+}
+
+fn kind_arg(args: &Value) -> Result<&str, String> {
+    match args.get("kind").and_then(Value::as_str).unwrap_or("anti_patterns") {
+        "anti_patterns" | "ap" | "anti_pattern" => Ok("anti_patterns"),
+        "patterns" | "pattern" => Ok("patterns"),
+        other => Err(format!("unknown kind `{other}` (anti_patterns or patterns)")),
+    }
+}
+
+/// Say what two entries that read alike are to each other (plan L2).
+fn tool_resolve_pair(args: &Value, store: &Store) -> Result<String, String> {
+    let kind = kind_arg(args)?;
+    let new_id = args["new_id"].as_i64().ok_or("missing `new_id`")?;
+    let old_id = args["old_id"].as_i64().ok_or("missing `old_id`")?;
+    let verdict = args["verdict"].as_str().ok_or("missing `verdict`")?;
+    let winner = args.get("winner").and_then(Value::as_i64);
+    let fact = args.get("fact").and_then(Value::as_str).filter(|f| !f.trim().is_empty());
+    crate::reconcile::resolve_pair(store, kind, new_id, old_id, verdict, winner, fact).map_err(|e| e.to_string())
+}
+
+/// The maintenance judge's answers: [{item, verdict}, ...].
+fn tool_loop_judge(args: &Value, store: &Store, repo_root: &Path) -> Result<String, String> {
+    let answers: Vec<(i64, String)> = args
+        .get("answers")
+        .and_then(Value::as_array)
+        .ok_or("missing `answers`: [{\"item\": <n>, \"verdict\": \"duplicate|refinement|conflict|compatible\"}]")?
+        .iter()
+        .filter_map(|a| Some((a.get("item")?.as_i64()?, a.get("verdict")?.as_str()?.to_string())))
+        .collect();
+    crate::maintenance::judge(store, repo_root, &answers).map_err(|e| e.to_string())
+}
+
+/// Settle the disputes on an entry with a fact.
+fn tool_settle_dispute(args: &Value, store: &Store) -> Result<String, String> {
+    let kind = kind_arg(args)?;
+    let id = args["id"].as_i64().ok_or("missing `id`")?;
+    let verdict = args["verdict"].as_str().ok_or("missing `verdict`")?;
+    let fact = args["fact"].as_str().ok_or("missing `fact`: a measurement, or a dated vendor-doc or paper")?;
+    crate::reconcile::settle_dispute(store, kind, id, verdict, fact).map_err(|e| e.to_string())
 }
 
 fn tool_resolve_challenge(args: &Value, store: &Store) -> Result<String, String> {
     let id = args["id"].as_i64().ok_or("missing `id`")?;
     let raw = args["verdict"].as_str().ok_or("missing `verdict`")?;
     let verdict = crate::corrections::Verdict::parse(raw).ok_or_else(|| {
-        format!("unknown verdict `{raw}` — use user_right, agent_right, mixed, or unresolved")
+        format!("unknown verdict `{raw}` — use user_right, agent_right, mixed, unresolved, or not_a_challenge")
     })?;
     let subject = args["subject"].as_str().unwrap_or("").trim();
     let evidence = args["evidence"].as_str().unwrap_or("");
@@ -145,8 +279,376 @@ fn tool_resolve_challenge(args: &Value, store: &Store) -> Result<String, String>
     if subject.is_empty() {
         return Err("missing `subject` — state in one sentence what is actually true".into());
     }
-    crate::corrections::resolve(store, id, verdict, subject, evidence)
-        .map_err(|e| e.to_string())
+    // A settled dispute about a limit belongs in the wall ledger, or the next
+    // session meets the same limit with nothing but the old verdict.
+    let wall_id = args.get("wall_id").and_then(|v| v.as_i64());
+    let is_limit = crate::corrections::cue_of(store, id)
+        .map_err(|e| e.to_string())?
+        .as_deref()
+        .map(crate::corrections::is_limit_cue)
+        .unwrap_or(false);
+    let settles_a_limit = !matches!(
+        verdict,
+        crate::corrections::Verdict::Unresolved | crate::corrections::Verdict::NotAChallenge
+    );
+    if is_limit && settles_a_limit && wall_id.is_none() {
+        return Err(format!(
+            "challenge {id} disputes a limit. Put it in the wall ledger first: \
+             record_wall(claim=<the limit as it was stated>, provenance=<whose limit>, \
+             evidence=[...], cheapest_test=...) or update_wall(id=<an existing wall>, ...), \
+             then pass wall_id here.{}",
+            matching_walls_hint(store, subject)
+        ));
+    }
+    if let Some(w) = wall_id {
+        if crate::walls::get(store, w).map_err(|e| e.to_string())?.is_none() {
+            return Err(format!("no wall #{w}; record it with record_wall first"));
+        }
+    }
+    let settled = crate::corrections::resolve(store, id, verdict, subject, evidence)
+        .map_err(|e| e.to_string())?;
+    // The entry the challenge proved wrong, if the agent names it: disputed
+    // until a fact settles it, so the next session meets the warning.
+    let settled = match (verdict, args.get("entry").and_then(Value::as_str)) {
+        (crate::corrections::Verdict::UserRight, Some(entry)) => match crate::loop_ledger::parse_entry_ref(entry) {
+            Some((kind, eid)) => {
+                crate::reconcile::raise_dispute(
+                    store,
+                    kind,
+                    eid,
+                    &format!("challenge #{id} was settled against it: {subject}"),
+                    "challenge",
+                )
+                .map_err(|e| e.to_string())?;
+                format!("{settled} {entry} is now served as disputed until a fact settles it.")
+            }
+            None => return Err(format!("`entry` must look like ap:<id> or pattern:<id>, got `{entry}`")),
+        },
+        _ => settled,
+    };
+    match wall_id {
+        Some(w) => {
+            crate::walls::link_challenge(store, w, id).map_err(|e| e.to_string())?;
+            Ok(format!("{settled} Linked to wall #{w}."))
+        }
+        None => Ok(settled),
+    }
+}
+
+// ── walls ───────────────────────────────────────────────────────────────────
+
+/// At most this many walls ride along with get_context and get_anti_patterns.
+const WALLS_IN_CONTEXT: usize = 3;
+/// Hard cap on that section, so the ledger can grow without growing every
+/// pre-code check.
+const WALLS_SECTION_CAP: usize = 1_800;
+
+/// Open walls first: they are the invitations. Then held, then moved.
+fn wall_rank(w: &crate::walls::Wall) -> u8 {
+    match w.status.as_str() {
+        "open" => 0,
+        "holds" => 1,
+        _ => 2,
+    }
+}
+
+/// Live walls that share enough of `hint`, best match first.
+fn walls_for_hint(store: &Store, hint: &str, min_score: Option<usize>) -> Vec<crate::walls::Wall> {
+    let tokens = hint_tokens(hint);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let threshold = min_score.unwrap_or_else(|| hint_expand_threshold(&tokens));
+    let mut scored: Vec<(usize, crate::walls::Wall)> = crate::walls::all(store)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| w.status != "retired")
+        .map(|w| (text_hint_score(&crate::walls::haystack(&w), &tokens), w))
+        .filter(|(s, _)| *s >= threshold)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(wall_rank(&a.1).cmp(&wall_rank(&b.1))));
+    scored.into_iter().map(|(_, w)| w).collect()
+}
+
+fn clip_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// The walls a task touches, for get_context and get_anti_patterns: each one
+/// line with its status, whose limit it is, and its open edge, plus the
+/// project's own base rate. Empty when nothing matches.
+fn walls_section(store: &Store, hint: &str) -> String {
+    let hits = walls_for_hint(store, hint, None);
+    if hits.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n## Walls on record\n");
+    let rate = crate::walls::base_rate_line(store);
+    if !rate.is_empty() {
+        s.push_str(&rate);
+        s.push('\n');
+    }
+    for w in hits.iter().take(WALLS_IN_CONTEXT) {
+        s.push_str("  ");
+        s.push_str(&crate::walls::render_line(w));
+        s.push('\n');
+    }
+    if hits.len() > WALLS_IN_CONTEXT {
+        s.push_str(&format!(
+            "  (+{} more: get_walls(hint=...))\n",
+            hits.len() - WALLS_IN_CONTEXT
+        ));
+    }
+    // Open walls a short test would settle: worth running before arguing.
+    let cheap: Vec<String> = hits
+        .iter()
+        .filter(|w| crate::walls::is_cheap_shot(w))
+        .take(2)
+        .map(|w| {
+            let m = crate::walls::estimate_minutes(&w.cheapest_test).unwrap_or(0);
+            format!("#{} (~{m} min)", w.id)
+        })
+        .collect();
+    if !cheap.is_empty() {
+        s.push_str(&format!("  Cheap to settle now: {}.\n", cheap.join(", ")));
+    }
+    clip_chars(&s, WALLS_SECTION_CAP)
+}
+
+/// Walls bound to packages that just changed, each pushed once per session:
+/// a version-bound limit may have moved with the version, and nothing else
+/// would reopen it.
+fn wall_revisits(store: &Store, session_id: &str, what: &str, names: &[String]) -> Option<String> {
+    let bound = crate::walls::bound_to_packages(store, names).ok()?;
+    let mut lines = Vec::new();
+    for (package, w) in bound {
+        let text = format!(
+            "[cortex] {what} changes `{package}`, and wall #{id} is bound to it:\n  {}\n  \
+             The limit may have moved with the version. Re-check it, then \
+             update_wall(id={id}, ...) with what you find.",
+            crate::walls::render_line(&w),
+            id = w.id
+        );
+        if store
+            .record_push(session_id, "wall_revisit", &w.id.to_string(), None, text.len())
+            .unwrap_or(false)
+        {
+            lines.push(text);
+        }
+    }
+    if lines.is_empty() { None } else { Some(lines.join("\n")) }
+}
+
+/// " On record: #N ..." for an error message, when a wall already matches.
+fn matching_walls_hint(store: &Store, text: &str) -> String {
+    let hits = walls_for_hint(store, text, Some(2));
+    if hits.is_empty() {
+        return String::new();
+    }
+    let ids: Vec<String> = hits.iter().take(3).map(|w| format!("#{}", w.id)).collect();
+    format!(" Walls that may already cover it: {} (get_walls(id=N)).", ids.join(", "))
+}
+
+/// What a limit dispute gets instead of the generic reminder.
+fn limit_audit(store: &Store, id: i64, prompt: &str) -> String {
+    let mut s = format!(
+        "[cortex] That disputes a limit (challenge #{id}). Neither agree nor hold from memory: \
+         challenged models flip about half their answers either way. Run the wall audit:\n\
+         1. State the limit as a measurable claim: what, on what, at what budget.\n\
+         2. Whose limit is it: physics, hardware, platform, library default, library version, \
+         our design, existing implementations, authority, or budget? The last six are work \
+         items with a cost, not walls.\n\
+         3. Bound it for this use (ops, bytes, ms on the target), not by the cost of a \
+         general implementation.\n\
+         4. Date every source, and look up the latest version now, not from memory.\n\
+         5. Say what the material you were given already says about it.\n\
+         6. Name the cheapest decisive test; if it takes under ~30 minutes, run it.\n\
+         7. Change the verdict only with a new fact. Record it with record_wall or \
+         update_wall, then resolve_challenge(id={id}, ..., wall_id=N).\n"
+    );
+    let hits = walls_for_hint(store, prompt, Some(2));
+    if !hits.is_empty() {
+        s.push_str("On record:\n");
+        for w in hits.iter().take(2) {
+            s.push_str("  ");
+            s.push_str(&crate::walls::render_line(w));
+            s.push('\n');
+        }
+    }
+    let rate = crate::walls::base_rate_line(store);
+    if !rate.is_empty() {
+        s.push_str(&rate);
+        s.push('\n');
+    }
+    s
+}
+
+fn str_arg(args: &Value, key: &str) -> String {
+    args.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn opt_str_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// Evidence as objects `{kind, text, source?, date?}`, or strings
+/// `kind: text @ source @ date` (one per item, or `;`-separated).
+fn evidence_arg(v: Option<&Value>) -> Result<Vec<crate::walls::Evidence>, String> {
+    let line = |s: &str| {
+        crate::walls::parse_evidence_line(s).ok_or_else(|| {
+            format!(
+                "evidence {s:?}: write `kind: text @ source @ date` with kind one of {}",
+                crate::walls::EVIDENCE_KINDS.join(", ")
+            )
+        })
+    };
+    match v {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            s.split([';', '\n']).filter(|l| !l.trim().is_empty()).map(line).collect()
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|it| match it {
+                Value::String(s) => line(s),
+                Value::Object(_) => serde_json::from_value(it.clone())
+                    .map_err(|e| format!("evidence item {it}: {e} (needs kind and text)")),
+                other => Err(format!("evidence item {other}: expected an object or a string")),
+            })
+            .collect(),
+        Some(other) => Err(format!("`evidence` must be a list, got {other}")),
+    }
+}
+
+fn topic_arg(v: Option<&Value>) -> Option<Vec<String>> {
+    match v {
+        Some(Value::Array(a)) => Some(a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()),
+        Some(Value::String(s)) => Some(vec![s.clone()]),
+        _ => None,
+    }
+}
+
+fn tool_get_walls(args: &Value, store: &Store) -> Result<String, String> {
+    if let Some(id) = args.get("id").and_then(|v| v.as_i64()) {
+        return match crate::walls::get(store, id).map_err(|e| e.to_string())? {
+            Some(w) => Ok(crate::walls::render_full(&w)),
+            None => Err(format!("no wall #{id}")),
+        };
+    }
+    let hint = require_hint(args, "get_walls")?;
+    let all = crate::walls::all(store).map_err(|e| e.to_string())?;
+    if all.is_empty() {
+        return Ok("No walls recorded yet. When you accept, dispute or test a limit, record it: \
+                   record_wall(claim, provenance, evidence, cheapest_test)."
+            .into());
+    }
+    let (moved, held, open) = crate::walls::base_rate(store).map_err(|e| e.to_string())?;
+    let mut out = format!(
+        "{} walls on record: {open} open, {held} holding, {moved} moved.",
+        all.len()
+    );
+    let rate = crate::walls::base_rate_line(store);
+    if !rate.is_empty() {
+        out.push(' ');
+        out.push_str(&rate);
+    }
+    out.push('\n');
+    if args.get("detail").and_then(|v| v.as_str()) == Some("full") {
+        for w in &all {
+            out.push_str("  ");
+            out.push_str(&crate::walls::render_line(w));
+            out.push('\n');
+        }
+    } else {
+        let hits = walls_for_hint(store, &hint, None);
+        if hits.is_empty() {
+            out.push_str(&format!("No wall matches `{hint}`."));
+            let open_walls: Vec<&crate::walls::Wall> =
+                all.iter().filter(|w| w.status == "open").take(5).collect();
+            if !open_walls.is_empty() {
+                out.push_str(" Open walls, each a test waiting to be run:\n");
+                for w in open_walls {
+                    out.push_str("  ");
+                    out.push_str(&crate::walls::render_line(w));
+                    out.push('\n');
+                }
+            } else {
+                out.push('\n');
+            }
+        } else {
+            for w in hits.iter().take(8) {
+                out.push_str("  ");
+                out.push_str(&crate::walls::render_line(w));
+                out.push('\n');
+            }
+            if hits.len() > 8 {
+                out.push_str(&format!("  (+{} more; narrow the hint)\n", hits.len() - 8));
+            }
+        }
+    }
+    out.push_str(
+        "Full record: get_walls(id=N). Change one: update_wall(id, ...). A verdict changes \
+         only with a new fact: a measurement, or a dated source.",
+    );
+    Ok(out)
+}
+
+fn tool_record_wall(args: &Value, store: &Store) -> Result<String, String> {
+    let new = crate::walls::NewWall {
+        claim: str_arg(args, "claim"),
+        provenance: str_arg(args, "provenance"),
+        evidence: evidence_arg(args.get("evidence"))?,
+        status: opt_str_arg(args, "status"),
+        topic: topic_arg(args.get("topic")).unwrap_or_default(),
+        untested: str_arg(args, "untested"),
+        cheapest_test: str_arg(args, "cheapest_test"),
+        revisit_when: str_arg(args, "revisit_when"),
+        revisit_after: opt_str_arg(args, "revisit_after"),
+        challenge_id: args.get("challenge_id").and_then(|v| v.as_i64()),
+        links: str_arg(args, "links"),
+    };
+    let (wall, notes) = crate::walls::record(store, new).map_err(|e| e.to_string())?;
+    let mut out = format!("Recorded wall #{}.\n{}", wall.id, crate::walls::render_full(&wall));
+    for n in notes {
+        out.push_str(&format!("Note: {n}\n"));
+    }
+    let rate = crate::walls::base_rate_line(store);
+    if !rate.is_empty() {
+        out.push_str(&rate);
+    }
+    Ok(out)
+}
+
+fn tool_update_wall(args: &Value, store: &Store) -> Result<String, String> {
+    let id = args.get("id").and_then(|v| v.as_i64()).ok_or("missing `id`")?;
+    let upd = crate::walls::WallUpdate {
+        status: opt_str_arg(args, "status"),
+        provenance: opt_str_arg(args, "provenance"),
+        evidence: evidence_arg(args.get("evidence"))?,
+        topic: topic_arg(args.get("topic")),
+        untested: opt_str_arg(args, "untested"),
+        cheapest_test: opt_str_arg(args, "cheapest_test"),
+        revisit_when: opt_str_arg(args, "revisit_when"),
+        revisit_after: opt_str_arg(args, "revisit_after"),
+        links: opt_str_arg(args, "links"),
+    };
+    let before = crate::walls::get(store, id).ok().flatten().map(|w| w.status);
+    let (wall, notes) = crate::walls::update(store, id, upd).map_err(|e| e.to_string())?;
+    let mut out = format!("Updated wall #{id}.\n{}", crate::walls::render_full(&wall));
+    if matches!(wall.status.as_str(), "moved" | "retired") && before.as_deref() != Some(wall.status.as_str()) {
+        let n = crate::reconcile::dispute_entries_citing_wall(store, id, &wall.status).unwrap_or(0);
+        if n > 0 {
+            out.push_str(&format!("{n} knowledge entr(ies) citing wall #{id} are now served as disputed.\n"));
+        }
+    }
+    for n in notes {
+        out.push_str(&format!("Note: {n}\n"));
+    }
+    Ok(out)
 }
 
 // ── edit_guard ──────────────────────────────────────────────────────────────
@@ -174,11 +676,42 @@ const EDIT_GUARD_MIN_SCORE: usize = 3;
 /// most four in total, and a match threshold higher than ordinary retrieval
 /// uses. Silence is the expected outcome and returns an empty string.
 fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
-    let Some(hit) = edit_guard_match(args, store, session_id, &[])? else {
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(t) = dependency_revisits(store, session_id, file_path, edit_added(args)) {
+        texts.push(t);
+    }
+    if let Some(hit) = edit_guard_match(args, store, session_id, &[])? {
+        edit_guard_record(store, session_id, hit.id, &hit.file, hit.text.len());
+        texts.push(hit.text);
+    }
+    if texts.is_empty() {
         return Ok(String::new());
-    };
-    edit_guard_record(store, session_id, hit.id, &hit.file, hit.text.len());
-    Ok(crate::push::deliver(args, &hit.text))
+    }
+    Ok(crate::push::deliver(args, &texts.join("\n\n")))
+}
+
+/// The text an edit adds: Edit sends new_string (as `added`), Write sends
+/// content. Either may be absent.
+fn edit_added(args: &Value) -> &str {
+    args.get("added")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| args.get("content").and_then(|v| v.as_str()))
+        .unwrap_or("")
+}
+
+/// A manifest edit that moves a package some wall is bound to: that wall,
+/// pushed once per session. Called by every edit hook path.
+pub(crate) fn dependency_revisits(
+    store: &Store,
+    session_id: &str,
+    file_path: &str,
+    added: &str,
+) -> Option<String> {
+    let names = crate::walls::changed_dependencies(file_path, added);
+    let file = file_path.rsplit(['/', '\\']).next().unwrap_or(file_path);
+    wall_revisits(store, session_id, &format!("This edit to {file}"), &names)
 }
 
 /// A trap the edit guard would raise for one edit, before anything is recorded.
@@ -198,13 +731,7 @@ pub(crate) fn edit_guard_match(
     session_id: &str,
     exclude: &[i64],
 ) -> Result<Option<GuardHit>, String> {
-    // Edit sends new_string; Write sends content. Either may be absent.
-    let added = args
-        .get("added")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .or_else(|| args.get("content").and_then(|v| v.as_str()))
-        .unwrap_or("");
+    let added = edit_added(args);
     // A one-line tweak carries no context to judge; matching it produces noise.
     if added.len() < 120 {
         return Ok(None);
@@ -343,10 +870,18 @@ fn tool_compact_output(
     let _ = store.log_compression_saving(session_id, command, observed, observed);
     let _ = repo_root;
 
+    let mut texts: Vec<String> = Vec::new();
     // What the agent CAN be told: that this failure is one the store already
     // knows. Delivered as additionalContext, once per failure per session.
     if verdict == Some(false) {
-        if let Some(p) = crate::push::failure_recall(store, &raw) {
+        if let Some(mut p) = crate::push::failure_recall(store, &raw) {
+            if let Some(line) = p
+                .anti_pattern_id
+                .and_then(|ap| crate::reconcile::recurrence_after_delivery(store, session_id, &p.key, ap))
+            {
+                p.text.push_str("\n");
+                p.text.push_str(&line);
+            }
             let under_cap = store
                 .push_count(session_id, "failure_recall")
                 .map(|n| n < crate::push::FAILURE_PUSH_SESSION_CAP)
@@ -356,11 +891,19 @@ fn tool_compact_output(
                     .record_push(session_id, "failure_recall", &p.key, p.anti_pattern_id, p.text.len())
                     .unwrap_or(false)
             {
-                return Ok(crate::push::deliver(args, &p.text));
+                texts.push(p.text);
             }
         }
     }
-    Ok(String::new())
+    // And that a package this command just moved carries a limit on record.
+    let moved = crate::walls::cargo_reported_changes(&raw);
+    if let Some(t) = wall_revisits(store, session_id, "This command", &moved) {
+        texts.push(t);
+    }
+    if texts.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(crate::push::deliver(args, &texts.join("\n\n")))
 }
 
 // ── semantic_search ───────────────────────────────────────────────────────────
@@ -776,11 +1319,13 @@ fn tool_get_context(
 
     let packet = build_context_packet_with(store, units, &augmented, budget, Some(repo_root), Some(&delta_opts))
         .map_err(|e| e.to_string())?;
+    let walls = walls_section(store, hint);
 
     if packet.relevant_units.is_empty()
         && packet.patterns.is_empty()
         && packet.anti_patterns.is_empty()
         && packet.annotations.is_empty()
+        && walls.is_empty()
     {
         let _ = store.log_query_gap(
             "get_context",
@@ -811,6 +1356,7 @@ fn tool_get_context(
         out.push('\n');
     }
     out.push_str(&render_packet(&packet));
+    out.push_str(&walls);
     Ok(out)
 }
 
@@ -977,6 +1523,8 @@ fn tool_recall(
 ) -> Result<String, String> {
     let topic = args["topic"].as_str().ok_or("missing `topic`")?;
     let topic_lower = topic.to_lowercase();
+    let mut recalled_patterns: Vec<i64> = Vec::new();
+    let mut recalled_aps: Vec<i64> = Vec::new();
     let terms = recall_terms(topic);
 
     let mut out = format!("# Recall: `{topic}`\n\n");
@@ -1041,6 +1589,7 @@ fn tool_recall(
             if let Some(id) = p.id {
                 let _ = store.pattern_used(id);
                 let _ = store.log_session_retrieval(session_id, "patterns", id, "recall");
+                recalled_patterns.push(id);
             }
         }
         push_more_matched(&mut out, matched_patterns.len());
@@ -1077,6 +1626,7 @@ fn tool_recall(
             }
             if let Some(id) = ap.id {
                 let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "recall");
+                recalled_aps.push(id);
             }
         }
         push_more_matched(&mut out, matched_aps.len());
@@ -1121,6 +1671,8 @@ fn tool_recall(
     }
 
     cap_response(&mut out, "Narrow the topic to see the rest.");
+    out.push_str(&crate::reconcile::serving_notes(store, "anti_patterns", &recalled_aps));
+    out.push_str(&crate::reconcile::serving_notes(store, "patterns", &recalled_patterns));
     Ok(out)
 }
 
@@ -1312,6 +1864,8 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
     // well under the limit, but a `detail=full` call over a store that keeps
     // growing must degrade to a shorter answer rather than to a transport error.
     cap_response(&mut out, "Pass a narrower hint, or detail=\"summary\", to see the rest.");
+    let shown: Vec<i64> = chosen.iter().filter_map(|&i| patterns[i].id).collect();
+    out.push_str(&crate::reconcile::serving_notes(store, "patterns", &shown));
 
     // A hint is mandatory now, so it can no longer be absent — but it can still
     // tokenise to nothing (all stop-words, or terms no pattern uses). Say which
@@ -1549,11 +2103,14 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
         // retrievals feed pattern-survival scoring, so suppressing the log for
         // omitted entries would quietly starve the very signal the required
         // hint was introduced to produce.
-        if let Some(id) = ap.id {
-            let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "get_anti_patterns");
-        }
-
         let relevant = chosen.contains(&idx);
+        // Expanded entries are logged under their own name, as list_patterns
+        // does: logging every listed entry as one kind made anti-pattern use
+        // unmeasurable (75,554 rows for 456 entries by 2026-09-30).
+        if let Some(id) = ap.id {
+            let tool = if relevant { "get_anti_patterns_hint" } else { "get_anti_patterns" };
+            let _ = store.log_session_retrieval(session_id, "anti_patterns", id, tool);
+        }
 
         // An unchanged entry is omitted only when it is ALSO not hint-relevant:
         // the caller asked about this topic, so the remedy is what they came for
@@ -1642,6 +2199,14 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
              closest to your hint are shown. Narrow the hint to reach the rest.)\n"
         ));
     }
+
+    // Entries shown whole that are disputed or never reconciled with a
+    // look-alike: one line each, at most three.
+    let shown: Vec<i64> = chosen.iter().filter_map(|&i| aps[i].id).collect();
+    body.push_str(&crate::reconcile::serving_notes(store, "anti_patterns", &shown));
+
+    // Limits on record for this task, each with its open edge.
+    body.push_str(&walls_section(store, &_hint));
 
     // The stamp for the next call. Passing it back turns a repeat into a delta.
     body.push_str(&format!("
@@ -2279,7 +2844,14 @@ fn review_queue_line(store: &Store) -> String {
     // the change journal, so it costs one query while the journal is empty.
     let drifted = crate::knowledge::drifted_entries(store).len();
 
-    if drafted.is_empty() && proposals == 0 && repeats.is_empty() && open == 0 && drifted == 0 {
+    // Limits whose revisit date has come: walls expire (a platform gains a
+    // feature, a library moves on), and nothing else would reopen them.
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let due = crate::walls::due_for_revisit(store, &today).unwrap_or_default();
+
+    if drafted.is_empty() && proposals == 0 && repeats.is_empty() && open == 0 && drifted == 0
+        && due.is_empty()
+    {
         return String::new();
     }
 
@@ -2325,6 +2897,16 @@ fn review_queue_line(store: &Store) -> String {
             "  {drifted} pattern/anti-pattern entr(ies) name code that changed after they were \
              written\n    list: {}  (re-verify, then update or supersede)\n",
             crate::cache::launcher_command("knowledge-drift")
+        ));
+    }
+    for w in &due {
+        out.push_str(&format!(
+            "  wall #{} is due for revisit (after {}): {}\n    re-check it, then \
+             update_wall(id={}, ...) with what you found\n",
+            w.id,
+            w.revisit_after.as_deref().unwrap_or(""),
+            clip_chars(&w.claim, 90),
+            w.id
         ));
     }
     out
@@ -2436,6 +3018,7 @@ fn tool_flush_knowledge_markers(
                 format!("Context: {context}\nDecision: {decision}"),
             crate::markers::KnowledgeMarker::PrefsNote { body, .. } => body.clone(),
             crate::markers::KnowledgeMarker::SkillCandidate { summary, .. } => summary.clone(),
+            crate::markers::KnowledgeMarker::Wall(w) => crate::walls::marker_body(w),
         };
         let name = marker.display_name();
         let tags_json = "[]".to_string();
@@ -2501,14 +3084,24 @@ fn tool_closeout_session(
     // Build response.
     let mut out = String::new();
 
-    if inline_approve {
-        out.push_str("✓ KNOWLEDGE COMMITTED — session closed.\n\n");
+    if inline_approve || result.auto_committed {
+        out.push_str(if inline_approve {
+            "✓ KNOWLEDGE COMMITTED — session closed.\n\n"
+        } else {
+            "✓ Session closed. Knowledge committed automatically; a sample is audited \
+             (`cortex knowledge audit`), and any entry can be taken back \
+             (`cortex knowledge undo ap:<id>`).\n\n"
+        });
         out.push_str("Committed to Cortex DB:\n");
         out.push_str(&format!("  {} patterns\n", result.patterns_committed));
         out.push_str(&format!("  {} anti-patterns\n", result.anti_patterns_committed));
         out.push_str(&format!("  {} corrections\n", result.corrections_committed));
         out.push_str(&format!("  {} ADRs\n", result.adrs_committed));
         out.push_str(&format!("  {} prefs notes\n", result.prefs_notes_committed));
+        out.push_str(&format!("  {} walls\n", result.walls_committed));
+        if result.markers_known > 0 {
+            out.push_str(&format!("  ({} marker(s) were already in the store)\n", result.markers_known));
+        }
         if result.skill_candidates_staged > 0 {
             out.push_str(&format!("  {} skill candidates staged for Tier 2 consolidation\n",
                 result.skill_candidates_staged));
@@ -3665,4 +4258,420 @@ mod delta_mode_tests {
         assert!(MAX_RESPONSE_CHARS < 60_000);
     }
 
+}
+
+#[cfg(test)]
+mod walls_tool_tests {
+    use super::*;
+
+    fn store(tag: &str) -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new(tag).unwrap()
+    }
+
+    fn ray_query_wall(s: &Store) -> i64 {
+        let out = tool_record_wall(
+            &json!({
+                "claim": "Hardware ray queries are unavailable on Quest 3",
+                "provenance": "hardware",
+                "evidence": ["inferred: July's answer assumed the Adreno 740 has no RT units"],
+                "topic": ["quest", "raytracing"],
+                "untested": "whether Quest's driver exposes VK_KHR_ray_query",
+                "cheapest_test": "log VK_KHR_ray_query at startup (~15 min)"
+            }),
+            s,
+        )
+        .unwrap();
+        assert!(out.starts_with("Recorded wall #"), "{out}");
+        crate::walls::find_by_claim(s, "Hardware ray queries are unavailable on Quest 3")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_limit_dispute_gets_the_audit_and_the_walls_on_record() {
+        let s = store("walls_audit");
+        let id = ray_query_wall(&s);
+        let out = tool_note_challenge(
+            &json!({"prompt": "what level of raytracing IS possible on the quest 3?"}),
+            &s,
+            "sess",
+        )
+        .unwrap();
+        assert!(out.contains("That disputes a limit"), "{out}");
+        assert!(out.contains("Whose limit is it"), "{out}");
+        assert!(out.contains("only with a new fact"), "{out}");
+        assert!(out.contains(&format!("#{id} LIMIT [open · hardware]")), "the matching wall rides along: {out}");
+
+        let plain = tool_note_challenge(&json!({"prompt": "are you sure that hook fires?"}), &s, "sess").unwrap();
+        assert!(plain.contains("Settle it by CHECKING"), "{plain}");
+        assert!(!plain.contains("wall audit"), "{plain}");
+    }
+
+    #[test]
+    fn settling_a_limit_dispute_needs_a_wall_and_links_both_ways() {
+        let s = store("walls_resolve");
+        crate::corrections::note(&s, "sess", "I believe it is more doable than you wrote off").unwrap();
+        let cid: i64 = s.conn().query_row("SELECT MAX(id) FROM challenges", [], |r| r.get(0)).unwrap();
+        let args = |wall: Option<i64>| {
+            let mut v = json!({"id": cid, "verdict": "user_right",
+                               "subject": "Ray queries on Quest are untested, not absent",
+                               "evidence": "Mesa Turnip exposes accelerated ray queries on a740+"});
+            if let Some(w) = wall { v["wall_id"] = json!(w); }
+            v
+        };
+        let err = tool_resolve_challenge(&args(None), &s).unwrap_err();
+        assert!(err.contains("disputes a limit"), "{err}");
+        let err = tool_resolve_challenge(&args(Some(999)), &s).unwrap_err();
+        assert!(err.contains("no wall #999"), "{err}");
+
+        let wall = ray_query_wall(&s);
+        let ok = tool_resolve_challenge(&args(Some(wall)), &s).unwrap();
+        assert!(ok.contains(&format!("Linked to wall #{wall}")), "{ok}");
+        let linked: Option<i64> = s.conn()
+            .query_row("SELECT wall_id FROM challenges WHERE id = ?1", [cid], |r| r.get(0)).unwrap();
+        assert_eq!(linked, Some(wall));
+        assert_eq!(crate::walls::get(&s, wall).unwrap().unwrap().challenge_id, Some(cid));
+    }
+
+    #[test]
+    fn an_unresolved_limit_dispute_needs_no_wall() {
+        let s = store("walls_unresolved");
+        crate::corrections::note(&s, "sess", "don't blindly believe coded hard limits").unwrap();
+        let cid: i64 = s.conn().query_row("SELECT MAX(id) FROM challenges", [], |r| r.get(0)).unwrap();
+        let out = tool_resolve_challenge(
+            &json!({"id": cid, "verdict": "unresolved", "subject": "never checked", "evidence": ""}),
+            &s,
+        )
+        .unwrap();
+        assert!(out.contains("unresolved"), "{out}");
+    }
+
+    #[test]
+    fn retrieval_serves_matching_walls_capped_and_with_the_base_rate() {
+        let s = store("walls_section");
+        for i in 0..5 {
+            tool_record_wall(
+                &json!({
+                    "claim": format!("Quest renderer limit number {i} holds at our budget"),
+                    "provenance": "budget",
+                    "evidence": [{"kind": "measured", "text": "bench.py hallway view 13.9 ms", "date": "2026-09-28"}],
+                    "status": if i == 0 { "moved" } else { "open" },
+                    "topic": "quest,renderer",
+                    "cheapest_test": "one bench.py run (~20 min)"
+                }),
+                &s,
+            )
+            .unwrap();
+        }
+        let section = walls_section(&s, "quest renderer budget");
+        assert!(section.starts_with("\n## Walls on record\n"), "{section}");
+        assert!(section.contains("Here, 1 of 1 tested limits moved"), "{section}");
+        assert_eq!(section.matches(" LIMIT [").count(), WALLS_IN_CONTEXT, "{section}");
+        assert!(section.contains("(+2 more"), "{section}");
+        assert!(section.chars().count() <= WALLS_SECTION_CAP);
+        assert_eq!(walls_section(&s, "slint scroll thumb"), "", "no match, no section");
+
+        crate::crystallizer::add_anti_pattern(
+            &s, "A renderer change that skips the bench reads as free", "ship it", "run bench.py", vec![],
+        )
+        .unwrap();
+        let aps = tool_get_anti_patterns(&json!({"hint": "quest renderer budget"}), &s, "sess").unwrap();
+        let walls_at = aps.find("## Walls on record").expect("walls in get_anti_patterns");
+        assert!(walls_at < aps.rfind("as of ").unwrap(), "the as-of stamp stays last");
+    }
+
+    #[test]
+    fn the_tools_enforce_provenance_and_a_new_fact_for_a_verdict() {
+        let s = store("walls_rules");
+        let err = tool_record_wall(
+            &json!({"claim": "Splat relighting is not a Quest 3 technique", "provenance": "vibes",
+                    "evidence": ["implementation: relighting papers run 30-40 FPS on desktop"],
+                    "cheapest_test": "one Adreno profiler run"}),
+            &s,
+        )
+        .unwrap_err();
+        assert!(err.contains("whose limit"), "{err}");
+
+        let wall = ray_query_wall(&s);
+        let err = tool_update_wall(
+            &json!({"id": wall, "status": "moved", "evidence": ["inferred: it probably works"]}),
+            &s,
+        )
+        .unwrap_err();
+        assert!(err.contains("needs a new fact"), "{err}");
+        let ok = tool_update_wall(
+            &json!({"id": wall, "status": "moved",
+                    "evidence": [{"kind": "measured", "text": "VK_KHR_ray_query listed on the headset", "date": "2026-09-30"}]}),
+            &s,
+        )
+        .unwrap();
+        assert!(ok.contains("[moved]"), "{ok}");
+        let listing = tool_get_walls(&json!({"hint": "raytracing quest"}), &s).unwrap();
+        assert!(listing.contains("1 walls on record: 0 open, 0 holding, 1 moved."), "{listing}");
+    }
+
+    fn version_bound_wall(s: &Store) -> i64 {
+        tool_record_wall(
+            &json!({"claim": "wgpu cannot multisample a layered texture on our Quest path",
+                    "provenance": "library-version", "status": "holds",
+                    "evidence": [{"kind": "measured", "text": "wgpu 25 rejects array layers with MSAA", "date": "2026-09-18"}],
+                    "topic": ["wgpu", "msaa"]}),
+            s,
+        )
+        .unwrap();
+        crate::walls::find_by_claim(s, "wgpu cannot multisample a layered texture on our Quest path").unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_manifest_edit_reopens_a_version_bound_wall_once_per_session() {
+        let s = store("walls_dep_edit");
+        let id = version_bound_wall(&s);
+        let args = json!({"file_path": "vr_workspace/space_soup/Cargo.toml", "added": "wgpu = \"31.0.0\""});
+        let out = tool_edit_guard(&args, &s, "sess").unwrap();
+        let v: Value = serde_json::from_str(&out).expect("hook JSON");
+        let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(ctx.contains("This edit to Cargo.toml changes `wgpu`"), "{ctx}");
+        assert!(ctx.contains(&format!("wall #{id} is bound to it")), "{ctx}");
+        assert_eq!(tool_edit_guard(&args, &s, "sess").unwrap(), "", "once per wall per session");
+        assert_ne!(tool_edit_guard(&args, &s, "other").unwrap(), "", "a new session hears it again");
+        let src = json!({"file_path": "src/lib.rs", "added": "let wgpu = 31;"});
+        assert_eq!(tool_edit_guard(&src, &s, "third").unwrap(), "", "only manifests count");
+    }
+
+    #[test]
+    fn cargo_update_output_reopens_a_version_bound_wall() {
+        let s = store("walls_dep_bash");
+        let id = version_bound_wall(&s);
+        let out = tool_compact_output(
+            &json!({"command": "cargo update -p wgpu",
+                    "stdout": "", "stderr": "    Updating crates.io index\n    Updating wgpu v30.0.1 -> v31.0.0\n"}),
+            &s,
+            "sess",
+            Path::new("."),
+        )
+        .unwrap();
+        assert!(out.contains(&format!("wall #{id} is bound to it")), "{out}");
+        assert!(out.contains("This command changes `wgpu`"), "{out}");
+    }
+
+    #[test]
+    fn retrieval_flags_an_open_wall_that_a_short_test_would_settle() {
+        let s = store("walls_cheap");
+        let id = ray_query_wall(&s);
+        let section = walls_section(&s, "raytracing quest");
+        assert!(section.contains(&format!("Cheap to settle now: #{id} (~15 min).")), "{section}");
+    }
+
+    #[test]
+    fn a_wall_due_for_revisit_is_listed_for_review() {
+        let s = store("walls_review");
+        tool_record_wall(
+            &json!({"claim": "Horizon OS blocks FastRPC to the cDSP for sideloaded apps",
+                    "provenance": "platform", "status": "holds",
+                    "evidence": [{"kind": "measured", "text": "dlopen refused three ways on device", "date": "2026-09-17"}],
+                    "revisit_after": "2026-01-01"}),
+            &s,
+        )
+        .unwrap();
+        let block = review_queue_line(&s);
+        assert!(block.contains("is due for revisit (after 2026-01-01)"), "{block}");
+    }
+}
+
+#[cfg(test)]
+mod loop_tool_tests {
+    use super::*;
+
+    fn store(tag: &str) -> crate::test_support::TempStore {
+        crate::test_support::TempStore::new(tag).unwrap()
+    }
+
+    const TRAP: &str = "calling zorbulate_widget::frobnicate twice corrupts the widget_cache";
+
+    fn seed(s: &Store) -> (i64, i64) {
+        s.conn()
+            .execute(
+                "INSERT INTO anti_patterns (description, wrong, correct, tags, added_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    TRAP,
+                    "zorbulate_widget::frobnicate(); zorbulate_widget::frobnicate(); widget_cache.read()",
+                    "call zorbulate_widget::frobnicate once, then widget_cache.refresh()",
+                    "[\"zorbulate_widget\",\"widget_cache\"]",
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        let ap = s.conn().last_insert_rowid();
+        let marker = crate::markers::KnowledgeMarker::Pattern {
+            name: "zorbulate-widget-refresh".into(),
+            intent: "Refresh the zorbulate_widget cache after frobnicate".into(),
+            body: "Call zorbulate_widget::frobnicate once, then widget_cache.refresh().".into(),
+            trust: "verified".into(),
+            kind: String::new(),
+            uses: vec!["zorbulate_widget".into()],
+            tags: vec!["zorbulate_widget".into()],
+        };
+        let pat = s.insert_pattern(&crate::closeout::pattern_from_marker(&marker).unwrap()).unwrap();
+        (ap, pat)
+    }
+
+    /// Every path that serves knowledge, with the text it returned. `session`
+    /// must differ between calls: the edit guard warns once per file per session.
+    fn served(s: &Store, session: &str) -> Vec<(&'static str, String)> {
+        let hint = json!({ "hint": "zorbulate_widget frobnicate widget_cache refresh" });
+        let root = std::env::temp_dir();
+        let sessions = SessionRegistry::new();
+        vec![
+            ("get_anti_patterns", tool_get_anti_patterns(&hint, s, "s").unwrap_or_default()),
+            ("list_patterns", tool_list_patterns(&hint, s, "s").unwrap_or_default()),
+            (
+                "recall",
+                tool_recall(&json!({ "topic": "zorbulate_widget frobnicate" }), s, &[], &sessions, "s").unwrap_or_default(),
+            ),
+            ("get_context", tool_get_context(&hint, s, &[], &root, "", "s").unwrap_or_default()),
+            (
+                "edit_guard",
+                tool_edit_guard(
+                    &json!({
+                        "file_path": "src/widgets.rs",
+                        // The guard ignores edits adding under 120 characters.
+                        "added": "fn reload_all(widgets: &mut Widgets) {\n    zorbulate_widget::frobnicate(widgets);\n    zorbulate_widget::frobnicate(widgets);\n    let cached = widget_cache.read();\n    render(cached);\n}\n"
+                    }),
+                    s,
+                    session,
+                )
+                .unwrap_or_default(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_retracted_entry_is_served_by_no_path_and_moves_the_cache_key() {
+        let s = store("undo_paths");
+        let (ap, pat) = seed(&s);
+        let before = served(&s, "before");
+        // Discriminating: each path serves it while it is live.
+        for (path, text) in &before {
+            let hit = text.contains("zorbulate") || text.contains("frobnicate");
+            assert!(hit, "{path} did not serve the live entry, so this test proves nothing for it:\n{text}");
+        }
+        let v1 = crate::cache::compute_index_version(s.conn(), None).unwrap();
+        crate::loop_ledger::retract(&s, "anti_patterns", ap, "test", "").unwrap();
+        crate::loop_ledger::retract(&s, "patterns", pat, "test", "").unwrap();
+        let v2 = crate::cache::compute_index_version(s.conn(), None).unwrap();
+        assert_ne!(v1, v2, "retracting must move the response cache key, or cached answers keep serving it");
+        for (path, text) in served(&s, "after") {
+            assert!(
+                !text.contains("zorbulate_widget::frobnicate twice") && !text.contains("zorbulate-widget-refresh"),
+                "{path} still serves a retracted entry:\n{text}"
+            );
+        }
+        crate::loop_ledger::restore(&s, "anti_patterns", ap).unwrap();
+        assert_ne!(crate::cache::compute_index_version(s.conn(), None).unwrap(), v2, "restoring moves it back");
+    }
+
+    #[test]
+    fn an_agent_noted_miss_is_recorded_with_its_source_and_gets_the_procedure() {
+        let s = store("agent_miss");
+        let out = tool_note_challenge(
+            &json!({ "prompt": "hmm, I really doubt that part", "source": "agent" }),
+            &s,
+            "s1",
+        )
+        .unwrap();
+        assert!(out.contains("the hook's cues missed"), "{out}");
+        let (cue, source): (String, String) = s
+            .conn()
+            .query_row("SELECT cue, source FROM challenges ORDER BY id DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(source, "agent");
+        assert_eq!(cue, crate::corrections::MISSED_LABEL);
+
+        let out = tool_note_challenge(
+            &json!({ "prompt": "surely we could get that running on the headset", "source": "agent", "limit": true }),
+            &s,
+            "s1",
+        )
+        .unwrap();
+        assert!(out.contains("limit dispute"), "{out}");
+        let id: i64 = s.conn().query_row("SELECT MAX(id) FROM challenges", [], |r| r.get(0)).unwrap();
+        // A limit miss follows the limit rules: settling it needs a wall...
+        let refused = tool_resolve_challenge(
+            &json!({ "id": id, "verdict": "user_right", "subject": "it runs", "evidence": "ran it on the headset and it worked" }),
+            &s,
+        );
+        assert!(refused.unwrap_err().contains("wall ledger"));
+        // ...unless it was not a dispute after all.
+        let ok = tool_resolve_challenge(
+            &json!({ "id": id, "verdict": "not_a_challenge", "subject": "a question, not a dispute", "evidence": "" }),
+            &s,
+        )
+        .unwrap();
+        assert!(ok.contains("not_a_challenge"), "{ok}");
+        // The hook's own heartbeat is untouched by the agent's calls.
+        assert!(crate::corrections::heartbeat(&s).is_none());
+    }
+
+    #[test]
+    fn a_pair_notice_rides_on_the_next_prompt_once_and_serving_shows_the_pair() {
+        let s = store("pair_delivery");
+        let (ap, _) = seed(&s);
+        s.conn()
+            .execute(
+                "INSERT INTO anti_patterns (description, wrong, correct, tags, added_at) VALUES (?1, 'w', 'c', '[]', ?2)",
+                params!["frobnicating a zorbulate_widget twice leaves widget_cache stale", chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        let newer = s.conn().last_insert_rowid();
+        crate::reconcile::open_pair(&s, "anti_patterns", newer, ap, 0.4, false).unwrap();
+        let out = tool_note_challenge(&json!({ "prompt": "ok, carry on with the next step" }), &s, "s").unwrap();
+        assert!(out.contains("resolve_pair") && out.contains(&format!("ap:{newer}")), "{out}");
+        let again = tool_note_challenge(&json!({ "prompt": "and the one after that" }), &s, "s").unwrap();
+        assert!(again.is_empty(), "announced once: {again}");
+        let served = tool_get_anti_patterns(&json!({ "hint": "zorbulate_widget frobnicate widget_cache" }), &s, "s").unwrap();
+        assert!(served.contains("## Not yet reconciled") && served.contains("never reconciled"), "{served}");
+        let notes_at = served.find("## Not yet reconciled").unwrap();
+        assert!(notes_at < served.rfind("as of ").unwrap(), "the as-of stamp stays last");
+        let out = tool_resolve_pair(&json!({ "kind": "anti_patterns", "new_id": newer, "old_id": ap, "verdict": "compatible" }), &s).unwrap();
+        assert!(out.contains("both stand"), "{out}");
+        let served = tool_get_anti_patterns(&json!({ "hint": "zorbulate_widget frobnicate widget_cache" }), &s, "s2").unwrap();
+        assert!(!served.contains("never reconciled"), "a resolved pair is not shown again");
+    }
+
+    #[test]
+    fn the_capture_tool_answers_a_hook_with_nothing_and_commits_the_marker() {
+        let s = store("capture_tool");
+        let dir = std::env::temp_dir().join(format!("cx-{}/.claude/projects/p", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("session.jsonl");
+        let text = "[CORTEX-AP: description=\"a hook-captured trap about sprockets\" tags=\"t\"]\nwrong: a\ncorrect: b\n[/CORTEX-AP]";
+        let line = json!({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}});
+        std::fs::write(&t, format!("{line}\n")).unwrap();
+        let root = std::env::temp_dir();
+        let out = tool_capture_markers(
+            &json!({ "transcript_path": t.to_string_lossy(), "hook_event_name": "Stop" }),
+            &s,
+            &root,
+        )
+        .unwrap();
+        assert_eq!(out, "", "a Stop hook must get nothing back");
+        let n: i64 = s
+            .conn()
+            .query_row("SELECT COUNT(*) FROM anti_patterns WHERE description = 'a hook-captured trap about sprockets'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let fired: i64 = s
+            .conn()
+            .query_row("SELECT fired FROM hook_heartbeat WHERE hook = 'capture_markers'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fired, 1);
+        // Called by hand, it reports.
+        let manual = tool_capture_markers(&json!({ "transcript_path": t.to_string_lossy() }), &s, &root).unwrap();
+        assert_eq!(manual, "no new markers");
+        // A broken template is recorded where a person will see it.
+        let bad = tool_capture_markers(&json!({ "transcript_path": "${transcript_path}", "hook_event_name": "Stop" }), &s, &root).unwrap();
+        assert_eq!(bad, "");
+        assert!(s.get_meta("loop.capture_error").unwrap().unwrap().contains("uninterpolated"));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("cx-{}", std::process::id())));
+    }
 }

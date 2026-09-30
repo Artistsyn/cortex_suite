@@ -71,6 +71,14 @@ A nudge that a failure has recurred across sessions with nothing recorded is a
 request. Once you know the cause, record it with the printed
 `anti-pattern add ... --resolves '<signature>'` command.
 
+## Limits
+
+A limit is a claim with a provenance. Before accepting one — including one you
+retrieved — say whose limit it is and what cheap check would move it. Check
+`get_walls(hint: "<the limit>")` first, and record what you accept, dispute or
+test with `record_wall` / `update_wall`: a verdict changes only with a new fact
+(a measurement or a dated source).
+
 ## API facts
 
 - `get_item(name)` returns the full definition including methods from **every**
@@ -92,10 +100,16 @@ request. Once you know the cause, record it with the printed
 Embed markers as you go:
 
 ```
-[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
+[CORTEX-AP: description="..." tags="..."]wrong: ...
+correct: ...[/CORTEX-AP]
 [CORTEX-PATTERN: name="..." intent="..." trust="verified"]body[/CORTEX-PATTERN]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
+[CORTEX-WALL: claim="..." provenance="hardware" cheapest_test="..."]measured: what @ where @ 2026-09-30[/CORTEX-WALL]
 ```
+
+`correct:` must start its own line; the split is per line. A WALL needs a
+`provenance` and at least one evidence line `kind: text @ source @ date`
+(sources dated), or closeout refuses it and says why.
 
 A pattern takes an optional `kind="constraint|policy|fact"` (default
 `procedure`). Constraints and policies are served in their own sections ahead
@@ -117,20 +131,20 @@ report and in `get_session_health`, with the command that resolves it
 
 ### Closing the session
 
-Markers alone do not save anything. When the work is verifiably done, present a
-short summary of what you captured and ask for the word:
+When the work is verifiably done, call `closeout_session(outcome_type="build_pass")`.
+It commits your `[CORTEX-*]` markers through the gates without waiting for approval:
+in VS Code it reads them from this chat; in any other host, pass them as
+`markers_text`. A person audits a random sample (`cortex knowledge audit`) instead
+of approving every entry. If the work did not verify, call
+`closeout_session(outcome_type="build_fail")`.
 
-```
-KNOWLEDGE COMMITTED
-```
+**Close the session.** In VS Code, markers reach the store only through
+closeout; a session that never closes loses them. (Claude Code also captures
+them from its transcript as they are written.)
 
-On that reply, call `closeout_session(outcome_type="build_pass",
-inline_approve=true, markers_text=<your [CORTEX-*] markers from this session>)`.
-
-**Pass `markers_text`.** Outside VS Code there is no chat store to scrape, so
-omitting it commits nothing — the session ends and every marker you wrote is
-lost. If the work did not verify, call `closeout_session(outcome_type="build_fail")`
-and do not pass `inline_approve`.
+If closeout answers "staged mode", the audit has switched automatic commit off.
+Present a short summary and ask for the word `KNOWLEDGE COMMITTED`; on that reply
+call `closeout_session(outcome_type="build_pass", inline_approve=true)`.
 
 ### Freshness - what "current" means here
 

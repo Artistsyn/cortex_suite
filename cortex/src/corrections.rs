@@ -53,6 +53,11 @@ pub enum Verdict {
     /// somewhere to put "we moved on without finding out", instead of being
     /// pushed toward inventing a verdict to clear the queue.
     Unresolved,
+    /// The hook fired on a message that did not dispute anything. Stores
+    /// nothing, and is the negative label cue tuning learns from: without it a
+    /// false fire could only be left unresolved, indistinguishable from a real
+    /// dispute nobody settled.
+    NotAChallenge,
 }
 
 impl Verdict {
@@ -62,6 +67,7 @@ impl Verdict {
             "agent_right" | "agent" | "i_was_right" => Some(Self::AgentRight),
             "mixed" | "both" | "partly" => Some(Self::Mixed),
             "unresolved" | "unknown" | "none" => Some(Self::Unresolved),
+            "not_a_challenge" | "not_challenge" | "false_alarm" | "false_positive" => Some(Self::NotAChallenge),
             _ => None,
         }
     }
@@ -72,6 +78,7 @@ impl Verdict {
             Self::AgentRight => "agent_right",
             Self::Mixed => "mixed",
             Self::Unresolved => "unresolved",
+            Self::NotAChallenge => "not_a_challenge",
         }
     }
 
@@ -89,7 +96,7 @@ impl Verdict {
 /// claim already made*, never language that merely asks for work.
 ///
 /// Every entry below is matched against a lowercased prompt.
-const CUES: &[(&str, &str)] = &[
+pub(crate) const CUES: &[(&str, &str)] = &[
     // Direct disputes.
     ("you don't think", "disputes a conclusion"),
     ("you dont think", "disputes a conclusion"),
@@ -123,16 +130,142 @@ const CUES: &[(&str, &str)] = &[
     ("isn't it?", "asks the agent to confirm a stated fact"),
     ("if i'm wrong", "invites the agent to contradict them"),
     ("if im wrong", "invites the agent to contradict them"),
+    ("you keep saying", "disputes a repeated claim"),
+    // Explicit pushback. Not the bare word: "I'm open for pushback" invites it.
+    ("give pushback", "pushes back on a claim"),
+    ("some pushback", "pushes back on a claim"),
+    ("pushback to", "pushes back on a claim"),
+    ("pushback on", "pushes back on a claim"),
+    ("pushback that", "pushes back on a claim"),
+    ("push back on", "pushes back on a claim"),
+    ("push back that", "pushes back on a claim"),
+    ("want to push back", "pushes back on a claim"),
 ];
 
+/// Phrases that dispute a LIMIT the agent stated or accepted: a write-off, a
+/// "not possible", a limit resting on a document, a version or an authority.
+///
+/// Chosen by replaying every user message in this workspace (2,195, queued
+/// ones included) and reading each hit: 26 fire, 24 of them real pushbacks
+/// against a limit, the other 2 questions ABOUT limits. They include every
+/// pushback found by hand. Three were added on 2026-09-30 after one was missed
+/// live ("I want to give some pushback ... we COULD"): the replay added exactly
+/// those three and nothing else. Near misses that must stay silent are tested
+/// below ("is that doable without costing us...", "get creative with your
+/// suggestions", "within the limitations of the quest 3").
+pub(crate) const LIMIT_CUES: &[(&str, &str)] = &[
+    ("wrote off", "disputes a write-off"),
+    ("write off", "disputes a write-off"),
+    ("written off", "disputes a write-off"),
+    ("writing off", "disputes a write-off"),
+    ("wrote it off", "disputes a write-off"),
+    ("write it off", "disputes a write-off"),
+    ("doable than", "says it is doable"),
+    ("more doable", "says it is doable"),
+    ("honest limits", "disputes a stated limit"),
+    ("limits you mentioned", "disputes a stated limit"),
+    ("hard limit", "disputes a stated limit"),
+    ("coded limit", "disputes a stated limit"),
+    ("documented limitation", "disputes a stated limit"),
+    ("documented engine limitation", "disputes a stated limit"),
+    ("blindly believe", "refuses to accept a limit"),
+    ("blindly accept", "refuses to accept a limit"),
+    ("rather than accepting", "refuses to accept a limit"),
+    ("instead of accepting", "refuses to accept a limit"),
+    ("by default accepting", "refuses to accept a limit"),
+    ("accepting the limit", "refuses to accept a limit"),
+    ("accepting limits", "refuses to accept a limit"),
+    ("settle for", "refuses to accept a limit"),
+    ("we know we can", "cites evidence it can be done"),
+    ("other games manage", "cites evidence it can be done"),
+    ("other engines manage", "cites evidence it can be done"),
+    ("other engines have", "cites evidence it can be done"),
+    ("other games have", "cites evidence it can be done"),
+    ("others have done", "cites evidence it can be done"),
+    ("overcome", "asks to get past a limit"),
+    ("overcoming", "asks to get past a limit"),
+    ("break through", "asks to get past a limit"),
+    ("get past", "asks to get past a limit"),
+    ("push past", "asks to get past a limit"),
+    ("research\" says", "disputes a limit resting on authority"),
+    ("what the research says", "disputes a limit resting on authority"),
+    ("the research says", "disputes a limit resting on authority"),
+    ("documentation says", "disputes a limit resting on authority"),
+    ("experts say", "disputes a limit resting on authority"),
+    ("consensus", "disputes a limit resting on authority"),
+    ("most recent version", "questions whether a limit is current"),
+    ("latest version", "questions whether a limit is current"),
+    ("later version", "questions whether a limit is current"),
+    ("newer version", "questions whether a limit is current"),
+    ("wrong on the latest", "questions whether a limit is current"),
+    ("beyond just meta documentation", "questions whether a limit is current"),
+    ("beyond the documentation", "questions whether a limit is current"),
+    ("there has to be a way", "insists there is a way"),
+    ("must be a way", "insists there is a way"),
+    ("sure there is a way", "insists there is a way"),
+    ("know there is a way", "insists there is a way"),
+    ("a way around", "insists there is a way"),
+    ("i know we can", "insists there is a way"),
+    ("together we can", "insists there is a way"),
+];
+
+/// Emphasis that only reads as a dispute in its original case: "what level of
+/// raytracing IS possible?"
+pub(crate) const LIMIT_EMPHASIS: &[(&str, &str)] = &[
+    (" IS possible", "insists it is possible"),
+    (" IS doable", "insists it is possible"),
+    // "the path ... that DOES exist and CAN work", "we COULD further automate"
+    (" CAN ", "insists it is possible"),
+    (" COULD ", "insists it is possible"),
+];
+
+/// A generic dispute ("are you sure", ", correct?") becomes a limit dispute
+/// when the message talks about what is possible or current. Whole words only:
+/// "limited to certain roots, correct?" is a question about scope.
+pub(crate) const LIMIT_WORDS: &[&str] = &[
+    "limit", "limits", "limitation", "limitations", "possible", "impossible", "doable",
+    "feasible", "realistic", "capability", "capabilities", "research",
+];
+/// Only alongside a dispute cue: on its own, "is there not a way to ..." is
+/// usually a feature request, and firing the audit on those was 2 of 5 wrong.
+pub(crate) const LIMIT_PHRASES: &[&str] = &[
+    "most recent", "most current", "latest",
+    "is there not a way", "isn't there a way", "is there no way",
+];
+
+/// The label a generic dispute gets when it is about a limit.
+const GENERIC_LIMIT_LABEL: &str = "disputes a limit";
+
+/// Is this cue label a dispute of a limit? Those get the wall audit.
+pub fn is_limit_cue(label: &str) -> bool {
+    label == GENERIC_LIMIT_LABEL
+        || LIMIT_CUES.iter().any(|(_, l)| *l == label)
+        || LIMIT_EMPHASIS.iter().any(|(_, l)| *l == label)
+}
+
+fn talks_about_limits(lower: &str) -> bool {
+    lower
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .any(|w| LIMIT_WORDS.contains(&w))
+        || LIMIT_PHRASES.iter().any(|p| lower.contains(p))
+}
+
 /// Does this user message dispute something? Returns the reason it matched.
+/// A dispute of a limit returns a label `is_limit_cue` accepts.
 ///
 /// Returns `None` for the overwhelming majority of messages, which is the point:
 /// this runs on every prompt and must cost nothing and say nothing when there is
 /// no disagreement.
 pub fn detect(prompt: &str) -> Option<&'static str> {
+    if let Some((_, why)) = LIMIT_EMPHASIS.iter().find(|(cue, _)| prompt.contains(cue)) {
+        return Some(why);
+    }
     let p = prompt.to_lowercase();
-    CUES.iter().find(|(cue, _)| p.contains(cue)).map(|(_, why)| *why)
+    if let Some((_, why)) = LIMIT_CUES.iter().find(|(cue, _)| p.contains(cue)) {
+        return Some(why);
+    }
+    let (_, why) = CUES.iter().find(|(cue, _)| p.contains(cue))?;
+    Some(if talks_about_limits(&p) { GENERIC_LIMIT_LABEL } else { why })
 }
 
 /// A short, quotable slice of the prompt — enough for a human to recognise the
@@ -188,7 +321,18 @@ pub fn heartbeat(store: &Store) -> Option<(i64, i64, i64)> {
 ///
 /// Returns the row id when something new was recorded, `None` when the message
 /// was not a challenge or was already noted.
+#[cfg(test)]
 pub fn note(store: &Store, session_id: &str, prompt: &str) -> Result<Option<i64>> {
+    Ok(note_with_cue(store, session_id, prompt)?.map(|(id, _)| id))
+}
+
+/// `note`, also returning the cue that matched, so a limit dispute can be
+/// answered with the wall audit rather than the generic reminder.
+pub fn note_with_cue(
+    store: &Store,
+    session_id: &str,
+    prompt: &str,
+) -> Result<Option<(i64, &'static str)>> {
     let Some(cue) = detect(prompt) else { return Ok(None) };
     let ex = excerpt(prompt);
 
@@ -205,7 +349,44 @@ pub fn note(store: &Store, session_id: &str, prompt: &str) -> Result<Option<i64>
         "INSERT INTO challenges (session_id, cue, excerpt) VALUES (?1, ?2, ?3)",
         params![session_id, cue, ex],
     )?;
-    Ok(Some(store.conn().last_insert_rowid()))
+    Ok(Some((store.conn().last_insert_rowid(), cue)))
+}
+
+/// Record a challenge the hook MISSED, noted by the agent: the positive label
+/// cue tuning learns from (plan L0). `limit` files it under the generic limit
+/// cue, so the wall audit and the wall-link rule apply exactly as if the hook
+/// had fired. Idempotent per (session, excerpt), like `note_with_cue`.
+pub fn note_missed(store: &Store, session_id: &str, prompt: &str, limit: bool) -> Result<Option<(i64, &'static str)>> {
+    let ex = excerpt(prompt);
+    let already: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM challenges WHERE session_id = ?1 AND excerpt = ?2",
+        params![session_id, ex],
+        |r| r.get(0),
+    )?;
+    if already > 0 {
+        return Ok(None);
+    }
+    let cue: &'static str = if limit { GENERIC_LIMIT_LABEL } else { MISSED_LABEL };
+    store.conn().execute(
+        "INSERT INTO challenges (session_id, cue, excerpt, source) VALUES (?1, ?2, ?3, 'agent')",
+        params![session_id, cue, ex],
+    )?;
+    Ok(Some((store.conn().last_insert_rowid(), cue)))
+}
+
+/// The cue label for a non-limit challenge the agent noted itself.
+pub const MISSED_LABEL: &str = "noted by the agent (the hook missed it)";
+
+/// The cue a challenge was recorded under, or `None` if there is no such row.
+pub fn cue_of(store: &Store, id: i64) -> Result<Option<String>> {
+    let cue = store
+        .conn()
+        .query_row("SELECT cue FROM challenges WHERE id = ?1", params![id], |r| r.get(0));
+    match cue {
+        Ok(c) => Ok(Some(c)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub struct OpenChallenge {
@@ -387,6 +568,96 @@ mod tests {
     #[test]
     fn detection_is_case_insensitive() {
         assert!(detect("ARE YOU SURE about that?").is_some());
+    }
+
+    #[test]
+    fn a_dispute_of_a_limit_is_told_apart_from_other_challenges() {
+        // Real pushbacks from this workspace, each against a limit that did not
+        // hold as stated.
+        for msg in [
+            "what level of raytracing IS possible?",
+            "I believe it is all most doable than you wrote off, and with proper compression",
+            "does a later version of wgpu not have multi-view enabled? was 30 even the most recent version, for sure?",
+            "but don't blindly believe coded hard limits until you validate them online as well",
+            "and you keep saying documented engine limitations. This is OUR engine",
+            "if we can make ours better quality than what the \"research\" says with negligible performance loss",
+            "I understand what the quest documentation says, but I know that together we can come up with a way",
+            "in your research you looked at the most recent solutions too, not just any solutions correct?",
+            "okay then, deep research, beyond just meta documentation, how other people have tested and overcome this issue",
+            "we find the path to utilizing the npu for our plans that DOES exist and CAN work",
+            "but I still want to give pushback to the npu implementations, is there not a way for us to create our own access point?",
+            "I want to give some pushback that with the right safeguards and honest enough testing and validation that we COULD further automate",
+        ] {
+            let label = detect(msg).unwrap_or_else(|| panic!("missed a limit dispute: {msg}"));
+            assert!(is_limit_cue(label), "{msg:?} matched as {label:?}, not as a limit dispute");
+        }
+    }
+
+    #[test]
+    fn near_misses_to_a_limit_dispute_stay_silent_or_generic() {
+        // A feasibility QUESTION, a stated real constraint, and scope words are
+        // not disputes of a limit.
+        for msg in [
+            "Is that doable without costing us significantly without having to use SSR?",
+            "I'm fine if you get creative with your suggestions for improving on what we have",
+            "we must do so within the limitations of the quest headset",
+            "the only other limit I would add that we have to respect is that it runs on players' headsets",
+            "let's not overcomplicate it if you already found a workable solution",
+            "thought I'm open for pushback and other suggestions as well",
+            "is there not a way we can accurately simulate the real gpu performance costs as we continue building",
+        ] {
+            assert!(detect(msg).is_none(), "false positive on: {msg}");
+        }
+        let scope = detect("quartz-ctx is no longer only limited to certain roots, correct?");
+        assert!(scope.is_some() && !is_limit_cue(scope.unwrap()), "{scope:?}");
+    }
+
+    /// Replay real user messages through the detector: every limit dispute it
+    /// fires on, and how many a week. `CORTEX_REPLAY_PROMPTS` is a JSONL file of
+    /// `{"ts": "...", "text": "..."}` built from a workspace's transcripts,
+    /// queued messages included. It holds private text; keep it out of the repo.
+    /// `cargo test replay_limit_cues -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn replay_limit_cues_against_real_prompts() {
+        let Ok(path) = std::env::var("CORTEX_REPLAY_PROMPTS") else {
+            eprintln!("set CORTEX_REPLAY_PROMPTS to a JSONL of real prompts");
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let (mut total, mut fires) = (0usize, 0usize);
+        let mut per_week: std::collections::BTreeMap<String, usize> = Default::default();
+        for line in text.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let (ts, msg) = (v["ts"].as_str().unwrap_or(""), v["text"].as_str().unwrap_or(""));
+            total += 1;
+            let Some(label) = detect(msg).filter(|l| is_limit_cue(l)) else { continue };
+            fires += 1;
+            let week = chrono::NaiveDate::parse_from_str(&ts[..ts.len().min(10)], "%Y-%m-%d")
+                .map(|d| {
+                    let w = chrono::Datelike::iso_week(&d);
+                    format!("{}-W{:02}", w.year(), w.week())
+                })
+                .unwrap_or_else(|_| "unknown".into());
+            *per_week.entry(week).or_default() += 1;
+            let flat: String = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+            println!("[{label}] {ts} :: {}", flat.chars().take(110).collect::<String>());
+        }
+        println!("\n{fires} limit disputes in {total} prompts");
+        for (week, n) in &per_week {
+            println!("  {week}: {n}");
+        }
+    }
+
+    #[test]
+    fn noting_a_limit_dispute_returns_its_cue() {
+        let s = store();
+        let (id, cue) = note_with_cue(&s, "sess", "I know there has to be a way around any blocks")
+            .unwrap()
+            .unwrap();
+        assert!(is_limit_cue(cue));
+        assert_eq!(cue_of(&s, id).unwrap().as_deref(), Some(cue));
+        assert_eq!(cue_of(&s, id + 100).unwrap(), None);
     }
 
     // ── recording ──────────────────────────────────────────────────────────
