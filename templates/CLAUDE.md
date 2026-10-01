@@ -30,7 +30,18 @@ it is never stale.
   returns a whole definition with line numbers (private items, `Type::method`,
   `a|b`, WGSL inside Rust strings), every use grouped by enclosing function
   (comments and strings only with `include_comments=true`), or a file's items
-  with line ranges. Read from disk at call time. grep stays right for free text, logs, config and files outside the roots.
+  with line ranges. Read from disk at call time.
+- `search_code(pattern)` — **instead of grep/rg**, for code, logs and config
+  alike: a regex (read like `grep -E`) over the roots or any `path`, matches
+  grouped by file and enclosing item as `12:text` (`~` a comment line, `-`
+  context), the overflow counted per file. `get_source(file, lines="120-160")`
+  reads by line number (sed -n, head, tail, cat) from any text file.
+- **A shell grep or `sed -n 'A,Bp'` is answered by quartz-ctx anyway.** The
+  PreToolUse Bash hook (`hooks-init`) rewrites a read-only one into
+  `quartz-ctx nav`, which prints the same lines plus the item each match is in.
+  Anything it cannot reproduce runs untouched. `QX_RAW=1` in a command keeps
+  the raw tool; `QX_HOOK=off` in Claude Code's environment turns the hook off.
+  grep stays right for filtering a command's output.
 - `get_api_context(hint)` — **start here for any coding task**; one budgeted
   packet of the relevant types, variants and signatures
 - `get_item(name)` — full definition, including methods from every `impl` file

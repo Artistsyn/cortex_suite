@@ -10,7 +10,10 @@ Reading code under the indexed roots: `get_source(name)` instead of grep then
 sed/cat (whole definition with line numbers, `Type::method`, `a|b`),
 `find_references(name)` instead of `grep -n` (uses grouped by enclosing
 function; `include_comments=true` for renames), `get_outline(path)` instead of
-reading a whole file. grep stays right for free text, logs and config.
+reading a whole file, `search_code(pattern)` instead of grep/rg for code, logs
+and config (a `grep -E` regex; matches grouped by enclosing item as `12:text`,
+`~` a comment line), and `get_source(file, lines="120-160")` instead of
+`sed -n`/head/tail. grep stays right for filtering a command's output.
 
 ## Before writing any non-trivial code
 

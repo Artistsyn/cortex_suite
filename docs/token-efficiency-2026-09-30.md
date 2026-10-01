@@ -1,8 +1,10 @@
-# Token efficiency: measured bill, validated levers, plan (2026-09-30, revision 3)
+# Token efficiency: measured bill, validated levers, plan (2026-09-30, revision 4)
 
 **Status.** Steps 1–5 are done and verified offline against real sessions (§0). Both
 experiments are settled by measurement: E2 is rejected, and E1 is not recommended for this
-workspace. Nothing is committed to git.
+workspace. Revision 4 (§0b, 2026-10-01) covers every grep and `sed -n` use and answers the
+shell's own greps and reads from quartz-ctx through a hook. Revision 3 is committed on
+`self-learning-loop`; revision 4 is not yet committed.
 
 Revision 2 follows the user's direction:
 - aim for big, automatic savings;
@@ -79,8 +81,10 @@ Replayed against 14 days of real grep → read episodes:
   - None of this reaches a resumed session. Claude Code pins each session's system
     prompt and tool list in a `prompt_snapshot` transcript entry, taken at session start
     and again after every compaction, and `--resume` reuses it to keep the prompt cache
-    valid. A tool-list change shows in new sessions, and probably after the next
-    compaction. Restarting does not show it.
+    valid. A tool-list change shows only in new sessions; neither a restart nor a
+    compaction changes the tools a session has inline. Checked on 2026-10-01: a session
+    that compacted at 06:09 with the new server connected kept the three deferred. Tools
+    a session loaded through a tool search stay callable across compactions.
   - Verified in a new session (2026-10-01, 075cc1e0). Its first snapshot carries
     `get_source`, `find_references` and `get_outline` inline among 47 tools, while the
     other ten quartz-ctx tools and all cortex tools stay deferred. Plan-mode access
@@ -169,6 +173,94 @@ installed: that is a persistent change to every session.
   - 58% of them are Python file patches, which are Edit-sized.
   - 1.8M were identical scripts sent again.
 - Clearing tool results cannot touch any of this, which is part of why E2 fails.
+
+## 0b. Revision 4 (2026-10-01): every grep and sed, covered and answered
+
+**Why agents still grepped.** Session 80105f4e had the three tools inline after a
+compaction. Over its next 63 calls it made 3 navigation calls, 31 greps and 23 `sed -n`
+reads. Those were:
+- regex searches (`fn .*light.*direction`);
+- log searches;
+- identifier lookups;
+- re-reads of line ranges it already knew.
+
+Whole-identifier lookups cannot serve a regex, and nothing read by line number. So the
+tools covered about a third of what was asked.
+
+**Coverage: two additions, both always loaded.**
+- **`search_code(pattern)`.**
+  - **Pattern:** a regex read like `grep -E`, with `\|` accepted. Set `basic`, `fixed`,
+    `word` or `ignore_case` as needed.
+  - **Scope:** the indexed roots, or any `path`, so logs and config are included. Binary
+    files and `target`, `node_modules` and `.git` are skipped.
+  - **Output:** grouped by file and by enclosing item with its line range, as `12:text`.
+    `~` marks a comment line and `-` a context line. Lines past 160 characters are cut.
+  - **Modes:** context (`-A`/`-B`/`-C`), files only, and count.
+  - **Overflow:** matches past the limit are counted per file, with where the rest are.
+  - **`collapse=true`** folds log lines that differ only in numbers. It is off by
+    default, because folding hid the very numbers agents grep logs for.
+- **`get_source(file, lines="120-160,300-320")`** reads any text file by line number,
+  naming the items those lines sit in. It replaces `sed -n`, head, tail and cat.
+
+**Answering the shell anyway.** Instructions alone moved 15 calls in a week, against 6,000
+reads. So a PreToolUse Bash hook rewrites read-only `grep` and `sed -n 'A,Bp'` into
+`quartz-ctx nav` through `updatedInput`, and everything else runs as typed. The hook is
+`quartz-ctx nav hook || true`, installed by `cortex hooks-init` as hook set 7.
+
+The `|| true` matters. Exit 2 from a PreToolUse hook blocks the tool call, and clap exits
+2 on an unknown subcommand. Set 6 lacked it, so on any machine whose quartz-ctx predates
+`nav`, it would have blocked every Bash call. That would have hit, for example, a machine
+that pulls and rebuilds cortex but not quartz-ctx. It was caught before the branch was
+merged, and a test runs the installed command against such a binary.
+- **Accepted:**
+  - `grep` with `-n -r -R -H -h -I -s -i -w -F -E -G -l -c -A -B -C -e`, `--include`,
+    and `--exclude-dir` of dirs it skips anyway;
+  - pipes into `| head -N` and `| wc -l`, and `2>/dev/null`;
+  - `sed -n` with one or more `A,Bp` / `A,$p` ranges on one file;
+  - `cd`, `echo` and assignments around them, and several reads joined by `;`.
+- **Refused, running as typed:**
+  - pipes into anything else, redirections, substitutions, `||`, and `&&` after a read
+    (a read's exit status is not grep's);
+  - `-o`, `-v`, `-P`, backreferences, `--exclude-dir` of other dirs, and stdin;
+  - sed regex addresses and edits;
+  - anything containing `QX_RAW=1`.
+- **Output keeps grep's and sed's shape:**
+  - a path line only when more than one file can match;
+  - `N:text` for matches;
+  - sed's raw lines, with a `[in fn X a-b]` note only when the range cuts an item.
+
+**Replay before enabling.** 1,200 real commands were sampled from 14 days of transcripts;
+2,813 of 6,000 grep/sed commands were rewritable. Each ran both ways on today's disk, in
+its original cwd, and was compared with the full uncapped output:
+
+| | Commands | Characters vs original | Lines recovered |
+|---|---|---|---|
+| Searches | 566 | +0.2% | 99.98% (4,679 of 4,680) |
+| Reads | 634 | +1.7% | 100% (22,854 of 22,854) |
+
+Each command takes about 20 ms longer. The replay found five bugs before any agent saw
+them:
+- `^` anchors failed the whole-text prefilter until it ran in multi-line mode.
+- Default folding merged distinct log lines.
+- `-A`/`-B` emulated as `-C` doubled the output.
+- `| head -N` counts output lines, not matches.
+- Numbered lines in a sed read cost 10% more.
+
+**Rejected: a re-read stub** ("unchanged since your last read"). Only 1.4% of sed reads
+re-read an unchanged range, too few to pay for the bookkeeping.
+
+**Live.**
+- Hook settings reload mid-session, unlike MCP tool lists, so the hook took effect in
+  sessions already open.
+- Within the hour another open session had five commands answered: one grep and five
+  sed reads. Each was re-run raw afterwards:
+  - Every sed read was byte-identical apart from the added `[in ...]` notes.
+  - The grep showed all 22 distinct matches, each real. Raw grep printed 38 lines,
+    because zsh's `**/*.rs` repeats the `*.rs` files.
+- `cortex scoreboard` counts these on its Navigation guard ("answered by quartz-ctx
+  through the Bash hook"), from the ids the hook writes to `.cortex/nav-rewrites.jsonl`.
+- To opt out, put `QX_RAW=1` in a command to keep the raw tool, or set `QX_HOOK=off` in
+  Claude Code's environment to turn the hook off.
 
 ## 1. Bottom line
 
