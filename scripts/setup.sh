@@ -164,7 +164,7 @@ EOF
 # developer gets cortex.sh from.
 # The frontier skill (auditing a limit before accepting it) goes to the path
 # each host reads: .claude/skills for Claude Code, .github/prompts for Copilot.
-for pair in "templates/CLAUDE.md:CLAUDE.md" "templates/copilot-instructions.md:.github/copilot-instructions.md" "templates/cortex.sh:.cortex/cortex.sh" "templates/cortex.ps1:.cortex/cortex.ps1" "templates/skills/frontier/SKILL.md:.claude/skills/frontier/SKILL.md" "templates/skills/frontier.prompt.md:.github/prompts/frontier.prompt.md"; do
+for pair in "templates/cortex.sh:.cortex/cortex.sh" "templates/cortex.ps1:.cortex/cortex.ps1" "templates/skills/frontier/SKILL.md:.claude/skills/frontier/SKILL.md" "templates/skills/frontier.prompt.md:.github/prompts/frontier.prompt.md"; do
   src="${pair%%:*}"; dst="${pair##*:}"
   if [ -e "$WORKSPACE/$dst" ] && [ "$FORCE" -eq 0 ]; then
     warn "$dst exists, leaving it alone"
@@ -175,6 +175,18 @@ for pair in "templates/CLAUDE.md:CLAUDE.md" "templates/copilot-instructions.md:.
     say "wrote $dst"
   fi
 done
+
+# The agent instructions. Only the cortex_suite section of each file is ours: a
+# missing file is written from the template, an existing one gains the section
+# or has it brought up to date, and nothing else in it changes. This used to
+# copy the templates only where no file existed - so anyone with instructions
+# of their own got none of ours - and to overwrite the whole file under
+# --force. Updating later is the same command: ./.cortex/cortex.sh instructions
+INSTR_FORCE=""
+[ "$FORCE" -eq 1 ] && INSTR_FORCE="--force"
+"$CORTEX_EXE" instructions --root "$WORKSPACE" --name "$NAME" $INSTR_FORCE \
+  | while IFS= read -r line; do say "$line"; done \
+  || die "cortex could not update the instruction files (built before 'instructions' existed? re-run without --skip-build)"
 
 say ""
 say "NEXT: edit .cortex/index-sources.json to list your projects, then run:"

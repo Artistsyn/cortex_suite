@@ -37,10 +37,12 @@ chmod +x scripts/setup.sh
 ./scripts/setup.sh ~/code/my-project
 ```
 
-The script builds both binaries, writes `.mcp.json`, `.vscode/mcp.json`,
-`.cortex/index-sources.json`, `CLAUDE.md` and `.github/copilot-instructions.md`
-into your workspace, and never overwrites an existing file unless you pass
-`-Force` / `--force`.
+The script builds both binaries and writes `.mcp.json`, `.vscode/mcp.json` and
+`.cortex/index-sources.json` into your workspace, never overwriting an existing
+one unless you pass `-Force` / `--force`. It also adds the cortex_suite section
+to `CLAUDE.md` and `.github/copilot-instructions.md`: a missing file is written
+from the template, and in an existing one only the text between the
+`cortex_suite` markers is ever touched (section 4).
 
 Then:
 
@@ -717,7 +719,19 @@ coverage report naming every undocumented item, which doubles as a worklist.
 ## 4. Writing the instruction files
 
 `CLAUDE.md` and `.github/copilot-instructions.md` are what make this reliable
-rather than merely available. Templates are in `templates/`. What matters:
+rather than merely available. Templates are in `templates/`.
+
+The part of each file between the `cortex_suite` markers belongs to the suite,
+and `cortex instructions` maintains it: setup runs it, and after updating the
+suite you run it again (`./.cortex/cortex.sh instructions`, or
+`.\.cortex\cortex.ps1 instructions` on Windows). It replaces that section and
+nothing else, so write your own rules outside it. A section you edited is left
+alone until you pass `--force`. A file copied before the markers existed is
+reported, and `--adopt` converts it. Both keep the old file under
+`.cortex/backups/`. Closeout lists a section with a newer version available
+under AWAITING YOUR REVIEW.
+
+For the rules you write yourself, what matters:
 
 **Do:**
 - State the **routing rule** in one place: structure → quartz-ctx, judgment →

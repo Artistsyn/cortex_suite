@@ -41,6 +41,7 @@
 #   .\.cortex\cortex.ps1 init              # RE-SEED: force prefs.toml + workflow anti-patterns + MCP annotations (auto on first run)
 #   .\.cortex\cortex.ps1 setup-mcp         # Create or repair .vscode/mcp.json Cortex entry (direct cortex.exe)
 #   .\.cortex\cortex.ps1 sync-continue-mcp # Sync .vscode/mcp.json servers into ~/.continue/config.yaml mcpServers
+#   .\.cortex\cortex.ps1 instructions      # Add or update the cortex_suite section of CLAUDE.md and .github/copilot-instructions.md (--check, --force, --adopt)
 #   .\.cortex\cortex.ps1 -- <args>         # Pass any cortex args directly
 #
 # Formatting controls for selfcheck/status-lite/doctor-lite:
@@ -1409,8 +1410,8 @@ notes = [
         Write-Prefix '  2. Run: .\.cortex\cortex.ps1 setup-mcp (write or repair .vscode/mcp.json Cortex entry)'
         Write-Prefix '  3. Run: .\.cortex\cortex.ps1 reindex   (index your source)'
         Write-Prefix '  4. Run: .\.cortex\cortex.ps1 serve     (start MCP server for VS Code)'
-        Write-Prefix '  5. Copy the copilot-instructions.md snippet from cortex/README.md'
-        Write-Prefix '     into your .github/copilot-instructions.md'
+        Write-Prefix '  5. Run: .\.cortex\cortex.ps1 instructions   (add the cortex_suite section to CLAUDE.md'
+        Write-Prefix '     and .github/copilot-instructions.md; the rest of each file is left alone)'
     }
     "post-session" {
         # Run after every coding session: git-review + pending observations + annotation reminder

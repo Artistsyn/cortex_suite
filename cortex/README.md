@@ -611,77 +611,24 @@ The api-graph items take precedence over raw source units when both exist for th
 
 ---
 
-## copilot-instructions.md snippet
+## Agent instructions: CLAUDE.md and copilot-instructions.md
 
-Add this block to your `.github/copilot-instructions.md`. It teaches the assistant
-when and how to use cortex throughout a session — not just at boot.
+The suite's guidance for agents ships as `templates/CLAUDE.md` and
+`templates/copilot-instructions.md`, each with one section between
+`cortex_suite` markers. Setup writes or updates both; to add or refresh that
+section in a workspace later, run:
 
-```markdown
-## Cortex (Semantic Memory Layer)
-
-cortex holds project-specific knowledge that is NOT in training data:
-bug traps, approved patterns, API facts, architecture decisions, and corrections.
-Always consult it before writing code and when blocked during a task.
-
-### PROTOCOL - CORTEX Trigger
-
-If user message contains PROTOCOL - CORTEX -:
-- Run MCP readiness gate first: required tools are get_delta, get_preferences,
-  get_anti_patterns, list_patterns, get_context
-- If any required tool fails, run remediation loop before coding:
-  1) `.\.cortex\cortex.ps1 doctor --format json`
-  2) `.\.cortex\cortex.ps1 -- status --format json --full`
-  3) verify `.vscode/mcp.json` cortex server entry
-  4) restart MCP server path (`.\.cortex\cortex.ps1 serve`) and re-probe tools
-  5) reload VS Code window and re-probe
-- Run baseline retrieval: get_delta → get_preferences → get_anti_patterns → get_context
-- Use JSON mode for automation-critical commands: cortex --format json status --full
-- Hard rule: do not silently bypass missing required MCP tools for non-trivial tasks.
-  Stop and report blocker unless user explicitly approves degraded mode.
-
-### Mandatory Pre-Code Check (no trigger required)
-
-Before writing any factory, tick/update, spawn, pool, or physics-integration function:
-1. `get_anti_patterns` — check all known traps for this project
-2. `get_preferences` — load current style rules and API notes
-3. `list_patterns` — find approved patterns for the task category
-
-Skip only for trivial changes: renaming a constant, fixing a typo, adding a comment.
-
-### Mid-Task Cortex Checkpoints
-
-Cortex is a co-author, not a boot-time shelf. Consult it at every "I'm not sure" moment:
-
-| Situation | Tool to call |
-|---|---|
-| First approach failed | `recall <error_keyword>` before trying a second approach |
-| Unfamiliar compiler error | `semantic_search <error description>` before reading source |
-| A type/module behaves unexpectedly | `get_item <typename>` before reading docs |
-| About to add a new integration point | `simulate_change <unit>` to preview impact first |
-| Code compiles but behavior is wrong | `recall <behavior_keyword>` — may be a known runtime trap |
-| Choosing between two approaches | `list_patterns` + `get_anti_patterns` to see if one is vetted |
-
-**Blocked rule:** After two failed attempts at the same problem, STOP and run
-`recall <topic>` before a third. If cortex has nothing, note the gap for crystallization.
-
-### Tagging Quality (for semantic findability)
-
-New cortex entries must be findable by concept, not just exact API name:
-- Tags: API name + behavior + domain + colloquial term
-  e.g., GrappleConstraint → tags: grapple,hook,rope,constraint,swing,GrappleConstraint
-- Include error code if applicable: E0583,file-not-found (not just module-resolution)
-- First sentence of description = what goes wrong, not what the feature is
-- Body text: include both the official name AND plain-words description
-- Use `semantic_search` to look up entries — it uses embedding similarity,
-  so conceptual descriptions find relevant entries even with wrong API names
-
-### Session-End (Mandatory)
-
-After every session where code was written or a bug was fixed:
-1. Run post-session: `.\.cortex\cortex.ps1 post-session` (or your launcher equivalent)
-2. Add new bugs as anti-patterns; working implementations as patterns
-3. Update prefs notes if a new API fact was discovered
+```bash
+./.cortex/cortex.sh instructions      # .\.cortex\cortex.ps1 instructions on Windows
 ```
+
+Only the text between the markers is replaced. Everything else in each file is
+yours, and a file that does not exist yet is written from the template.
+`--check` reports without writing (exit 1 when anything would change), `--force`
+replaces a section you edited by hand, and `--adopt` converts a copy made before
+the markers existed, including the snippet this README used to publish, which
+called `get_anti_patterns` without the `hint` the server now requires. Both keep
+the previous file under `.cortex/backups/`.
 
 ### Recommended initial prefs.toml
 
