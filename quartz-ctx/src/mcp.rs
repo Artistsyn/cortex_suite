@@ -19,7 +19,7 @@
 ///       }
 ///     }
 ///   }
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -159,9 +159,11 @@ pub fn serve(
     resolved: Resolved,
     plan: SourcePlan,
 ) -> Result<()> {
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    // Moves this connection onto a rebuilt binary, and tells the client when
+    // its tool list may be out of date (see mcp_session).
+    let mut session = quartz_ctx::mcp_session::Session::open("quartz-ctx");
 
     // The index is still being built (see run_serve). `initialize` and
     // `tools/list` need none of it, so they are answered at once; the first
@@ -171,8 +173,7 @@ pub fn serve(
     let mut live: Option<Live> = None;
     eprintln!("quartz-ctx MCP server ready (index loading)");
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    while let Some(line) = session.next_line(&mut out)? {
         if line.trim().is_empty() {
             continue;
         }
@@ -194,6 +195,7 @@ pub fn serve(
             // e.g. "notifications/initialized" — just swallow it
             continue;
         }
+        session.saw(method);
 
         let id = req["id"].clone();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
@@ -322,7 +324,8 @@ fn initialize_result(engine_name: &str, params: &Value) -> Value {
         .unwrap_or("2024-11-05");
     json!({
         "protocolVersion": version,
-        "capabilities": { "tools": {} },
+        // listChanged: a rebuilt binary announces its tools (mcp_session).
+        "capabilities": { "tools": { "listChanged": true } },
         "serverInfo": {
             "name": "quartz-ctx",
             "version": env!("CARGO_PKG_VERSION"),

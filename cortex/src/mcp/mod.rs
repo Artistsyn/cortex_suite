@@ -1,7 +1,7 @@
 pub mod tools;
 
 use std::path::PathBuf;
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -92,9 +92,11 @@ pub fn serve(
     repo_root: PathBuf,
     prefs_summary: String,
 ) -> Result<()> {
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    // Moves this connection onto a rebuilt binary, and tells the client when
+    // its tool list may be out of date (see quartz_ctx::mcp_session).
+    let mut session = quartz_ctx::mcp_session::Session::open("cortex");
     let engine_name = engine_name.to_string();
     let sessions = SessionRegistry::new();
 
@@ -141,10 +143,16 @@ pub fn serve(
     );
 
     let mut units_generation = crate::indexer::generation(store.conn());
-    crate::indexer::mark_session_start();
+    // The session began when the client connected, which a rebuilt binary
+    // that took the connection over learns from the build before it.
+    let started = session
+        .carried("session_start")
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    crate::indexer::mark_session_start(started);
+    session.carry("session_start", crate::indexer::session_start().to_rfc3339());
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    while let Some(line) = session.next_line(&mut out)? {
         if line.trim().is_empty() { continue; }
 
         let req: Value = match serde_json::from_str(&line) {
@@ -157,6 +165,7 @@ pub fn serve(
         let id = req["id"].clone();
         let method = req["method"].as_str().unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(Value::Null);
+        session.saw(method);
 
         // quartz_ctx parses with proc-macro2 span-locations: every parse appends
         // its source to a thread-local span map that is never freed and wraps at
@@ -345,7 +354,8 @@ pub fn serve(
 fn initialize_result(engine_name: &str) -> Value {
     json!({
         "protocolVersion": "2024-11-05",
-        "capabilities": { "tools": {} },
+        // listChanged: a rebuilt binary announces its tools (quartz_ctx::mcp_session).
+        "capabilities": { "tools": { "listChanged": true } },
         "serverInfo": {
             "name": "cortex",
             "version": env!("CARGO_PKG_VERSION"),
