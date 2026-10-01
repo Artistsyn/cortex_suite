@@ -6,6 +6,12 @@ Two MCP servers back this workspace. Use them before writing code.
   stale.
 - **cortex** — judgment: what we *learned*. Patterns, anti-patterns, decisions.
 
+Reading code under the indexed roots: `get_source(name)` instead of grep then
+sed/cat (whole definition with line numbers, `Type::method`, `a|b`),
+`find_references(name)` instead of `grep -n` (uses grouped by enclosing
+function; `include_comments=true` for renames), `get_outline(path)` instead of
+reading a whole file. grep stays right for free text, logs and config.
+
 ## Before writing any non-trivial code
 
 1. `get_api_context(hint: "<what you are about to write>")` — types, variants and
@@ -95,6 +101,9 @@ test with `record_wall` / `update_wall`: a verdict changes only with a new fact
 - Follow `get_preferences(hint: ...)` for naming, error handling and line length.
 - Smallest safe patch. No unrelated refactors.
 - Never run git commands unless explicitly asked.
+- Fewer, fuller requests: every request re-sends the whole conversation. Run
+  independent reads, searches and edits together, and wait on long jobs in the
+  background instead of polling with `sleep` or repeated checks.
 
 ## Recording what you learn
 

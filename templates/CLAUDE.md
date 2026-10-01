@@ -13,6 +13,10 @@ short — a long manual gets skimmed.
 - **Assess, don't act uninvited.** If the user is describing a problem, the
   deliverable is your assessment. Report and stop.
 - **Match effort to the task.** Deep reasoning for hard work, fast for routine.
+- **Fewer, fuller calls.** Every call re-sends the whole conversation. Issue
+  independent reads, searches and edits together in one message, and wait on
+  long jobs with `run_in_background` or `Monitor`, never by polling (`sleep`,
+  repeated `tail`/`ps` checks).
 - **A limit is a claim with a provenance.** Before accepting one — including one
   you retrieved — say whose limit it is and what cheap check would move it
   (`get_walls`, the `frontier` skill).
@@ -21,6 +25,12 @@ short — a long manual gets skimmed.
 
 **quartz-ctx owns STRUCTURE — what the code *is*.** Parsed live from source, so
 it is never stale.
+- `get_source(name)` / `find_references(name)` / `get_outline(path)` —
+  **instead of grep then sed/cat** for code under the indexed roots. One call
+  returns a whole definition with line numbers (private items, `Type::method`,
+  `a|b`, WGSL inside Rust strings), every use grouped by enclosing function
+  (comments and strings only with `include_comments=true`), or a file's items
+  with line ranges. Read from disk at call time. grep stays right for free text, logs, config and files outside the roots.
 - `get_api_context(hint)` — **start here for any coding task**; one budgeted
   packet of the relevant types, variants and signatures
 - `get_item(name)` — full definition, including methods from every `impl` file
@@ -365,3 +375,15 @@ requires hunting and killing the server first.
 After changing any tool surface, **grep this file for removed tool names**. A
 manual that routes to a tool which no longer exists misdirects every future
 session, and nothing errors.
+
+# Compact instructions
+
+When compacting, keep in the summary, verbatim where it matters:
+- the user's current request and every constraint or approval they gave;
+- the objective, what is done and verified (with the command that proved it), and the exact next step;
+- every file being edited or about to be, and why;
+- open errors and failing test names, quoted exactly;
+- decisions made and approaches rejected, with the reason;
+- anything promised to the user and not yet done.
+
+Drop tool output already acted on and file contents that can be re-read.
