@@ -67,6 +67,7 @@ const UNCACHEABLE: &[&str] = &[
     "resolve_challenge",
     // Reads a growing transcript and writes to the store.
     "capture_markers",
+    "restore_after_compact",
     // Both change what is served.
     "resolve_pair",
     // The maintenance run's queue, answers and digest change every call.
@@ -156,6 +157,12 @@ pub fn serve(
         let id = req["id"].clone();
         let method = req["method"].as_str().unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(Value::Null);
+
+        // quartz_ctx parses with proc-macro2 span-locations: every parse appends
+        // its source to a thread-local span map that is never freed and wraps at
+        // 4 GiB, so a long session of re-indexing grows it without bound. Nothing
+        // holds a Span between requests (parsers keep line numbers only).
+        proc_macro2::extra::invalidate_current_thread_spans();
 
         let result = match method {
             "initialize"  => Ok(initialize_result(&engine_name)),
@@ -871,11 +878,13 @@ fn tools_list() -> Value {
             {
                 "name": "expand_memory",
                 "description": "Return one pattern's full body, uses and tags by id (ids come from \
-                                list_memory_handles).",
+                                list_memory_handles), or one anti-pattern's wrong/correct text \
+                                with kind=\"anti_pattern\" (ids from get_anti_patterns).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "integer", "description": "Pattern id." }
+                        "id": { "type": "integer", "description": "Pattern or anti-pattern id." },
+                        "kind": { "type": "string", "enum": ["pattern", "anti_pattern"], "description": "Default pattern." }
                     },
                     "required": ["id"]
                 }
@@ -885,9 +894,28 @@ fn tools_list() -> Value {
     if let Some(tools) = list["tools"].as_array_mut() {
         tools.extend(wall_tools());
         tools.extend(loop_tools());
+        // Claude Code treats an MCP tool without `readOnlyHint` as a writer:
+        // plan mode refuses it ("Cannot call ... while in plan mode") and its
+        // calls never run in parallel.
+        for tool in tools.iter_mut() {
+            if tool["name"].as_str().is_some_and(|n| READ_ONLY_TOOLS.contains(&n)) {
+                tool["annotations"] = json!({ "readOnlyHint": true });
+            }
+        }
     }
     list
 }
+
+/// Tools that change nothing a person or another session would see. Retrieval
+/// telemetry is the server's own bookkeeping and does not count as a change.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "semantic_search", "get_item", "get_syntax", "get_usage_examples", "get_helper",
+    "get_context", "get_delta", "query_graph", "explain_dependency_path",
+    "get_preferences", "simulate_change", "recall", "list_patterns",
+    "get_anti_patterns", "list_all", "get_session_health", "edit_guard",
+    "get_checkpoint", "list_memory_handles", "expand_memory", "loop_queue",
+    "loop_digest", "restore_after_compact", "get_walls",
+];
 
 /// The self-learning loop's tools (docs/self-learning-loop-2026-09-30.md).
 fn loop_tools() -> Vec<Value> {
@@ -985,6 +1013,21 @@ fn loop_tools() -> Vec<Value> {
                 "required": ["kind", "id", "verdict", "fact"]
             }
         }),
+        json!({
+        "name": "restore_after_compact",
+        "description": "After a compaction, read back from the transcript what its summary blurs: the \
+                        latest requests, files edited, commands that went green, errors still open \
+                        (verbatim) and the last stated next step, within ~1.5k tokens; also stored as a \
+                        checkpoint. Installed as the SessionStart hook with the `compact` matcher.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "transcript_path": { "type": "string", "description": "The session transcript (.jsonl under ~/.claude/projects/)." },
+                "hook_event_name": { "type": "string", "description": "Set by the hook; answers with hook JSON." }
+            },
+            "required": ["transcript_path"]
+        }
+    }),
         json!({
         "name": "capture_markers",
         "description": "Capture the CORTEX-* knowledge markers written in a Claude Code transcript \
@@ -1086,6 +1129,22 @@ mod tests {
         tools
             .iter()
             .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+    }
+
+    #[test]
+    fn read_only_tools_say_so_and_writers_do_not() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+        for name in super::READ_ONLY_TOOLS {
+            let tool = find_tool(tools, name)
+                .unwrap_or_else(|| panic!("READ_ONLY_TOOLS names {name}, which tools/list lacks"));
+            assert_eq!(tool["annotations"]["readOnlyHint"], true, "{name}");
+        }
+        for name in ["closeout_session", "capture_markers", "set_checkpoint", "record_wall",
+                     "suggest_pattern", "compact_output"] {
+            let tool = find_tool(tools, name).expect(name);
+            assert!(tool.get("annotations").is_none(), "{name} writes; it must not claim to read only");
+        }
     }
 
     #[test]

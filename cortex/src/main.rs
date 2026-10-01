@@ -38,6 +38,7 @@ mod verify;
 mod walls;
 mod loop_ledger;
 mod capture;
+mod restore;
 mod knowledge_sim;
 mod reconcile;
 mod maintenance;
@@ -1183,7 +1184,20 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     };
     let stop_hook = capture_hook("Stop");
     let precompact_hook = capture_hook("PreCompact");
-    for event in ["Stop", "PreCompact"] {
+    // After a compaction, the state its summary blurs - files in play, the
+    // error still open, what went green - read back from the transcript
+    // (src/restore.rs). SessionStart's mcp_tool hooks are skipped at launch,
+    // before servers connect, but `compact` comes mid-session.
+    let restore_hook = json!({
+        "matcher": "compact",
+        "hooks": [{
+            "type": "mcp_tool",
+            "server": "cortex",
+            "tool": "restore_after_compact",
+            "input": { "transcript_path": "${transcript_path}", "hook_event_name": "SessionStart" }
+        }]
+    });
+    for event in ["Stop", "PreCompact", "SessionStart"] {
         hooks_obj
             .entry(event.to_string())
             .or_insert_with(|| Value::Array(vec![]));
@@ -1202,6 +1216,7 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
 
     let is_challenge = |e: &Value| names_tool(e, "note_challenge");
     let is_capture = |e: &Value| names_tool(e, "capture_markers");
+    let is_restore = |e: &Value| names_tool(e, "restore_after_compact");
 
     // A hook is up to date only if it is present AND byte-identical to what we
     // would write. Anything else is refreshed — including a hook from an older
@@ -1218,7 +1233,8 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         && failure_now.iter().find(|e| is_compact(e)).is_some_and(|e| *e == failure_hook)
         && prompt_now.iter().find(|e| is_challenge(e)).is_some_and(|e| *e == challenge_hook)
         && array_of(hooks_obj, "Stop").iter().find(|e| is_capture(e)).is_some_and(|e| *e == stop_hook)
-        && array_of(hooks_obj, "PreCompact").iter().find(|e| is_capture(e)).is_some_and(|e| *e == precompact_hook);
+        && array_of(hooks_obj, "PreCompact").iter().find(|e| is_capture(e)).is_some_and(|e| *e == precompact_hook)
+        && array_of(hooks_obj, "SessionStart").iter().find(|e| is_restore(e)).is_some_and(|e| *e == restore_hook);
     if !force && up_to_date {
         return Ok(HookOutcome::AlreadyPresent);
     }
@@ -1258,6 +1274,12 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         arr.retain(|e| !is_capture(e));
         arr.push(hook);
     }
+    let start_arr = hooks_obj
+        .get_mut("SessionStart")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("`hooks.SessionStart` in {filename} is not an array"))?;
+    start_arr.retain(|e| !is_restore(e));
+    start_arr.push(restore_hook);
 
     let rendered = serde_json::to_string_pretty(&Value::Object(root_obj))?;
     std::fs::write(&settings_path, rendered)
@@ -1286,6 +1308,9 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
              \x20 capture_markers on Stop and PreCompact — captures the CORTEX-* markers written \
              in the transcript since the last capture and commits them through the closeout \
              gates, so knowledge no longer waits for a closeout a compaction can outrun.\n\
+             \x20 restore_after_compact on SessionStart(compact) — after a compaction, reads back \
+             from the transcript what the summary blurs (latest requests, files edited, what went \
+             green, errors still open, verbatim) in at most ~1.5k tokens.\n\
              Restart Claude Code (or reload the session) for them to take effect.\n\
              Note: these are Claude Code hooks. VS Code Copilot cannot observe tool output or \
              edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
@@ -1406,7 +1431,9 @@ fn auto_install_hook_on_serve(repo: &Path) {
     //    reach PostToolUse), and hook tools now answer in additionalContext JSON
     // 4: added capture_markers on Stop and PreCompact (knowledge captured when
     //    it is written, not when a closeout remembers it)
-    const HOOK_SET_VERSION: u32 = 4;
+    // 5: added restore_after_compact on SessionStart(compact) (state a
+    //    compaction's summary blurs, read back from the transcript)
+    const HOOK_SET_VERSION: u32 = 5;
     let cortex_dir = repo.join(".cortex");
     let sentinel = cortex_dir.join(format!(".claude-hooks-installed.v{HOOK_SET_VERSION}"));
     if sentinel.exists() {

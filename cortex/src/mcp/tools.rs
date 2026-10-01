@@ -53,6 +53,7 @@ pub fn dispatch(
         "edit_guard"              => tool_edit_guard(args, store, session_id),
         "note_challenge"          => tool_note_challenge(args, store, session_id),
         "capture_markers"         => tool_capture_markers(args, store, repo_root),
+        "restore_after_compact"   => tool_restore_after_compact(args, store, repo_root),
         "resolve_pair"            => tool_resolve_pair(args, store),
         "loop_queue"              => crate::maintenance::queue(store, repo_root).map_err(|e| e.to_string()),
         "loop_judge"              => tool_loop_judge(args, store, repo_root),
@@ -89,6 +90,7 @@ pub(crate) fn run_hook_tool(
         "edit_guard" => tool_edit_guard(args, store, session_id),
         "note_challenge" => tool_note_challenge(args, store, session_id),
         "capture_markers" => tool_capture_markers(args, store, repo_root),
+        "restore_after_compact" => tool_restore_after_compact(args, store, repo_root),
         other => Err(format!("not a hook tool: {other}")),
     }
 }
@@ -225,6 +227,58 @@ fn tool_capture_markers(args: &Value, store: &Store, repo_root: &Path) -> Result
     }
     let text: Vec<String> = reports.into_iter().filter(|r| !r.is_empty()).collect();
     Ok(if text.is_empty() { "no new markers".into() } else { text.join("\n") })
+}
+
+/// Put back what a compaction's summary blurs, read from the transcript
+/// (src/restore.rs). Installed as the SessionStart hook with the `compact`
+/// matcher, which gets the block as additionalContext; called directly, it
+/// answers with the block.
+fn tool_restore_after_compact(args: &Value, store: &Store, repo_root: &Path) -> Result<String, String> {
+    let raw = args["transcript_path"].as_str().unwrap_or("");
+    let from_hook = args.get("hook_event_name").and_then(Value::as_str).is_some_and(|e| !e.is_empty());
+    let quiet = |msg: String| -> Result<String, String> {
+        let _ = crate::corrections::beat_named(store, "restore_after_compact", false);
+        Ok(if from_hook { String::new() } else { msg })
+    };
+    let path = match crate::capture::checked_transcript(raw) {
+        Ok(p) => p,
+        Err(e) => return quiet(e.to_string()),
+    };
+    let st = match crate::restore::from_transcript(&path) {
+        Ok(st) if !st.is_empty() => st,
+        Ok(_) => return quiet("nothing to restore: the segment before the compaction is empty".into()),
+        Err(e) => return quiet(format!("could not read the transcript: {e}")),
+    };
+    let text = crate::restore::render(&st, Some(repo_root), crate::restore::BUDGET);
+    // Kept as a checkpoint too, so get_checkpoint(scope="any") finds it after
+    // a restart.
+    let clip = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
+    let cp = crate::model::Checkpoint {
+        id: None,
+        objective: st.requests.last().map(|r| clip(r, 500)).unwrap_or_default(),
+        verified_evidence: st.green.join("; "),
+        remaining_gaps: st
+            .failing
+            .iter()
+            .map(|(c, e)| format!("{c}: {}", e.lines().last().unwrap_or("")))
+            .collect::<Vec<_>>()
+            .join("; "),
+        next_action: clip(&st.last_note, 500),
+        prohibited_repetition: String::new(),
+        session_id: Some(crate::capture::session_key_for(&path)),
+        version: 0, // computed by DB
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    let _ = store.insert_checkpoint(&cp);
+    let _ = crate::corrections::beat_named(store, "restore_after_compact", true);
+    if from_hook {
+        return Ok(json!({
+            "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": text }
+        })
+        .to_string());
+    }
+    Ok(text)
 }
 
 fn kind_arg(args: &Value) -> Result<&str, String> {
@@ -1765,6 +1819,29 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
     let chosen: std::collections::HashSet<usize> =
         ranked.into_iter().take(MAX_EXPANDED_ENTRIES).map(|(i, _)| i).collect();
 
+    if detail_is_summary {
+        let mut out = ranked_pattern_listing(&patterns, &scores, &chosen, &tokens, store, session_id);
+        log_expansion_miss(store, "list_patterns", args, session_id, chosen.len(), patterns.len());
+        if over_cap > 0 {
+            out.push_str(&format!(
+                "({over_cap} further patterns also matched but were not expanded — the \
+                 {MAX_EXPANDED_ENTRIES} closest to your hint are shown.)\n"
+            ));
+        }
+        cap_response(&mut out, "Pass a narrower hint, or detail=\"summary\", to see the rest.");
+        let mut shown: Vec<i64> = chosen.iter().filter_map(|&i| patterns[i].id).collect();
+        shown.sort_unstable();
+        out.push_str(&crate::reconcile::serving_notes(store, "patterns", &shown));
+        if tokens.is_empty() {
+            out.push_str(
+                "\nNote: your hint matched no pattern, so nothing was expanded and no usage signal was \
+                 recorded. Try naming the type, API or behaviour you are working with rather than the \
+                 intent alone.\n",
+            );
+        }
+        return Ok(out);
+    }
+
     let mut out = format!("{} approved pattern(s):\n\n", patterns.len());
     let mut expanded = 0usize;
     let mut compact = 0usize;
@@ -1894,6 +1971,109 @@ Note: your hint matched no pattern, so nothing was expanded and no              
         );
     }
     Ok(out)
+}
+
+/// The summary-tier pattern listing, ranked and bounded like get_anti_patterns:
+/// hint-matched patterns whole, then those related to the hint on one line,
+/// then the rest cut short within `LISTING_BUDGET`, then the tail by id. In
+/// store order the matched patterns sat wherever their ids fell, and the whole
+/// listing was 41KB at the median and growing with every approval.
+fn ranked_pattern_listing(
+    patterns: &[crate::model::Pattern],
+    scores: &[usize],
+    chosen: &std::collections::HashSet<usize>,
+    tokens: &[String],
+    store: &Store,
+    session_id: &str,
+) -> String {
+    let marker = |p: &crate::model::Pattern| {
+        if p.survival_rate < 0.4 { "⚠" } else if p.survival_rate < 0.8 { "!" } else { "✓" }
+    };
+    // Every row is logged, the matched ones as targeted: see list_patterns.
+    for (idx, p) in patterns.iter().enumerate() {
+        if let Some(id) = p.id {
+            let tool = if chosen.contains(&idx) { "list_patterns_hint" } else { "list_patterns" };
+            let _ = store.log_session_retrieval(session_id, "patterns", id, tool);
+        }
+    }
+    let docs: Vec<String> = patterns
+        .iter()
+        .map(|p| format!("{n} {n} {i} {i} {} {} {}", p.body, p.uses.join(" "), p.tags.join(" "), n = p.name.replace(['-', '_'], " "), i = p.intent).to_lowercase())
+        .collect();
+    let rel = bm25_scores(&docs, tokens);
+    let by_rel = |a: &usize, b: &usize| rel[*b].partial_cmp(&rel[*a]).unwrap_or(std::cmp::Ordering::Equal);
+    let mut first: Vec<usize> = chosen.iter().copied().collect();
+    first.sort_by(|a, b| scores[*b].cmp(&scores[*a]).then_with(|| by_rel(a, b)).then(a.cmp(b)));
+    let mut related: Vec<usize> = (0..patterns.len()).filter(|i| !chosen.contains(i) && rel[*i] > 0.0).collect();
+    related.sort_by(|a, b| by_rel(a, b).then(a.cmp(b)));
+    related.truncate(RELATED_SHOWN);
+    let mut taken = chosen.clone();
+    taken.extend(related.iter().copied());
+
+    let mut out = format!(
+        "{} approved pattern(s). Most likely to matter first: matched to your hint, related to it, \
+         then the rest.\n\n",
+        patterns.len()
+    );
+    for &i in &first {
+        let p = &patterns[i];
+        out.push_str(&format!(
+            "## {} {} (used {}x, reverted {}, survival {:.0}%)\nIntent: {}\n",
+            marker(p), p.name, p.use_count, p.reverted_count, p.survival_rate * 100.0, p.intent
+        ));
+        if let Some(note) = crate::knowledge::drift_note(store.conn(), &[&p.intent, &p.body], &p.uses, p.approved_at) {
+            out.push_str(&note);
+            out.push('\n');
+        }
+        if !p.uses.is_empty() {
+            out.push_str(&format!("Uses: {}\n", p.uses.join(", ")));
+        }
+        let preview = p.body.lines().take(4).collect::<Vec<_>>().join("\n");
+        if !preview.trim().is_empty() {
+            out.push_str(&preview);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if !related.is_empty() {
+        out.push_str("Also related to your hint:\n");
+        for &i in &related {
+            let p = &patterns[i];
+            out.push_str(&format!("- {} {} — {}\n", marker(p), p.name, opening_clause(&p.intent, 160).0));
+        }
+        out.push('\n');
+    }
+    let mut rest: Vec<usize> = (0..patterns.len()).filter(|i| !taken.contains(i)).collect();
+    rest.sort_by(|a, b| patterns[*b].approved_at.cmp(&patterns[*a].approved_at).then(b.cmp(a)));
+    let mut overflow = Vec::new();
+    if !rest.is_empty() {
+        out.push_str("Every other pattern, newest first:\n");
+        for &i in &rest {
+            let p = &patterns[i];
+            let line = format!("- {} {} — {}\n", marker(p), p.name, opening_clause(&p.intent, REST_CLAUSE_CHARS).0);
+            if out.len() + line.len() > LISTING_BUDGET {
+                overflow.push(i);
+            } else {
+                out.push_str(&line);
+            }
+        }
+    }
+    if !overflow.is_empty() {
+        let names: Vec<String> = overflow
+            .iter()
+            .filter_map(|&i| patterns[i].id.map(|id| format!("#{id} {}", patterns[i].name)))
+            .collect();
+        out.push_str(&format!(
+            "\n{} more — expand_memory(id) shows one whole: {}\n",
+            overflow.len(),
+            names.join(", ")
+        ));
+    }
+    out.push_str(
+        "\n(Matched patterns show their first lines; detail=\"standard\" shows every body preview, \
+         detail=\"full\" every body.)\n",
+    );
+    out
 }
 
 // ── get_anti_patterns ─────────────────────────────────────────────────────────
@@ -2106,108 +2286,170 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
     let chosen: std::collections::HashSet<usize> =
         ranked.into_iter().take(MAX_EXPANDED_ENTRIES).map(|(i, _)| i).collect();
 
-    let now = chrono::Utc::now();
-    let mut out = String::new();
-    let mut expanded = 0usize;
-    let mut listed = 0usize;
-    let mut unchanged = 0usize;
-    let mut shortened = 0usize;
-
+    // Telemetry is recorded for EVERY entry, shown or not. Only targeted
+    // retrievals feed pattern-survival scoring, so suppressing the log for
+    // omitted entries would quietly starve the very signal the required hint
+    // was introduced to produce. Expanded entries are logged under their own
+    // name, as list_patterns does: logging every listed entry as one kind made
+    // anti-pattern use unmeasurable (75,554 rows for 456 entries by 2026-09-30).
     for (idx, ap) in aps.iter().enumerate() {
-        // Telemetry is recorded for EVERY entry, shown or not. Only targeted
-        // retrievals feed pattern-survival scoring, so suppressing the log for
-        // omitted entries would quietly starve the very signal the required
-        // hint was introduced to produce.
-        let relevant = chosen.contains(&idx);
-        // Expanded entries are logged under their own name, as list_patterns
-        // does: logging every listed entry as one kind made anti-pattern use
-        // unmeasurable (75,554 rows for 456 entries by 2026-09-30).
         if let Some(id) = ap.id {
-            let tool = if relevant { "get_anti_patterns_hint" } else { "get_anti_patterns" };
+            let tool = if chosen.contains(&idx) { "get_anti_patterns_hint" } else { "get_anti_patterns" };
             let _ = store.log_session_retrieval(session_id, "anti_patterns", id, tool);
         }
+    }
 
-        // An unchanged entry is omitted only when it is ALSO not hint-relevant:
-        // the caller asked about this topic, so the remedy is what they came for
-        // even if they have technically seen it before.
-        if let Some(cut) = since {
-            if ap.added_at <= cut && !(full || relevant) {
-                unchanged += 1;
-                continue;
-            }
-        }
-
-        if full || relevant {
-            let drift = if relevant {
-                crate::knowledge::drift_note(
-                    store.conn(),
-                    &[&ap.description, &ap.wrong, &ap.correct],
-                    &[],
-                    ap.added_at,
-                )
+    let now = chrono::Utc::now();
+    let expanded_block = |ap: &crate::model::AntiPattern, relevant: bool| -> String {
+        let drift = if relevant {
+            crate::knowledge::drift_note(store.conn(), &[&ap.description, &ap.wrong, &ap.correct], &[], ap.added_at)
                 .map(|n| format!("{n}\n"))
                 .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            out.push_str(&format!("### {}
-✗ wrong:   {}
-✓ correct: {}
-{}
-",
-                ap.description, ap.wrong, ap.correct, drift));
-            expanded += 1;
         } else {
-            // Every trap stays listed -- that is this call's safety function, and
-            // it earns it: of 43 real edit-guard firings with a hinted call in
-            // the three hours before, 20 were traps sharing no word with that
-            // hint. So nothing is dropped; a trap unrelated to the hint is cut
-            // to its opening clause, which by convention says what goes wrong.
-            // Replayed over 49 real first calls: median 56.8KB -> 42.4KB.
-            // A delta (`since`) lists only new entries, and those stay whole.
-            let text = if since.is_none() && !tokens.is_empty() && scores[idx] == 0 {
-                let (clause, cut) = opening_clause(&ap.description, 90);
-                if cut {
-                    shortened += 1;
+            String::new()
+        };
+        format!("### {}\n✗ wrong:   {}\n✓ correct: {}\n{}\n", ap.description, ap.wrong, ap.correct, drift)
+    };
+
+    let mut body;
+    let mut expanded = 0usize;
+    if since.is_some() || full {
+        // A delta is short by construction and `full` asks for everything, so
+        // both keep the plain listing in store order.
+        let mut out = String::new();
+        let mut listed = 0usize;
+        let mut unchanged = 0usize;
+        for (idx, ap) in aps.iter().enumerate() {
+            let relevant = chosen.contains(&idx);
+            // An unchanged entry is omitted only when it is ALSO not hint-relevant:
+            // the caller asked about this topic, so the remedy is what they came for
+            // even if they have technically seen it before.
+            if let Some(cut) = since {
+                if ap.added_at <= cut && !(full || relevant) {
+                    unchanged += 1;
+                    continue;
                 }
-                clause
+            }
+            if full || relevant {
+                out.push_str(&expanded_block(ap, relevant));
+                expanded += 1;
             } else {
-                ap.description.clone()
-            };
-            out.push_str(&format!("- {text}\n"));
-            listed += 1;
+                out.push_str(&format!("- {}\n", ap.description));
+                listed += 1;
+            }
         }
+        body = match since {
+            Some(cut) => format!(
+                "{} anti-pattern(s) — DO NOT do these. {} new or relevant since {}; \
+                 {} unchanged and omitted.\n\n",
+                aps.len(), expanded + listed, cut.to_rfc3339(), unchanged,
+            ),
+            None => format!("{} anti-pattern(s) — DO NOT do these:\n\n", aps.len()),
+        };
+        body.push_str(&out);
+    } else {
+        // Ranked, and bounded. Every trap used to be listed by description in
+        // store order, which hid the very entries it existed to show: past
+        // ~50KB the host saves the answer to a file and shows a 2KB preview of
+        // the OLDEST entries, which happened on 23 of 97 calls in 14 days, and
+        // the store grows by 50+ entries a week. Replayed against 112 edit-guard
+        // firings, each joined to the hinted call earlier in the SAME transcript:
+        // the fired trap was expanded 21% of the time and buried as a one-liner
+        // 71%. Ordered as below it reaches the first three sections 71% of the
+        // time at a bounded ~30KB; firing history is the strongest single signal
+        // (half the fired traps share no word with the hint).
+        let fires = recent_guard_fires(store, ACTIVE_FIRE_DAYS);
+        let docs: Vec<String> = aps
+            .iter()
+            .map(|ap| {
+                let tags = ap.tags.join(" ");
+                format!("{d} {d} {} {} {tags} {tags}", ap.wrong, ap.correct, d = ap.description).to_lowercase()
+            })
+            .collect();
+        let rel_scores = bm25_scores(&docs, &tokens);
+        let by_rel = |a: &usize, b: &usize| rel_scores[*b].partial_cmp(&rel_scores[*a]).unwrap_or(std::cmp::Ordering::Equal);
+
+        let mut first: Vec<usize> = chosen.iter().copied().collect();
+        first.sort_by(|a, b| scores[*b].cmp(&scores[*a]).then_with(|| by_rel(a, b)).then(a.cmp(b)));
+        let fired_count = |i: usize| aps[i].id.and_then(|id| fires.get(&id).copied()).unwrap_or(0);
+        let mut active: Vec<usize> = (0..aps.len()).filter(|i| !chosen.contains(i) && fired_count(*i) > 0).collect();
+        active.sort_by(|a, b| fired_count(*b).cmp(&fired_count(*a)).then(aps[*b].added_at.cmp(&aps[*a].added_at)));
+        active.truncate(ACTIVE_SHOWN);
+        let mut taken: std::collections::HashSet<usize> = chosen.clone();
+        taken.extend(active.iter().copied());
+        let mut related: Vec<usize> = (0..aps.len()).filter(|i| !taken.contains(i) && rel_scores[*i] > 0.0).collect();
+        related.sort_by(|a, b| by_rel(a, b).then(a.cmp(b)));
+        related.truncate(RELATED_SHOWN);
+        taken.extend(related.iter().copied());
+
+        body = format!(
+            "{} anti-pattern(s) — DO NOT do these. Most likely to matter first: matched to your hint, \
+             fired by the edit guard lately, related to your hint, then the rest.\n\n",
+            aps.len()
+        );
+        for &i in &first {
+            body.push_str(&expanded_block(&aps[i], true));
+            expanded += 1;
+        }
+        if !active.is_empty() {
+            body.push_str(&format!("Fired by the edit guard in the last {ACTIVE_FIRE_DAYS} days, most often first:\n"));
+            for &i in &active {
+                body.push_str(&format!("- {} (×{})\n", aps[i].description, fired_count(i)));
+            }
+            body.push('\n');
+        }
+        if !related.is_empty() {
+            body.push_str("Also related to your hint:\n");
+            for &i in &related {
+                body.push_str(&format!("- {}\n", aps[i].description));
+            }
+            body.push('\n');
+        }
+        // Newest first: in the replay, store order spent the budget on the
+        // oldest entries and left 15 of 112 fired traps reachable only by id;
+        // newest first left 3.
+        let mut rest: Vec<usize> = (0..aps.len()).filter(|i| !taken.contains(i)).collect();
+        rest.sort_by(|a, b| aps[*b].added_at.cmp(&aps[*a].added_at).then(b.cmp(a)));
+        let mut overflow: Vec<usize> = Vec::new();
+        if !rest.is_empty() {
+            body.push_str("Every other trap, newest first, by what goes wrong:\n");
+            for &i in &rest {
+                let line = format!("- {}\n", opening_clause(&aps[i].description, REST_CLAUSE_CHARS).0);
+                if body.len() + line.len() > LISTING_BUDGET {
+                    overflow.push(i);
+                } else {
+                    body.push_str(&line);
+                }
+            }
+        }
+        if !overflow.is_empty() {
+            // Nothing is dropped silently: the tail is named by id under its
+            // first tag, one call from its full text.
+            let mut groups: std::collections::BTreeMap<&str, Vec<i64>> = std::collections::BTreeMap::new();
+            for &i in &overflow {
+                let tag = aps[i].tags.first().map(String::as_str).unwrap_or("untagged");
+                if let Some(id) = aps[i].id {
+                    groups.entry(tag).or_default().push(id);
+                }
+            }
+            let index: Vec<String> = groups
+                .iter()
+                .map(|(t, ids)| format!("{t} {}", ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" ")))
+                .collect();
+            body.push_str(&format!(
+                "\n{} more, by first tag — expand_memory(id, kind=\"anti_pattern\") shows one whole: {}\n",
+                overflow.len(),
+                index.join("; ")
+            ));
+        }
+        body.push_str(
+            "\n(Past the first sections each trap is cut to its opening clause. A hint naming \
+             the API or behaviour expands one; detail=\"full\" shows them all.)\n",
+        );
     }
 
     log_expansion_miss(store, "get_anti_patterns", args, session_id, expanded, aps.len());
 
-    let header = match since {
-        Some(cut) => format!(
-            "{} anti-pattern(s) — DO NOT do these. {} new or relevant since {};              {} unchanged and omitted.
-
-",
-            aps.len(), expanded + listed, cut.to_rfc3339(), unchanged,
-        ),
-        None => format!("{} anti-pattern(s) — DO NOT do these:
-
-", aps.len()),
-    };
-    let mut body = header;
-    body.push_str(&out);
-
-    if !full && since.is_none() {
-        body.push_str(&format!(
-            "
-({listed} listed by description only — their wrong/correct text is one call away:              get_anti_patterns with hint=\"<what you are writing>\", or detail=\"full\" for all of them.)
-"
-        ));
-    }
-    if shortened > 0 {
-        body.push_str(&format!(
-            "({shortened} of them share no word with your hint and are cut to their opening \
-             clause, ending in …; name the API or behaviour to see one whole.)\n"
-        ));
-    }
     if over_cap > 0 {
         body.push_str(&format!(
             "\n({over_cap} further entries also matched but were not expanded — the {MAX_EXPANDED_ENTRIES} \
@@ -2217,17 +2459,87 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
 
     // Entries shown whole that are disputed or never reconciled with a
     // look-alike: one line each, at most three.
-    let shown: Vec<i64> = chosen.iter().filter_map(|&i| aps[i].id).collect();
+    // Sorted: `chosen` is a HashSet, whose order differs per process, so the
+    // notes moved between identical calls.
+    let mut shown: Vec<i64> = chosen.iter().filter_map(|&i| aps[i].id).collect();
+    shown.sort_unstable();
     body.push_str(&crate::reconcile::serving_notes(store, "anti_patterns", &shown));
 
     // Limits on record for this task, each with its open edge.
     body.push_str(&walls_section(store, &_hint));
 
     // The stamp for the next call. Passing it back turns a repeat into a delta.
-    body.push_str(&format!("
-as of {}
-", now.to_rfc3339()));
+    body.push_str(&format!("\nas of {}\n", now.to_rfc3339()));
     Ok(body)
+}
+
+/// Days of edit-guard firings that count as a trap being active.
+const ACTIVE_FIRE_DAYS: i64 = 14;
+/// Traps listed whole for having fired lately.
+const ACTIVE_SHOWN: usize = 25;
+/// Entries listed whole for relevance to the hint beyond those expanded.
+const RELATED_SHOWN: usize = 30;
+/// The rest are cut to this many bytes of their opening clause.
+const REST_CLAUSE_CHARS: usize = 70;
+/// Characters a ranked listing may reach before its tail is indexed by id: well
+/// under the ~50KB at which Claude Code stops showing a tool answer inline.
+const LISTING_BUDGET: usize = 30_000;
+
+/// Edit-guard firings per anti-pattern over the last `days`.
+fn recent_guard_fires(store: &Store, days: i64) -> HashMap<i64, usize> {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let mut out = HashMap::new();
+    let Ok(mut stmt) = store.conn().prepare(
+        "SELECT anti_pattern_id, COUNT(*) FROM edit_guard_fires WHERE fired_at >= ?1 GROUP BY anti_pattern_id",
+    ) else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map(params![cutoff], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+        for (id, n) in rows.flatten() {
+            out.insert(id, n as usize);
+        }
+    }
+    out
+}
+
+/// BM25 relevance of each (lowercased) document to the hint tokens.
+///
+/// Graded where `text_hint_score` is a count of distinct words, so it can order
+/// the entries that matched one word, or a rare word, among hundreds that
+/// matched none. Same word rule: whole words, and a prefix for tokens of six
+/// characters or more.
+fn bm25_scores(docs: &[String], tokens: &[String]) -> Vec<f64> {
+    if tokens.is_empty() || docs.is_empty() {
+        return vec![0.0; docs.len()];
+    }
+    let split: Vec<Vec<&str>> = docs
+        .iter()
+        .map(|d| d.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).collect())
+        .collect();
+    let hit = |w: &str, t: &str| w == t || (t.len() >= 6 && w.len() >= t.len() && w.starts_with(t));
+    let n = docs.len() as f64;
+    let avg = (split.iter().map(Vec::len).sum::<usize>() as f64 / n).max(1.0);
+    let idf: Vec<f64> = tokens
+        .iter()
+        .map(|t| {
+            let df = split.iter().filter(|d| d.iter().any(|w| hit(w, t))).count() as f64;
+            (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+        })
+        .collect();
+    split
+        .iter()
+        .map(|d| {
+            let len = d.len() as f64;
+            tokens
+                .iter()
+                .zip(&idf)
+                .map(|(t, idf)| {
+                    let f = d.iter().filter(|w| hit(w, t)).count() as f64;
+                    if f == 0.0 { 0.0 } else { idf * f * 2.2 / (f + 1.2 * (0.25 + 0.75 * len / avg)) }
+                })
+                .sum()
+        })
+        .collect()
 }
 
 // ── suggest_pattern ───────────────────────────────────────────────────────────
@@ -3374,6 +3686,16 @@ fn tool_expand_memory(args: &Value, store: &Store) -> Result<String, String> {
         Some(v) => v,
         None    => return Err("expand_memory: 'id' (integer) is required".to_string()),
     };
+    if matches!(args["kind"].as_str(), Some("anti_pattern" | "anti_patterns" | "ap")) {
+        let aps = store.all_anti_patterns().map_err(|e| format!("expand_memory: {e}"))?;
+        return match aps.iter().find(|a| a.id == Some(id)) {
+            Some(a) => Ok(format!(
+                "### {}\n✗ wrong:   {}\n✓ correct: {}\nTags: {}\n",
+                a.description, a.wrong, a.correct, a.tags.join(", ")
+            )),
+            None => Err(format!("No anti-pattern with id={id}")),
+        };
+    }
     let patterns = store.all_patterns()
         .map_err(|e| format!("expand_memory: {e}"))?;
     match patterns.iter().find(|p| p.id == Some(id)) {
@@ -3390,6 +3712,7 @@ fn tool_expand_memory(args: &Value, store: &Store) -> Result<String, String> {
 mod tests {
     use super::{classify_risk, count_methods, parse_relation_filter, resolve_candidates,
                 tool_get_anti_patterns};
+    use rusqlite;
     use crate::cache::SessionRegistry;
     use crate::compressor::build_term_vector_str;
     use crate::model::CodeUnit;
@@ -3795,9 +4118,70 @@ mod tests {
         let out = tool_get_anti_patterns(
             &json!({"hint": "write the new code for this"}), &store, "s1").unwrap();
         assert!(!out.contains("✗ wrong:"), "no entry should have expanded: {out}");
-        let n = store.all_anti_patterns().unwrap().len();
-        assert!(out.contains(&format!("{n} listed by description only")),
-            "with no matches, every entry stays indexed: {out}");
+        for ap in store.all_anti_patterns().unwrap() {
+            let opening: String = ap.description.chars().take(30).collect();
+            assert!(out.contains(&opening), "with no matches, every entry stays listed ({opening}): {out}");
+        }
+    }
+
+    /// The trap a hint matches comes first, before the store-order rest: in an
+    /// oversized answer the host shows only the opening 2KB.
+    #[test]
+    fn matched_traps_come_before_everything_else() {
+        let store = ap_store("ap_order");
+        for i in 0..40 {
+            crate::crystallizer::add_anti_pattern(&store, &format!("Unrelated trap number {i} about something else"),
+                "w", "c", vec![]).unwrap();
+        }
+        crate::crystallizer::add_anti_pattern(&store,
+            "A shadow cascade split computed from the far plane wastes resolution",
+            "split from far", "split logarithmically", vec!["shadow".into(), "cascade".into()]).unwrap();
+        let out = tool_get_anti_patterns(&json!({"hint": "shadow cascade split"}), &store, "s1").unwrap();
+        let matched = out.find("### A shadow cascade split").expect("the matched trap expands");
+        let rest = out.find("Unrelated trap number 0").expect("the rest is still listed");
+        assert!(matched < rest, "matched entries lead: {out}");
+    }
+
+    /// A trap the edit guard keeps firing is listed whole, near the top, even
+    /// when it shares no word with the hint: half of real firings do not.
+    #[test]
+    fn a_trap_the_guard_fired_lately_is_listed_whole() {
+        let store = ap_store("ap_active");
+        let long = "Writing to the store with epoch-integer timestamps crashes every reader that \
+                    parses RFC 3339, and the crash surfaces far from the write";
+        let id = crate::crystallizer::add_anti_pattern(&store, long, "w", "c", vec!["sqlite".into()]).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        for s in ["a", "b", "c"] {
+            store.conn().execute(
+                "INSERT INTO edit_guard_fires (session_id, anti_pattern_id, file, fired_at) VALUES (?1, ?2, 'x.rs', ?3)",
+                rusqlite::params![s, id, now]).unwrap();
+        }
+        let out = tool_get_anti_patterns(&json!({"hint": "slint flickable layout"}), &store, "s1").unwrap();
+        let section = out.find("Fired by the edit guard").expect("an active section");
+        let entry = out.find(&format!("- {long} (×3)")).expect("listed whole with its count");
+        assert!(section < entry && entry < out.find("Every other trap").unwrap_or(usize::MAX), "{out}");
+    }
+
+    /// Past the budget, the tail is indexed by id rather than dropped.
+    #[test]
+    fn a_listing_over_budget_indexes_its_tail_by_id() {
+        let store = ap_store("ap_budget");
+        for i in 0..700 {
+            crate::crystallizer::add_anti_pattern(&store,
+                &format!("Filler trap {i:03} whose description runs long enough to need cutting at a clause"),
+                &format!("w{i}"), "c", vec!["filler".into()]).unwrap();
+        }
+        let out = tool_get_anti_patterns(&json!({"hint": "pool gravity momentum"}), &store, "s1").unwrap();
+        assert!(out.len() < super::LISTING_BUDGET + 6_000, "bounded: {} chars", out.len());
+        assert!(out.contains("more, by first tag"), "the tail is indexed");
+        for ap in store.all_anti_patterns().unwrap() {
+            let id = ap.id.unwrap();
+            let opening: String = ap.description.chars().take(24).collect();
+            assert!(out.contains(&opening) || out.contains(&format!("#{id} ")) || out.contains(&format!("#{id}\n")) || out.contains(&format!("#{id};")),
+                "entry {id} is neither listed nor indexed");
+        }
+        let one = super::tool_expand_memory(&json!({"id": store.all_anti_patterns().unwrap().last().unwrap().id.unwrap(), "kind": "anti_pattern"}), &store).unwrap();
+        assert!(one.contains("✗ wrong:   w699"), "{one}");
     }
 
     /// Shortening an unrelated trap must never hide it.

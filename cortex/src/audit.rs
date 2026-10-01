@@ -103,6 +103,17 @@ pub const MECHANISMS: &[Mechanism] = &[
         filter: "hook = 'capture_markers'",
         optional: false,
     },
+    // Runs only when a session compacts, so a stretch of short sessions leaves
+    // it idle; the heartbeat tells an uninstalled hook from a quiet one.
+    Mechanism {
+        label: "restore_after_compact hook (is it running)",
+        table: "hook_heartbeat",
+        ts_col: "last_fired",
+        expect_days: 14.0,
+        when_idle: "no compaction has been restored lately; if sessions did compact, the SessionStart(compact) hook is not installed (`cortex hooks-init`, then restart Claude Code)",
+        filter: "hook = 'restore_after_compact'",
+        optional: false,
+    },
     Mechanism {
         label: "automatic commits recorded (loop ledger)",
         table: "loop_changes",
