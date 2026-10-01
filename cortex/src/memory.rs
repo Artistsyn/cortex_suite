@@ -246,7 +246,10 @@ impl Store {
             }
         }
 
-        eprintln!("[cortex] First-run setup complete. See README.md for the recommended copilot-instructions.md snippet.");
+        eprintln!(
+            "[cortex] First-run setup complete. `{}` adds the cortex_suite section to CLAUDE.md and .github/copilot-instructions.md.",
+            crate::cache::launcher_command("instructions")
+        );
         Ok(())
     }
 

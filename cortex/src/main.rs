@@ -13,6 +13,7 @@ mod graph;
 mod graph_diff;
 mod graphify_proxy;
 mod indexer;
+mod instructions;
 mod knowledge;
 mod markers;
 mod memory;
@@ -404,6 +405,31 @@ enum Command {
         /// They run `cortex hook`, because VS Code runs command hooks only.
         #[arg(long)]
         vscode: bool,
+    },
+    /// Add or update the cortex_suite section of CLAUDE.md and
+    /// .github/copilot-instructions.md. Only the text between the section's
+    /// markers is ours: the rest of each file is left as it is, and a missing
+    /// file is written from the template.
+    Instructions {
+        /// Workspace root (default: current dir).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Report what would change and write nothing; exits 1 if anything would
+        /// change or waits on a decision.
+        #[arg(long)]
+        check: bool,
+        /// Also replace a section that was edited by hand (the old file is kept
+        /// under .cortex/backups/).
+        #[arg(long)]
+        force: bool,
+        /// Convert a copy made before the section markers existed: its
+        /// cortex_suite sections are replaced by the managed one (the old file
+        /// is kept under .cortex/backups/).
+        #[arg(long)]
+        adopt: bool,
+        /// Project name for a new file's title (default: the root's folder name).
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// Run cortex's hooks as a command, for hosts that cannot call an MCP tool
@@ -980,8 +1006,44 @@ fn main() -> Result<()> {
         Command::HooksInit { root, shared, force, vscode } => {
             if vscode { run_hooks_init_vscode(root, &db_path) } else { run_hooks_init(root, shared, force) }
         }
+        Command::Instructions { root, check, force, adopt, name } => {
+            run_instructions(root, name, instructions::Opts { check, force, adopt }, format)
+        }
         Command::Hook { event } => run_hook(&db_path, event.as_deref()),
     }
+}
+
+/// `cortex instructions`: the cortex_suite section of each instruction file
+/// added or brought up to date (src/instructions.rs). Exits 1 under --check
+/// when anything would change or waits on a decision, so CI can gate on it.
+fn run_instructions(
+    root: Option<PathBuf>,
+    name: Option<String>,
+    opts: instructions::Opts,
+    format: OutputFormat,
+) -> Result<()> {
+    let root = root.unwrap_or_else(|| PathBuf::from("."));
+    let project = name.unwrap_or_else(|| {
+        root.canonicalize()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "this project".to_string())
+    });
+    let check = opts.check;
+    let outcomes = instructions::sync(&root, &project, &opts)?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&outcomes)?),
+        OutputFormat::Text => {
+            for o in &outcomes {
+                let backup = o.backup.as_deref().map(|b| format!(" (previous version: {b})")).unwrap_or_default();
+                println!("{}: {}{backup}", o.file, o.action);
+            }
+        }
+    }
+    if check && outcomes.iter().any(|o| o.changed || o.attention) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn resolve_default_db_path() -> PathBuf {

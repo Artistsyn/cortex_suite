@@ -41,7 +41,7 @@ pub fn dispatch(
         "list_all"             => tool_list_all(args, units),
         // Phase 0B: protocol session management tools.
         "begin_protocol_session" => tool_begin_protocol_session(args, store, session_id),
-        "get_session_health"     => tool_get_session_health(store, session_id),
+        "get_session_health"     => tool_get_session_health(store, session_id, repo_root),
         // Phase 0C/0D: knowledge capture tools.
         "flush_knowledge_markers" => tool_flush_knowledge_markers(args, store, session_id, repo_root),
         "closeout_session"        => tool_closeout_session(args, store, session_id, repo_root),
@@ -3239,6 +3239,21 @@ fn review_queue_line(store: &Store) -> String {
     out
 }
 
+/// The review queue plus the workspace's instruction files: a cortex_suite
+/// section this cortex wrote and can now update is review work too, and it is
+/// the only signal an existing user gets that one ships.
+fn review_block(store: &Store, repo_root: &Path) -> String {
+    let mut out = review_queue_line(store);
+    let items = crate::instructions::review_items(repo_root);
+    if !items.is_empty() {
+        if out.is_empty() {
+            out.push_str("\n\nAWAITING YOUR REVIEW\n");
+        }
+        out.push_str(&items);
+    }
+    out
+}
+
 /// Quote a value for the shell the launcher runs in. Signatures carry spaces,
 /// backticks and `@`, so a hint printed unquoted would not survive a paste.
 fn shell_quote(s: &str) -> String {
@@ -3252,6 +3267,7 @@ fn shell_quote(s: &str) -> String {
 fn tool_get_session_health(
     store: &Store,
     session_id: &str,
+    repo_root: &Path,
 ) -> Result<String, String> {
     let gaps = crate::protocol::top_query_gaps(store.conn(), 3)
         .unwrap_or_default();
@@ -3281,7 +3297,7 @@ fn tool_get_session_health(
     report.push_str(&crate::scoreboard::compact_line(store));
 
     // Anything that needs a human decision, on the surface a human actually sees.
-    report.push_str(&review_queue_line(store));
+    report.push_str(&review_block(store, repo_root));
 
     // Whatever has quietly stopped working. Silent when everything is live, so
     // this can sit here every session without becoming noise — and when it is
@@ -3511,7 +3527,7 @@ fn tool_closeout_session(
     out.push_str(&run_pipeline_if_stale(store, repo_root));
 
     // Whatever now needs a human decision, named with the command that does it.
-    out.push_str(&review_queue_line(store));
+    out.push_str(&review_block(store, repo_root));
 
     Ok(out)
 }
@@ -3917,6 +3933,21 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A cortex_suite section this cortex can update is raised even when nothing
+    /// else waits, under the same header, and only then.
+    #[test]
+    fn an_updatable_instruction_section_is_raised_on_an_otherwise_empty_queue() {
+        let g = crate::test_support::TempDir::new("review_instructions").unwrap();
+        let store = Store::open(&g.join("memory.db")).unwrap();
+        std::fs::write(g.join("CLAUDE.md"), "# Our own rules\n").unwrap();
+        assert_eq!(super::review_block(&store, g.path()), "", "a file without a section is a choice, not work");
+        // Stamped as written, but older than the section this cortex ships.
+        std::fs::write(g.join("CLAUDE.md"), crate::instructions::render("## Tool routing\n\nthe old text\n")).unwrap();
+        let out = super::review_block(&store, g.path());
+        assert!(out.starts_with("\n\nAWAITING YOUR REVIEW\n"), "{out}");
+        assert!(out.contains("CLAUDE.md: a newer cortex_suite section") && out.contains("instructions"), "{out}");
     }
 
     /// The review queue is the only place a human is told that something is

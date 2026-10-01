@@ -1,9 +1,12 @@
 # Agent Operating Manual
 
-Replace `<PROJECT>` and the example crate names with your own. Keep this file
-short — a long manual gets skimmed.
+The section between the `cortex_suite` markers is maintained by
+`.cortex/cortex.sh instructions` (`.\.cortex\cortex.ps1 instructions` on
+Windows): an update replaces that section and leaves the rest of this file
+alone, so keep your own rules outside it. Keep the file short — a long manual
+gets skimmed.
 
-## 0) How to work
+## How to work
 
 - **Act, don't overplan.** When you have enough to act, act. Give a
   recommendation, not a survey.
@@ -21,7 +24,8 @@ short — a long manual gets skimmed.
   you retrieved — say whose limit it is and what cheap check would move it
   (`get_walls`, the `frontier` skill).
 
-## 1) Tool routing — structure vs judgment
+<!-- cortex_suite:begin -->
+## Tool routing — structure vs judgment
 
 **quartz-ctx owns STRUCTURE — what the code *is*.** Parsed live from source, so
 it is never stale.
@@ -87,7 +91,7 @@ it is never stale.
 - What we *learned* → **cortex**
 - Both in one task → run both
 
-## 2) The `hint` is required — say what you are doing
+## The `hint` is required — say what you are doing
 
 `get_anti_patterns`, `list_patterns` and `get_preferences` will refuse a call
 without a `hint`. That is deliberate and it is not about tidiness:
@@ -124,7 +128,7 @@ so the saving comes out of repetition, not out of the answer.
 The hint controls how much of each entry you see; `since` controls how many times
 you see the same thing. Use both.
 
-## 3) Pre-code check (no trigger word needed)
+## Pre-code check (no trigger word needed)
 
 Before writing any non-trivial function — anything that constructs, ticks,
 spawns, or touches shared state:
@@ -138,7 +142,7 @@ Skip only for renames, typos and comments.
 **Why:** these hold project-specific failure modes that are not in training data.
 Three calls beat one debug cycle.
 
-## 4) Mid-task checks — the ones that get skipped
+## Mid-task checks — the ones that get skipped
 
 Consult memory at every "I'm not sure" moment, not only at session start.
 
@@ -201,13 +205,14 @@ is a request. Once you know the cause, record it with the printed
 `anti-pattern add ... --resolves '<signature>'` command. That links the trap to
 the failure, so the next occurrence arrives with the fix.
 
-## 5) Capturing what you learn
+## Capturing what you learn
 
 Embed markers in your responses as you discover things:
 
 ```
-[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
-[CORTEX-PATTERN: name="..." intent="..." trust="verified"]body[/CORTEX-PATTERN]
+[CORTEX-AP: description="..." tags="..."]wrong: ...
+correct: ...[/CORTEX-AP]
+[CORTEX-PATTERN: name="..." intent="..." tags="..." trust="verified"]body[/CORTEX-PATTERN]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
 [CORTEX-ADR: title="..." tags="..."]Context: ... Decision: ...[/CORTEX-ADR]
 [CORTEX-PREFS-NOTE: tags="..."]note[/CORTEX-PREFS-NOTE]
@@ -224,6 +229,13 @@ authority, inferred; sources need a date). An open wall must name
 A pattern takes an optional `kind="constraint|policy|fact"` (default
 `procedure`). Constraints and policies are served in their own sections ahead
 of ordinary patterns in `get_context`.
+
+`correct:` must begin its own line — the split is done per line. Written after
+a literal `\n` instead, the whole body lands in `wrong` and the remedy becomes a
+placeholder.
+
+`tags` works on a pattern too. A pattern without tags is findable by its name
+and intent alone.
 
 When a task is **verifiably** complete (build passes, tests pass), end with:
 
@@ -349,6 +361,7 @@ commands on both.
 | `fired` | which mechanisms have actually run, and which are silently idle |
 | `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
 | `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note); `--vscode` installs the same for VS Code Copilot |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone |
 | `-- <args>` | pass anything straight through to the binary |
 
 `fired` answers the one question nothing else asks: *has this ever actually
@@ -363,8 +376,9 @@ result cannot distinguish a working mechanism from an uninstalled one.
 `deploy` exists because Windows blocks deleting a running executable. It renames
 the live binary out of the way, which Windows does permit, so a rebuild never
 requires hunting and killing the server first.
+<!-- cortex_suite:end -->
 
-## 6) Editing safety
+## Editing safety
 
 - Smallest safe patch; match surrounding style.
 - No unrelated refactors, no scope expansion.
@@ -372,7 +386,7 @@ requires hunting and killing the server first.
   conversation.
 - If unexpected external edits appear in a file you touched, pause and confirm.
 
-## 7) Verify before claiming
+## Verify before claiming
 
 - Run the build or focused tests; report pass/fail with the actual output.
 - `cargo test` builds a *separate* binary — passing tests do not mean the CLI or
@@ -381,7 +395,7 @@ requires hunting and killing the server first.
 - A failed build leaves the previous binary in place. Ask the artifact its
   version rather than trusting an exit code.
 
-## 8) Housekeeping
+## Housekeeping
 
 After changing any tool surface, **grep this file for removed tool names**. A
 manual that routes to a tool which no longer exists misdirects every future

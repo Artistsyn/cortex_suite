@@ -1,5 +1,13 @@
 # Copilot Instructions — <PROJECT>
 
+The section between the `cortex_suite` markers is maintained by
+`.cortex/cortex.sh instructions` (`.\.cortex\cortex.ps1 instructions` on
+Windows): an update replaces that section and leaves the rest of this file
+alone, so keep your own rules outside it.
+
+<!-- cortex_suite:begin -->
+## Code navigation and project memory
+
 Two MCP servers back this workspace. Use them before writing code.
 
 - **quartz-ctx** — structure: what the code *is*. Parsed live from source, never
@@ -22,7 +30,8 @@ and config (a `grep -E` regex; matches grouped by enclosing item as `12:text`,
 2. `get_anti_patterns(hint: "<same>")` — known traps for this kind of change.
 3. `list_patterns(hint: "<same>")` — approaches already vetted here.
 
-Skip only for renames, typos and comments.
+Skip only for renames, typos and comments. Follow `get_preferences(hint: ...)`
+for naming, error handling and line length.
 
 ## The hint is required
 
@@ -98,15 +107,6 @@ test with `record_wall` / `update_wall`: a verdict changes only with a new fact
   `scope=` or the full unit id to pin one.
 - `get_variants(enum)` before using any enum. Prefer an existing variant over
   inventing a parallel representation.
-
-## Style
-
-- Follow `get_preferences(hint: ...)` for naming, error handling and line length.
-- Smallest safe patch. No unrelated refactors.
-- Never run git commands unless explicitly asked.
-- Fewer, fuller requests: every request re-sends the whole conversation. Run
-  independent reads, searches and edits together, and wait on long jobs in the
-  background instead of polling with `sleep` or repeated checks.
 
 ## Recording what you learn
 
@@ -209,11 +209,21 @@ commands on both.
 | `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone |
 | `-- <args>` | pass anything straight through to the binary |
 
 `deploy` exists because Windows blocks deleting a running executable. It renames
 the live binary out of the way, which Windows does permit, so a rebuild never
 requires hunting and killing the server first.
+<!-- cortex_suite:end -->
+
+## Style
+
+- Smallest safe patch. No unrelated refactors.
+- Never run git commands unless explicitly asked.
+- Fewer, fuller requests: every request re-sends the whole conversation. Run
+  independent reads, searches and edits together, and wait on long jobs in the
+  background instead of polling with `sleep` or repeated checks.
 
 ## Verify before claiming done
 
