@@ -42,6 +42,7 @@ mod capture;
 mod restore;
 mod knowledge_sim;
 mod reconcile;
+mod reload;
 mod maintenance;
 mod cue_miner;
 mod skill_triage;
@@ -405,6 +406,17 @@ enum Command {
         /// They run `cortex hook`, because VS Code runs command hooks only.
         #[arg(long)]
         vscode: bool,
+    },
+    /// Put running cortex and quartz-ctx MCP servers on the binary now on disk.
+    /// Stops idle servers of Claude Code sessions that run a replaced binary;
+    /// each starts again on its session's next call to it. The session keeps
+    /// its tool list until the server is reconnected from /mcp. Servers built
+    /// from this version on move themselves onto a rebuild while idle, so this
+    /// is for older ones.
+    ReloadServers {
+        /// List what would be stopped and stop nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Add or update the cortex_suite section of CLAUDE.md and
     /// .github/copilot-instructions.md. Only the text between the section's
@@ -1010,6 +1022,7 @@ fn main() -> Result<()> {
             run_instructions(root, name, instructions::Opts { check, force, adopt }, format)
         }
         Command::Hook { event } => run_hook(&db_path, event.as_deref()),
+        Command::ReloadServers { dry_run } => reload::run(dry_run),
     }
 }
 

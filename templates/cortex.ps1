@@ -42,6 +42,7 @@
 #   .\.cortex\cortex.ps1 setup-mcp         # Create or repair .vscode/mcp.json Cortex entry (direct cortex.exe)
 #   .\.cortex\cortex.ps1 sync-continue-mcp # Sync .vscode/mcp.json servers into ~/.continue/config.yaml mcpServers
 #   .\.cortex\cortex.ps1 instructions      # Add or update the cortex_suite section of CLAUDE.md and .github/copilot-instructions.md (--check, --force, --adopt)
+#   .\.cortex\cortex.ps1 reload-servers    # Unix only: move running MCP servers onto a rebuilt binary; on Windows reconnect them from the host (/mcp)
 #   .\.cortex\cortex.ps1 -- <args>         # Pass any cortex args directly
 #
 # Formatting controls for selfcheck/status-lite/doctor-lite:

@@ -85,6 +85,18 @@ Replayed against 14 days of real grep → read episodes:
     compaction changes the tools a session has inline. Checked on 2026-10-01: a session
     that compacted at 06:09 with the new server connected kept the three deferred. Tools
     a session loaded through a tool search stay callable across compactions.
+  - Revised 2026-10-01: a running session can take a server's tool-list change
+    without a new session. Both servers declare `tools.listChanged`; after a
+    rebuild an idle server execs into the new build on the same connection and
+    sends `notifications/tools/list_changed`. Claude Code 2.1.284 then fetches
+    the list again and adds the difference to the conversation as a tool delta,
+    so the inline snapshot and the prompt cache stay as they were. That happens
+    only on a connection the session subscribed: one opened at session start or
+    reconnected from `/mcp`. A stdio server Claude Code restarted by itself after
+    it exited runs the new code but keeps the old list. Observed: the restarted
+    quartz-ctx served 14 tools and sent the notice, and the session kept 13 and
+    could not find `search_code`. `cortex reload-servers` moves older servers
+    onto the current binary; reconnecting once from `/mcp` brings their tools.
   - Verified in a new session (2026-10-01, 075cc1e0). Its first snapshot carries
     `get_source`, `find_references` and `get_outline` inline among 47 tools, while the
     other ten quartz-ctx tools and all cortex tools stay deferred. Plan-mode access

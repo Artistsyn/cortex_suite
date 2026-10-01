@@ -354,7 +354,8 @@ commands on both.
 | `reindex` | full rebuild of every manifest source (never needed for correctness - see Freshness) |
 | `refresh` | re-index only roots whose source changed; what the servers do before answering |
 | `knowledge-drift` | patterns/anti-patterns naming code that changed after they were written |
-| `deploy` | rebuild cortex without stopping the MCP server |
+| `deploy` | rebuild cortex without stopping the MCP server; running servers move onto the rebuild while idle |
+| `reload-servers` | move running servers that predate self-updating onto the binary on disk (`--dry-run` lists them) |
 | `check-mcp` | validate both MCP configs: every command resolves, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
@@ -376,6 +377,18 @@ result cannot distinguish a working mechanism from an uninstalled one.
 `deploy` exists because Windows blocks deleting a running executable. It renames
 the live binary out of the way, which Windows does permit, so a rebuild never
 requires hunting and killing the server first.
+
+**A rebuild reaches sessions already running.** A cortex or quartz-ctx server
+waiting for a request looks at its binary every two seconds. Once a rebuild has
+replaced it and the new build answers an MCP handshake, the server becomes the
+new build on the same connection (exec: macOS and Linux) and sends
+`tools/list_changed`, so the client fetches the tool list again. No new session
+is needed. The client listens only on a connection it subscribed: one opened at
+session start or reconnected from `/mcp`. A server that predates this, or one
+Claude Code started again by itself after it exited, runs the current code but
+leaves the session's tool list as it was: reconnect it once from `/mcp`.
+`reload-servers` moves every idle older server onto the current binary in one
+step. On Windows, reconnect from the host.
 <!-- cortex_suite:end -->
 
 ## Editing safety

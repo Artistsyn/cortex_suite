@@ -345,7 +345,7 @@ doctor|selfcheck|status|recall|health-report|graph-diff|meta|prune|review|crysta
 consolidate|correction|cluster-sessions|detect-skills|propose-gaps|propose-survival|\
 consolidate-pipeline|consolidate-if-stale|review-proposals|skill-status|skill-approve|\
 skill-reject|recurring-dismiss|proposal-approve|proposal-reject|scoreboard|pattern|anti-pattern|prefs|annotate|context|graph|index|watch|\
-fired|refresh|knowledge-drift|graphify-serve|hooks-init|walls|knowledge|instructions)
+fired|refresh|knowledge-drift|graphify-serve|hooks-init|walls|knowledge|instructions|reload-servers)
     # `fired` is on this list because it was documented as a launcher command
     # and was not on it: an unlisted command falls through to the help text
     # below, which prints and exits 0. Asking "has this mechanism ever actually
@@ -379,6 +379,8 @@ cortex launcher (bash) - workspace: $NAME
                 .github/copilot-instructions.md, leaving the rest of each file alone
                 (--check reports only, --force replaces a hand-edited section,
                 --adopt converts a copy made before the section markers)
+  reload-servers  move running MCP servers that predate self-updating onto the
+                binary on disk (--dry-run lists them); newer ones move themselves
   skill-status  drafts awaiting review   skill-approve <name>
   walls         limits on record: list | show <id> | import <file.json>
   knowledge     the self-learning loop: status | audit | undo <ap:id> | restore | auto-commit [on|off]

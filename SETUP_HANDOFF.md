@@ -771,7 +771,8 @@ names.
 | Index has units from deleted sources | indexing never prunes | `cortex prune-index --keep <root> ... --apply` |
 | Empty index for an app | `pub`-only extraction | `include_private: true` (2.11) |
 | 0 items on a non-Rust project | the root points at the wrong level, or `include_private` is off | point at the app directory; `include_private: true` (see §7) |
-| `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | restart the session (or reconnect cortex in `/mcp`); see 2.14 |
+| `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | `./.cortex/cortex.sh reload-servers` (or reconnect cortex in `/mcp`); see 2.14 |
+| A rebuilt server's new tool never appears in a running session | the session never subscribed that connection to `tools/list_changed`: it predates the server declaring it, or Claude Code restarted the server by itself | reconnect the server once in that session's `/mcp`; `reload-servers` moves older servers onto the current code but leaves tool lists as they were |
 | Failed builds missing from the scoreboard | hook set older than v3 (no `PostToolUseFailure` entry) | `./.cortex/cortex.sh hooks-init`; see 2.15 |
 | `hook_non_blocking_error: MCP server 'cortex' not connected` | the server was down (usually mid-deploy) | none needed; hooks are non-blocking and resume when it reconnects |
 | Copilot never gets `[cortex]` warnings | no `.github/hooks/cortex.json`, `chat.useHooks` off, or the workspace is not trusted | `./.cortex/cortex.sh hooks-init --vscode`; check the setting and Workspace Trust; `fired` shows whether `cortex hook` ever ran |
