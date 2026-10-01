@@ -92,7 +92,7 @@ impl Language {
         }
     }
 
-    fn ts_language(&self) -> tree_sitter::Language {
+    pub(crate) fn ts_language(&self) -> tree_sitter::Language {
         match self {
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),

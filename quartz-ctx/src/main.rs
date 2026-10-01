@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
 // The extraction core is the library half of this crate, shared with cortex.
-use quartz_ctx::{bridge, calls, incremental, lang, model, parser};
+use quartz_ctx::{bridge, calls, incremental, lang, model, nav, parser};
 
 mod discover;
 mod helpers;
@@ -611,21 +611,29 @@ fn run_serve(args: ServeArgs) -> Result<()> {
 
     // A parse failure is per-file and reported, never fatal; an empty result is
     // a state the notice explains, not a reason to exit.
-    let ws = incremental::Workspace::load(&resolved.sources);
-    let n = ws.items().len();
+    //
+    // The index is built on its own thread so the handshake does not wait for
+    // it: a client that builds its first prompt without waiting for slow
+    // servers would otherwise start the session without these tools, the
+    // always-loaded ones included.
+    let sources = resolved.sources.clone();
+    let loader = std::thread::spawn(move || {
+        let ws = incremental::Workspace::load(&sources);
+        let n = ws.items().len();
+        if n == 0 {
+            eprintln!("warn: empty index — serving diagnostics until a source root appears");
+        } else {
+            eprintln!(
+                "  loaded {} API items from {} source(s), {} files",
+                n,
+                sources.len(),
+                ws.file_count()
+            );
+        }
+        ws
+    });
 
-    if n == 0 {
-        eprintln!("warn: empty index — serving diagnostics until a source root appears");
-    } else {
-        eprintln!(
-            "  loaded {} API items from {} source(s), {} files — listening on stdio",
-            n,
-            resolved.sources.len(),
-            ws.file_count()
-        );
-    }
-
-    mcp::serve(ws, &args.name, resolved, plan)
+    mcp::serve(loader, &args.name, resolved, plan)
 }
 
 fn run_selfcheck(args: SelfcheckArgs) -> Result<()> {
