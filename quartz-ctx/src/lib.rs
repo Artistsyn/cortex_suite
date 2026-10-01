@@ -12,3 +12,4 @@ pub mod lang;
 pub mod model;
 pub mod nav;
 pub mod parser;
+pub mod rewrite;

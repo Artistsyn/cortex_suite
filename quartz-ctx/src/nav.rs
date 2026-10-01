@@ -17,6 +17,12 @@
 //!   which removes grep's substring and comment noise; asking for them keeps the
 //!   one job grep does better (a rename must touch comments and strings).
 //! * [`Nav::outline`]: a file's items with line ranges, instead of reading it.
+//! * [`Nav::search`]: every line matching a pattern - grep's own job - grouped
+//!   the same way, with the matches past the limit counted per file instead of
+//!   cut off, long lines cut around the match, and log lines that differ only
+//!   in their numbers folded into one with a count.
+//! * [`Nav::read_lines`]: lines of any file by number - what `sed -n`, `head`,
+//!   `tail` and `cat` are used for - with the items those lines sit in named.
 //!
 //! The output is organised by file, then by enclosing item, because flat snippet
 //! lists localise worse than file-centred ones (RepoNav, EMNLP 2026), and it is
@@ -44,6 +50,12 @@ pub const DEFAULT_REF_LIMIT: usize = 80;
 const LINE_CAP: usize = 400;
 /// Text shown for one use in a reference list.
 const USE_TEXT_CAP: usize = 100;
+/// Lines a file read shows before it is cut, when the caller sets none.
+pub const DEFAULT_READ_LINES: usize = 400;
+/// Characters of a matching line shown, cut around the match.
+const SEARCH_TEXT_CAP: usize = 160;
+/// Directories no search walks: build output, dependencies, version control.
+const SKIP_DIRS: &[&str] = &["target", "node_modules", ".git", "dist", "build", "venv", ".venv", "__pycache__"];
 
 /// A definition found in a file.
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +97,12 @@ pub struct Nav {
     /// re-tokenizing per call grew proc-macro2's thread-local source map past
     /// its 32-bit offsets in a few hundred calls and panicked the server.
     idents: HashMap<PathBuf, (Arc<String>, Arc<Option<IdentMap>>)>,
+    /// Paths under this directory are shown relative to it: the caller's
+    /// working directory, for the command line. `None` shows them whole.
+    pub display_base: Option<PathBuf>,
+    /// Answering a shell command a hook rewrote: nothing the original would
+    /// not have printed except the items and line numbers.
+    pub terse: bool,
 }
 
 /// The directories a navigation call walks: every configured root and, for a
@@ -129,13 +147,7 @@ impl Nav {
         let mut seen = HashSet::new();
         for (root, origin, _) in &crate_roots(roots) {
             let walker = ignore::WalkBuilder::new(root)
-                .filter_entry(|e| {
-                    let n = e.file_name().to_string_lossy();
-                    !matches!(
-                        n.as_ref(),
-                        "target" | "node_modules" | ".git" | "dist" | "build" | "venv" | ".venv" | "__pycache__"
-                    )
-                })
+                .filter_entry(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
                 .build();
             for entry in walker.flatten() {
                 let p = entry.path();
@@ -158,11 +170,20 @@ impl Nav {
                 return Some(text.clone());
             }
         }
-        let raw = std::fs::read_to_string(path).ok()?;
+        // Logs are not always valid UTF-8; a search must still read them.
+        let raw = match String::from_utf8(std::fs::read(path).ok()?) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        let source = is_source(path);
         // A minified bundle is one enormous line: unreadable as source, and
         // every name search would match inside it.
-        let text = Arc::new(if looks_minified(&raw) { String::new() } else { raw });
-        self.cache.insert(path.to_path_buf(), (key.0, key.1, text.clone()));
+        let text = Arc::new(if source && looks_minified(&raw) { String::new() } else { raw });
+        // Logs and scratch files change constantly and can be huge; only
+        // source is worth keeping between calls.
+        if source {
+            self.cache.insert(path.to_path_buf(), (key.0, key.1, text.clone()));
+        }
         Some(text)
     }
 
@@ -380,7 +401,7 @@ impl Nav {
                             if d.name == bare && d.name_line == line {
                                 defs_at.insert((f.path.clone(), line));
                             }
-                            (d.start, format!("{} {} {}-{}", d.kind, d.qual, d.start, d.end))
+                            (d.start, item_label(d))
                         }
                         None => (0, "(top level)".to_string()),
                     };
@@ -533,6 +554,727 @@ impl Nav {
         }
         out.trim_end().to_string()
     }
+
+    // ── search ───────────────────────────────────────────────────────────────
+
+    /// Every line matching `pattern`, grouped by file and by the item each line
+    /// sits in, each group with its line range so the next read can ask for
+    /// exactly that item. Matches past the limit are counted per file, not
+    /// dropped; long lines are cut around the match; lines that differ only in
+    /// their numbers fold into one when asked (logs).
+    pub fn search(&mut self, roots: &[(PathBuf, String, bool)], pattern: &str, o: &SearchOpts) -> String {
+        if pattern.is_empty() {
+            return "Give a pattern: `search_code(pattern=\"reach|slope\")`.".into();
+        }
+        let re = match search_regex(pattern, o) {
+            Ok(r) => r,
+            Err(e) => return e,
+        };
+        let (files, scope) = match self.search_files(roots, &o.paths, o.glob.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let searched = files.len();
+        let mut hits: Vec<(SrcFile, Arc<String>, Vec<usize>)> = Vec::new();
+        let mut total = 0usize;
+        for f in files {
+            let Some(text) = self.read(&f.path) else { continue };
+            if !re.is_match(&text) {
+                continue;
+            }
+            let lines: Vec<usize> =
+                text.lines().enumerate().filter(|(_, l)| re.is_match(l)).map(|(i, _)| i + 1).collect();
+            if lines.is_empty() {
+                continue;
+            }
+            total += lines.len();
+            hits.push((f, text, lines));
+        }
+        let head = format!("`{pattern}`");
+        if total == 0 {
+            return format!("{head}: no match in {searched} file(s) under {scope}.");
+        }
+        match o.output {
+            SearchOutput::Count => {
+                return format!(
+                    "{head}: {total} matching line(s) in {} of {searched} file(s) under {scope}.",
+                    hits.len()
+                )
+            }
+            SearchOutput::Files => {
+                let mut out = format!("{head}: {total} matching line(s) in {} file(s) under {scope}\n", hits.len());
+                for (f, _, lines) in &hits {
+                    out.push_str(&format!("  {} ({})\n", self.shown_path(&f.path), lines.len()));
+                }
+                return out.trim_end().to_string();
+            }
+            SearchOutput::Lines => {}
+        }
+
+        // One file asked for by name needs no path line: the caller knows it.
+        let single = o.paths.len() == 1 && hits.len() == 1 && absolute(Path::new(o.paths[0].trim())).is_file();
+        let mut body = String::new();
+        let mut shown = 0usize; // matching lines accounted for in the listing
+        let mut printed = 0usize; // match and context lines, for `head`
+        let cap = o.head.unwrap_or(usize::MAX);
+        let (before, after) = (o.before.unwrap_or(o.context), o.after.unwrap_or(o.context));
+        let full = |shown: usize, printed: usize| shown >= o.limit || printed >= cap;
+        let mut hidden: Vec<String> = Vec::new();
+        for (f, text, lines) in &hits {
+            if full(shown, printed) {
+                hidden.push(format!("{} ({})", self.shown_path(&f.path), lines.len()));
+                continue;
+            }
+            let all: Vec<&str> = text.lines().collect();
+            let source = is_source(&f.path);
+            if !single {
+                body.push_str(&self.shown_path(&f.path));
+                body.push('\n');
+            }
+
+            if o.collapse.unwrap_or(false) && before == 0 && after == 0 {
+                // Log lines: one per shape, with how often it recurs.
+                let mut order: Vec<String> = Vec::new();
+                let mut groups: HashMap<String, (usize, usize, usize)> = HashMap::new();
+                for &l in lines {
+                    let key = mask_numbers(all[l - 1].trim());
+                    let g = groups.entry(key.clone()).or_insert_with(|| {
+                        order.push(key);
+                        (l, l, 0)
+                    });
+                    g.1 = l;
+                    g.2 += 1;
+                }
+                let mut covered = 0usize;
+                for key in &order {
+                    if full(shown + covered, printed) {
+                        break;
+                    }
+                    printed += 1;
+                    let (first, last, n) = groups[key];
+                    let t = window(all[first - 1].trim(), &re, SEARCH_TEXT_CAP);
+                    if n > 1 {
+                        body.push_str(&format!("{first}:{t}  [x{n}, last at {last}]\n"));
+                    } else {
+                        body.push_str(&format!("{first}:{t}\n"));
+                    }
+                    covered += n;
+                }
+                shown += covered;
+                continue;
+            }
+
+            let defs_arc = if source { Some(self.defs_of(&f.path, text)) } else { None };
+            let defs: &[Def] = match defs_arc.as_deref() {
+                Some(Ok(d)) => d,
+                _ => &[],
+            };
+            let matched: HashSet<usize> = lines.iter().copied().collect();
+            // Matches with their context, merged where the windows touch.
+            let mut blocks: Vec<(usize, usize, usize)> = Vec::new(); // (from, to, first match)
+            for &l in lines {
+                let from = l.saturating_sub(before).max(1);
+                let to = (l + after).min(all.len());
+                match blocks.last_mut() {
+                    Some(b) if from <= b.1 + 1 => b.1 = b.1.max(to),
+                    _ => blocks.push((from, to, l)),
+                }
+            }
+            let mut last_label = String::new();
+            let mut previous_end = 0usize;
+            for (from, to, first) in blocks {
+                if full(shown, printed) {
+                    break;
+                }
+                // The item a block sits in, named once; top-level lines are
+                // named by nothing.
+                let label = innermost(defs, first).map(item_label).unwrap_or_default();
+                if label != last_label {
+                    if !label.is_empty() {
+                        body.push_str(&format!("  {label}\n"));
+                    }
+                    last_label = label;
+                } else if before + after > 0 && previous_end > 0 {
+                    body.push_str("--\n");
+                }
+                for n in from..=to {
+                    if printed >= cap {
+                        break;
+                    }
+                    printed += 1;
+                    if matched.contains(&n) {
+                        if shown >= o.limit {
+                            break;
+                        }
+                        let mark = if source && comment_line(&f.path, all[n - 1]) { '~' } else { ':' };
+                        body.push_str(&format!("{n}{mark}{}\n", window(all[n - 1].trim(), &re, SEARCH_TEXT_CAP)));
+                        shown += 1;
+                    } else {
+                        body.push_str(&format!("{n}-{}\n", cut(all[n - 1].trim(), SEARCH_TEXT_CAP)));
+                    }
+                }
+                previous_end = to;
+            }
+        }
+
+        let mut out = body;
+        if total > shown {
+            let mut files = hidden.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+            if hidden.len() > 5 {
+                files.push_str(&format!(", +{} files", hidden.len() - 5));
+            }
+            out.push_str(&format!(
+                "... {} more of {total} matching lines in {} files{}{}{}\n",
+                total - shown,
+                hits.len(),
+                if files.is_empty() { "" } else { ": " },
+                files,
+                // A rewritten grep is re-run with a bigger head to see more.
+                if self.terse { "" } else { " - raise limit or narrow the path" },
+            ));
+        }
+        out.trim_end_matches('\n').to_string()
+    }
+
+    /// A path as shown: relative to the display base when under it.
+    fn shown_path(&self, p: &Path) -> String {
+        match self.display_base.as_deref().and_then(|b| p.strip_prefix(b).ok()) {
+            Some(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
+            _ => p.display().to_string(),
+        }
+    }
+
+    /// The files a search reads, and how to name where they are.
+    fn search_files(
+        &mut self,
+        roots: &[(PathBuf, String, bool)],
+        paths: &[String],
+        glob: Option<&str>,
+    ) -> Result<(Vec<SrcFile>, String), String> {
+        let glob = glob.map(str::trim).filter(|g| !g.is_empty()).map(glob_regex).transpose()?;
+        let keep = |p: &Path| {
+            glob.as_ref().is_none_or(|g| {
+                let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                g.is_match(&name) || g.is_match(&p.to_string_lossy())
+            })
+        };
+        let wanted: Vec<&str> =
+            paths.iter().map(|p| p.trim().trim_end_matches('/')).filter(|q| !q.is_empty()).collect();
+        if wanted.is_empty() {
+            let files: Vec<SrcFile> = self.files(roots).into_iter().filter(|f| keep(&f.path)).collect();
+            return Ok((files, "the indexed roots".into()));
+        }
+        let mut out: Vec<SrcFile> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut under_roots: Option<Vec<SrcFile>> = None;
+        for q in &wanted {
+            // A path that exists: every text file under it, source or not.
+            let direct = absolute(Path::new(q));
+            let found: Vec<SrcFile> = if direct.exists() {
+                walk_text(&direct).into_iter().map(|p| SrcFile { origin: origin_of(roots, &p), path: p }).collect()
+            } else {
+                // Otherwise the end of a path under the roots.
+                let all = under_roots.get_or_insert_with(|| self.files(roots));
+                let hits: Vec<SrcFile> = all
+                    .iter()
+                    .filter(|f| {
+                        let s = f.path.to_string_lossy();
+                        s.ends_with(&format!("/{q}")) || s.contains(&format!("/{q}/"))
+                    })
+                    .cloned()
+                    .collect();
+                if hits.is_empty() {
+                    return Err(format!(
+                        "No file or directory `{q}` in the working directory or under the indexed roots."
+                    ));
+                }
+                hits
+            };
+            for f in found {
+                if keep(&f.path) && seen.insert(f.path.clone()) {
+                    out.push(f);
+                }
+            }
+        }
+        let scope = match wanted.as_slice() {
+            [one] => {
+                let d = absolute(Path::new(one));
+                if d.exists() { d.display().to_string() } else { format!("`{one}`") }
+            }
+            many => format!("{} paths", many.len()),
+        };
+        Ok((out, scope))
+    }
+
+    // ── reading lines ────────────────────────────────────────────────────────
+
+    /// Lines of any file by number - what `sed -n`, `head`, `tail` and `cat`
+    /// are used for - with the items the lines sit in named before them.
+    pub fn read_lines(
+        &mut self,
+        roots: &[(PathBuf, String, bool)],
+        file_query: &str,
+        ranges: Option<&str>,
+        max_lines: usize,
+    ) -> String {
+        let path = match self.resolve_file(roots, file_query) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let Some(text) = self.read(&path) else {
+            return format!("{} cannot be read.", path.display());
+        };
+        let total = text.lines().count();
+        let spans = match ranges.map(str::trim).filter(|r| !r.is_empty()) {
+            None => vec![(1, total.max(1))],
+            Some(r) => match parse_ranges(r, total) {
+                Ok(s) => s,
+                Err(e) => return e,
+            },
+        };
+        let defs: Vec<Def> = if is_source(&path) {
+            match &*self.defs_of(&path, &text) {
+                Ok(d) => d.iter().filter(|d| !matches!(d.kind, "field" | "variant")).cloned().collect(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let label = SrcFile { origin: origin_of(roots, &path), path: path.clone() };
+        // A rewritten `sed -n` printed no header; the caller named the file.
+        let mut out = if self.terse {
+            String::new()
+        } else {
+            format!("{} ({}, {total} lines)\n", self.shown_path(&path), origin_label(&label))
+        };
+        let mut budget = max_lines.max(1);
+        for (a, b) in spans {
+            if budget == 0 {
+                out.push_str(&format!("  ... lines {a}-{b} not shown; ask again with lines=\"{a}-{b}\"\n"));
+                continue;
+            }
+            let note = if self.terse {
+                // Only where it changes what the lines mean: a range that
+                // starts or ends inside an item, which the reader would
+                // otherwise take for the whole of it.
+                partial_item(&defs, a, b)
+            } else {
+                range_items(&defs, a, b)
+            };
+            if let Some(note) = note {
+                out.push_str(&note);
+            }
+            let shown = if self.terse {
+                // What `sed -n` printed, line for line; the note above is the
+                // only addition.
+                let lines: Vec<&str> = text.lines().collect();
+                let last = (a + budget).saturating_sub(1).min(b).min(lines.len());
+                for n in a..=last {
+                    out.push_str(lines[n - 1]);
+                    out.push('\n');
+                }
+                (last + 1).saturating_sub(a)
+            } else {
+                render_lines(&text, a, b, budget, &mut out)
+            };
+            budget = budget.saturating_sub(shown);
+        }
+        if self.terse {
+            // Byte for byte what sed printed, trailing empty lines included.
+            return out;
+        }
+        // Only the newline: an empty last line is still a numbered line.
+        out.trim_end_matches('\n').to_string()
+    }
+
+    /// A file by path: absolute, relative to the working directory, or the end
+    /// of a path under the roots.
+    fn resolve_file(&mut self, roots: &[(PathBuf, String, bool)], q: &str) -> Result<PathBuf, String> {
+        let q = q.trim();
+        let direct = absolute(Path::new(q));
+        if direct.is_file() {
+            return Ok(direct);
+        }
+        let hits: Vec<PathBuf> = self
+            .files(roots)
+            .into_iter()
+            .map(|f| f.path)
+            .filter(|p| p.to_string_lossy().ends_with(&format!("/{q}")))
+            .collect();
+        match hits.len() {
+            0 => Err(format!("No file `{q}` in the working directory or under the indexed roots.")),
+            1 => Ok(hits.into_iter().next().unwrap_or_default()),
+            k => Err(format!(
+                "`{q}` matches {k} files; pass more of the path:\n{}",
+                hits.iter().take(12).map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
+            )),
+        }
+    }
+}
+
+/// Options for [`Nav::search`].
+#[derive(Debug, Clone)]
+pub struct SearchOpts {
+    /// Files or directories: absolute, relative to the working directory, or
+    /// the end of a path under the roots. Empty searches every root.
+    pub paths: Vec<String>,
+    /// File-name globs: `*.rs`, `*.{rs,wgsl}`, several separated by commas.
+    pub glob: Option<String>,
+    pub ignore_case: bool,
+    /// Whole words only, like `grep -w`.
+    pub word: bool,
+    /// The pattern is literal text, like `grep -F`.
+    pub fixed: bool,
+    /// The pattern is basic grep syntax (no `-E`): `\\(` `\\|` `\\{` are the
+    /// operators there and their bare forms are literal.
+    pub basic: bool,
+    /// Lines shown around each match, like `grep -C`.
+    pub context: usize,
+    /// Lines shown before / after each match when they differ, like `grep -B`
+    /// and `grep -A`; each defaults to `context`.
+    pub before: Option<usize>,
+    pub after: Option<usize>,
+    /// Lines of matches and context printed at most, like `| head -N`.
+    pub head: Option<usize>,
+    pub output: SearchOutput,
+    /// Matching lines listed; the rest are counted per file.
+    pub limit: usize,
+    /// Fold lines that differ only in their numbers, for summarising logs.
+    /// Off unless asked: the numbers are often what the reader is after.
+    pub collapse: Option<bool>,
+}
+
+impl Default for SearchOpts {
+    fn default() -> Self {
+        Self {
+            paths: Vec::new(),
+            glob: None,
+            ignore_case: false,
+            word: false,
+            fixed: false,
+            basic: false,
+            context: 0,
+            before: None,
+            after: None,
+            head: None,
+            output: SearchOutput::Lines,
+            limit: DEFAULT_REF_LIMIT,
+            collapse: None,
+        }
+    }
+}
+
+/// What a search returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOutput {
+    /// The matching lines, grouped (grep -n).
+    Lines,
+    /// Each matching file with its count (grep -l, grep -c).
+    Files,
+    /// The totals only.
+    Count,
+}
+
+/// Whether `pattern` compiles the way a search would read it.
+pub fn check_pattern(pattern: &str, o: &SearchOpts) -> Result<(), String> {
+    search_regex(pattern, o).map(|_| ())
+}
+
+/// The pattern as a regex: read like `grep -E`, with `\|` taken as `|` the way
+/// agents write it for basic grep.
+fn search_regex(pattern: &str, o: &SearchOpts) -> Result<regex::Regex, String> {
+    let mut p = if o.fixed {
+        regex::escape(pattern)
+    } else if o.basic {
+        bre_to_ere(pattern)
+    } else {
+        pattern.replace("\\|", "|")
+    };
+    if o.word {
+        p = format!(r"\b(?:{p})\b");
+    }
+    regex::RegexBuilder::new(&p)
+        .case_insensitive(o.ignore_case)
+        // `^` and `$` at every line, as grep reads them, so the whole-file
+        // check before the line-by-line pass cannot reject a line-anchored
+        // pattern.
+        .multi_line(true)
+        .size_limit(1 << 24)
+        .build()
+        .map_err(|e| {
+            let why = e.to_string().lines().last().unwrap_or_default().trim().to_string();
+            format!("`{pattern}` is not a valid pattern ({why}). It is read like `grep -E`; pass fixed=true for literal text.")
+        })
+}
+
+/// A basic-grep pattern as an extended one. In basic syntax `\\(` `\\)` `\\{`
+/// `\\}` `\\|` `\\+` `\\?` are the operators and the bare characters are literal;
+/// inside a bracket expression nothing is special.
+pub fn bre_to_ere(p: &str) -> String {
+    let mut out = String::new();
+    let mut chars = p.chars().peekable();
+    let mut in_class = false;
+    while let Some(c) = chars.next() {
+        if in_class {
+            out.push(c);
+            if c == ']' {
+                in_class = false;
+            }
+            continue;
+        }
+        match c {
+            '\\' => match chars.next() {
+                Some(n @ ('(' | ')' | '{' | '}' | '|' | '+' | '?')) => out.push(n),
+                Some(n) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                None => out.push_str("\\\\"),
+            },
+            '(' | ')' | '{' | '}' | '|' | '+' | '?' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '[' => {
+                in_class = true;
+                out.push(c);
+                if chars.peek() == Some(&'^') {
+                    out.extend(chars.next());
+                }
+                if chars.peek() == Some(&']') {
+                    out.extend(chars.next());
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Globs - `*.rs`, `*.{rs,wgsl}`, `src/**/*.rs`, several separated by commas -
+/// as one regex, matched against a file's name or, for a glob with a `/`, the
+/// end of its path.
+fn glob_regex(globs: &str) -> Result<regex::Regex, String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    for c in globs.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                cur.push(c)
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c)
+            }
+            ',' if depth == 0 => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    let mut alts = Vec::new();
+    for g in parts.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
+        let mut r = String::new();
+        let mut chars = g.chars().peekable();
+        let mut braces = 0usize;
+        while let Some(c) = chars.next() {
+            match c {
+                '*' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    r.push_str(".*");
+                }
+                '*' => r.push_str("[^/]*"),
+                '?' => r.push_str("[^/]"),
+                '{' => {
+                    braces += 1;
+                    r.push_str("(?:")
+                }
+                '}' if braces > 0 => {
+                    braces -= 1;
+                    r.push(')')
+                }
+                ',' if braces > 0 => r.push('|'),
+                c => r.push_str(&regex::escape(&c.to_string())),
+            }
+        }
+        alts.push(if g.contains('/') { format!("(?:^|/){r}$") } else { format!("^{r}$") });
+    }
+    regex::Regex::new(&alts.join("|")).map_err(|e| format!("`{globs}` is not a usable glob ({e})"))
+}
+
+/// Every text file under `path`, or `path` itself: what `grep -r` reads,
+/// less build output, dependencies, version control and binary files.
+fn walk_text(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return if looks_binary(path) { Vec::new() } else { vec![path.to_path_buf()] };
+    }
+    let mut out = Vec::new();
+    let walker = ignore::WalkBuilder::new(path)
+        .standard_filters(false)
+        .filter_entry(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+        .build();
+    for entry in walker.flatten() {
+        if entry.file_type().is_some_and(|t| t.is_file()) && !looks_binary(entry.path()) {
+            out.push(absolute(entry.path()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A NUL byte in the first 8 KB, or an extension that is never text.
+fn looks_binary(p: &Path) -> bool {
+    use std::io::Read;
+    if matches!(
+        ext_of(p),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "ktx2" | "dds" | "hdr" | "exr" | "glb" | "bin" | "so" | "a" | "o"
+            | "rlib" | "rmeta" | "dylib" | "dll" | "exe" | "db" | "sqlite" | "gz" | "zip" | "apk" | "aab" | "jar"
+            | "wav" | "ogg" | "mp3" | "mp4" | "pdf" | "ttf" | "otf" | "woff" | "woff2" | "lightmaps"
+    ) {
+        return true;
+    }
+    let Ok(mut f) = std::fs::File::open(p) else { return true };
+    let mut buf = [0u8; 8192];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf[..n].contains(&0)
+}
+
+/// The origin tag of the root holding `path`, or none.
+fn origin_of(roots: &[(PathBuf, String, bool)], path: &Path) -> String {
+    crate_roots(roots)
+        .iter()
+        .filter(|(r, _, _)| path.starts_with(absolute(r)))
+        .max_by_key(|(r, _, _)| r.as_os_str().len())
+        .map(|(_, o, _)| o.clone())
+        .unwrap_or_default()
+}
+
+/// Whether a whole line is a comment, by its language's markers.
+fn comment_line(path: &Path, line: &str) -> bool {
+    let t = line.trim_start();
+    match ext_of(path) {
+        "py" | "sh" | "bash" | "zsh" | "toml" | "yaml" | "yml" | "rb" => t.starts_with('#') && !t.starts_with("#!"),
+        _ => t.starts_with("//") || t.starts_with("/*") || t.starts_with("* ") || t == "*" || t.starts_with("*/"),
+    }
+}
+
+/// `line` cut to `cap` characters around its first match, so a long line
+/// shows the part that matched.
+fn window(line: &str, re: &regex::Regex, cap: usize) -> String {
+    let n = line.chars().count();
+    if n <= cap {
+        return line.to_string();
+    }
+    let Some(m) = re.find(line) else { return cut(line, cap) };
+    let at = line[..m.start()].chars().count();
+    let from = at.saturating_sub(cap / 3).min(n.saturating_sub(cap));
+    let mid: String = line.chars().skip(from).take(cap).collect();
+    format!("{}{mid}{}", if from > 0 { "…" } else { "" }, if from + cap < n { "…" } else { "" })
+}
+
+/// A line with its numbers, long hex ids and timestamps blanked, so log lines
+/// that differ only in those fold together.
+fn mask_numbers(line: &str) -> String {
+    static NUM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = NUM.get_or_init(|| {
+        regex::Regex::new(r"0x[0-9a-fA-F]+|\b[0-9a-fA-F]{8,}\b|\d+(?:\.\d+)?").unwrap_or_else(|_| unreachable!())
+    });
+    re.replace_all(line, "#").into_owned()
+}
+
+/// `fn Canvas::draw 4-10`; an impl block's name already says `impl`.
+fn item_label(d: &Def) -> String {
+    if d.qual.starts_with(d.kind) {
+        format!("{} {}-{}", d.qual, d.start, d.end)
+    } else {
+        format!("{} {} {}-{}", d.kind, d.qual, d.start, d.end)
+    }
+}
+
+/// The items a line range sits in and the items that start inside it, as one
+/// line ahead of the range; `None` when the file has no items to name.
+fn range_items(defs: &[Def], a: usize, b: usize) -> Option<String> {
+    if defs.is_empty() {
+        return None;
+    }
+    let mut chain: Vec<&Def> = defs.iter().filter(|d| d.start <= a && a <= d.end).collect();
+    chain.sort_by_key(|d| std::cmp::Reverse(d.end - d.start));
+    let inside: Vec<&Def> = defs.iter().filter(|d| d.start > a && d.start <= b).collect();
+    let outer: Vec<&Def> = inside
+        .iter()
+        .copied()
+        .filter(|d| !inside.iter().any(|o| !std::ptr::eq(*o, *d) && o.start <= d.start && o.end >= d.end))
+        .collect();
+    let mut parts = Vec::new();
+    if !chain.is_empty() {
+        let names: Vec<String> =
+            chain.iter().rev().take(3).rev().map(|d| item_label(d)).collect();
+        parts.push(format!("in {}", names.join(" > ")));
+    }
+    if !outer.is_empty() {
+        let names: Vec<String> = outer.iter().take(8).map(|d| item_label(d)).collect();
+        let more = outer.len().saturating_sub(8);
+        parts.push(format!(
+            "then {}{}",
+            names.join(", "),
+            if more > 0 { format!(", +{more}") } else { String::new() }
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("  [{}]\n", parts.join("; ")))
+}
+
+/// The innermost item a range covers only part of, as a note; `None` when the
+/// range holds whole items or sits outside every item.
+fn partial_item(defs: &[Def], a: usize, b: usize) -> Option<String> {
+    let d = defs
+        .iter()
+        .filter(|d| d.start <= b && d.end >= a && (d.start < a || d.end > b))
+        .filter(|d| d.start <= a || d.end >= b)
+        .min_by_key(|d| d.end - d.start)?;
+    Some(format!("  [in {}]\n", item_label(d)))
+}
+
+/// `"120-160"`, `"120"`, `"120-"` (to the end), `"-40"` (the last 40), or
+/// several separated by commas; resolved against a file of `n` lines, sorted
+/// and merged.
+pub fn parse_ranges(s: &str, n: usize) -> Result<Vec<(usize, usize)>, String> {
+    let bad = |part: &str| {
+        format!("`{part}` is not a line range; use `120-160`, `120`, `120-` (to the end), `-40` (the last 40), several separated by commas")
+    };
+    let num = |t: &str, part: &str| t.trim().parse::<usize>().map_err(|_| bad(part));
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (a, b) = if let Some(k) = part.strip_prefix('-') {
+            (n.saturating_sub(num(k, part)?) + 1, n)
+        } else if let Some(a) = part.strip_suffix('-') {
+            (num(a, part)?, n)
+        } else if let Some((a, b)) = part.split_once('-') {
+            (num(a, part)?, num(b, part)?)
+        } else {
+            let a = num(part, part)?;
+            (a, a)
+        };
+        if a == 0 || a > b {
+            return Err(bad(part));
+        }
+        if a > n {
+            return Err(format!("line {a} is past the end; the file has {n} lines"));
+        }
+        spans.push((a, b.min(n)));
+    }
+    if spans.is_empty() {
+        return Err(bad(s));
+    }
+    spans.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in spans {
+        match merged.last_mut() {
+            Some(m) if a <= m.1 + 1 => m.1 = m.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    Ok(merged)
 }
 
 // ── Definitions ───────────────────────────────────────────────────────────────
@@ -1177,7 +1919,7 @@ fn render_lines(text: &str, from: usize, to: usize, cap: usize, out: &mut String
     }
     let last = (from + cap).saturating_sub(1).min(to);
     for n in from..=last {
-        out.push_str(&format!("{n:>5}\t{}\n", cut(lines[n - 1], LINE_CAP)));
+        out.push_str(&format!("{n}\t{}\n", cut(lines[n - 1].trim_end(), LINE_CAP)));
     }
     if last < to {
         out.push_str(&format!(
@@ -1280,8 +2022,8 @@ mod tests {
         let out = Nav::new().get_source(&roots, "Canvas::draw", None, None, DEFAULT_MAX_LINES);
         assert!(out.starts_with("fn Canvas::draw — "), "{out}");
         assert!(out.contains(":4-10 "), "{out}");
-        assert!(out.contains("    4\t    /// Draws it."), "{out}");
-        assert!(out.contains("   10\t    }"), "{out}");
+        assert!(out.contains("\n4\t    /// Draws it."), "{out}");
+        assert!(out.contains("\n10\t    }"), "{out}");
         assert!(!out.contains("flush_batch(&mut self) {}"), "{out}");
     }
 
@@ -1333,7 +2075,7 @@ mod tests {
         let out = nav.get_source(&roots, "big", None, None, 50);
         assert!(out.contains("more lines (51-302); ask again with lines=\"51-302\""), "{out}");
         let rest = nav.get_source(&roots, "big", None, Some((290, 302)), 50);
-        assert!(rest.contains("  302\t}"), "{rest}");
+        assert!(rest.contains("\n302\t}"), "{rest}");
     }
 
     #[test]
@@ -1411,7 +2153,7 @@ pub enum Action {
         let out = nav.get_source(&roots, "fs_main", None, None, DEFAULT_MAX_LINES);
         assert!(out.contains("wgsl fn fs_main — "), "{out}");
         assert!(out.contains(":7-11 (rust · t; in const OUTPUT_WGSL)"), "{out}");
-        assert!(out.contains("   11\t}"), "{out}");
+        assert!(out.contains("\n11\t}"), "{out}");
         let vout = nav.get_source(&roots, "VOut", None, None, DEFAULT_MAX_LINES);
         assert!(vout.contains("wgsl struct VOut") && vout.contains(":2-4 "), "{vout}");
         // A one-line format! string: `{{`/`}}` still balance, and the const is found.
@@ -1465,6 +2207,149 @@ pub enum Action {
         assert_eq!(parse_range("120-160"), Some((120, 160)));
         assert_eq!(parse_range("7"), Some((7, 7)));
         assert_eq!(parse_range("9-3"), None);
+    }
+
+    fn search(nav: &mut Nav, roots: &[(PathBuf, String, bool)], pattern: &str, o: SearchOpts) -> String {
+        nav.search(roots, pattern, &o)
+    }
+
+    #[test]
+    fn a_search_groups_matches_by_item_and_counts_what_it_does_not_list() {
+        let (_d, roots) = tmp_root(&[("src/lib.rs", CANVAS)]);
+        let mut nav = Nav::new();
+        let out = search(&mut nav, &roots, "flush", SearchOpts { limit: 2, ..Default::default() });
+        assert!(out.contains("  fn Canvas::draw 4-10\n7:self.flush_batch();\n8~// flush_batch in a comment"), "{out}");
+        assert!(out.ends_with("... 2 more of 4 matching lines in 1 files - raise limit or narrow the path"), "{out}");
+        // Nothing cut: no header and no trailer, only the lines.
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts::default());
+        assert!(out.ends_with("lib.rs\n  fn draw_rect 15-15\n15:fn draw_rect() {}"), "{out}");
+    }
+
+    #[test]
+    fn a_search_reads_basic_grep_alternation_words_and_literal_text() {
+        let (_d, roots) = tmp_root(&[("src/lib.rs", "fn alpha() {}\nfn beta() {}\nfn alphabet() {}\nlet x = a.b;\nlet y = axb;\n")]);
+        let mut nav = Nav::new();
+        let out = search(&mut nav, &roots, r"alpha\|beta", SearchOpts::default());
+        assert_eq!(out.matches(":fn ").count(), 3, "{out}");
+        let out = search(&mut nav, &roots, "alpha", SearchOpts { word: true, ..Default::default() });
+        assert!(out.contains("1:fn alpha() {}") && !out.contains("alphabet"), "{out}");
+        let out = search(&mut nav, &roots, "a.b", SearchOpts { fixed: true, ..Default::default() });
+        assert!(out.contains("4:let x = a.b;") && !out.contains("axb"), "{out}");
+        // Anchors hold at every line, as in grep.
+        let out = search(&mut nav, &roots, r"^fn \(alpha\|beta\)()", SearchOpts { basic: true, ..Default::default() });
+        assert!(out.contains("1:fn alpha() {}") && out.contains("2:fn beta() {}") && !out.contains("alphabet"), "{out}");
+        let bad = search(&mut nav, &roots, "fn (", SearchOpts::default());
+        assert!(bad.contains("not a valid pattern") && bad.contains("fixed=true"), "{bad}");
+    }
+
+    #[test]
+    fn log_lines_that_differ_only_in_numbers_fold_into_one_when_asked() {
+        let log = "07:01:02.123 frame 1 took 12 ms\nunrelated\n07:01:02.140 frame 2 took 13 ms\n07:01:03 error at 0x1f\n";
+        let (d, roots) = tmp_root(&[("logs/run.txt", log)]);
+        let mut nav = Nav::new();
+        let path = d.path().join("logs").display().to_string();
+        let out = search(&mut nav, &roots, "frame|error", SearchOpts { paths: vec![path.clone()], collapse: Some(true), ..Default::default() });
+        assert!(out.contains("1:07:01:02.123 frame 1 took 12 ms  [x2, last at 3]"), "{out}");
+        assert!(out.ends_with("4:07:01:03 error at 0x1f"), "{out}");
+        // Unasked, every line is kept: the numbers may be the point.
+        let out = search(&mut nav, &roots, "frame", SearchOpts { paths: vec![path], ..Default::default() });
+        assert!(out.contains("3:07:01:02.140 frame 2 took 13 ms"), "{out}");
+    }
+
+    #[test]
+    fn a_search_shows_context_and_lists_files_or_counts() {
+        let (_d, roots) = tmp_root(&[("src/lib.rs", CANVAS), ("src/other.rs", "fn draw_rect() {}\n")]);
+        let mut nav = Nav::new();
+        let out = search(&mut nav, &roots, r"flush_batch\(", SearchOpts { context: 1, ..Default::default() });
+        assert!(out.contains("6-pub fn draw(&mut self) {\n7:self.flush_batch();\n8-// flush_batch"), "{out}");
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { output: SearchOutput::Files, ..Default::default() });
+        assert!(out.contains("lib.rs (1)") && out.contains("other.rs (1)"), "{out}");
+        let out = search(&mut nav, &roots, "draw", SearchOpts { output: SearchOutput::Count, glob: Some("other.*".into()), ..Default::default() });
+        assert_eq!(out, "`draw`: 1 matching line(s) in 1 of 1 file(s) under the indexed roots.");
+    }
+
+    #[test]
+    fn a_search_of_one_named_file_shows_paths_as_the_caller_wrote_them() {
+        let (d, roots) = tmp_root(&[("src/lib.rs", CANVAS), ("src/other.rs", "fn draw_rect() {}\n")]);
+        let mut nav = Nav::new();
+        nav.display_base = Some(d.path().to_path_buf());
+        let one = d.path().join("src/lib.rs").display().to_string();
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![one], ..Default::default() });
+        assert_eq!(out, "  fn draw_rect 15-15\n15:fn draw_rect() {}");
+        let dir = d.path().join("src").display().to_string();
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![dir], ..Default::default() });
+        assert!(out.starts_with("src/lib.rs\n") && out.contains("src/other.rs\n"), "{out}");
+    }
+
+    #[test]
+    fn reading_lines_names_their_items_and_merges_ranges() {
+        let (d, roots) = tmp_root(&[("pkgx/src/lib.rs", CANVAS)]);
+        let mut nav = Nav::new();
+        let file = d.path().join("pkgx/src/lib.rs").display().to_string();
+        let out = nav.read_lines(&roots, &file, Some("6-7,7-8"), 400);
+        assert!(out.contains("(rust · t, 15 lines)"), "{out}");
+        assert!(out.contains("  [in impl Canvas 3-13 > fn Canvas::draw 4-10]\n6\t    pub fn draw(&mut self) {"), "{out}");
+        assert_eq!(out.matches("\n7\t").count(), 1, "overlapping ranges are merged: {out}");
+        // The end of a path under the roots finds it too (a path that exists from the
+        // working directory wins, as it would for sed); `-2` is the last two lines.
+        let out = nav.read_lines(&roots, "pkgx/src/lib.rs", Some("-2"), 400);
+        assert!(out.contains("\n14\t") && out.contains("\n15\tfn draw_rect() {}") && !out.contains("\n13\t"), "{out}");
+        // Items that start inside the range are named, and the budget cuts with a way on.
+        let out = nav.read_lines(&roots, "pkgx/src/lib.rs", Some("1-15"), 4);
+        assert!(out.contains("then struct Canvas 1-1") || out.contains("then impl Canvas 3-13"), "{out}");
+        assert!(out.contains("ask again with lines=\"5-15\""), "{out}");
+    }
+
+    #[test]
+    fn a_rewritten_read_prints_what_sed_would_and_names_a_cut_item() {
+        let (d, roots) = tmp_root(&[("pkgx/src/lib.rs", CANVAS)]);
+        let mut nav = Nav::new();
+        nav.terse = true;
+        let file = d.path().join("pkgx/src/lib.rs").display().to_string();
+        // Part of draw: named, then the lines exactly, no numbers.
+        let out = nav.read_lines(&roots, &file, Some("6-7"), 2);
+        assert_eq!(out, "  [in fn Canvas::draw 4-10]\n    pub fn draw(&mut self) {\n        self.flush_batch();\n");
+        // The whole of draw_rect: nothing to add, and the empty line 14 is kept.
+        let out = nav.read_lines(&roots, &file, Some("14-15"), 2);
+        assert_eq!(out, "\nfn draw_rect() {}\n");
+    }
+
+    #[test]
+    fn line_ranges_take_head_tail_and_lists() {
+        assert_eq!(parse_ranges("-3", 10), Ok(vec![(8, 10)]));
+        assert_eq!(parse_ranges("5-", 10), Ok(vec![(5, 10)]));
+        assert_eq!(parse_ranges("4, 1-2", 10), Ok(vec![(1, 2), (4, 4)]));
+        assert_eq!(parse_ranges("1-3,3-6", 10), Ok(vec![(1, 6)]));
+        assert_eq!(parse_ranges("8-40", 10), Ok(vec![(8, 10)]));
+        assert!(parse_ranges("0-3", 10).is_err());
+        assert!(parse_ranges("12", 10).unwrap_err().contains("past the end"));
+    }
+
+    #[test]
+    fn globs_match_names_alternatives_and_paths() {
+        let g = glob_regex("*.{rs,wgsl}").unwrap();
+        assert!(g.is_match("a.rs") && g.is_match("b.wgsl") && !g.is_match("c.py"));
+        let g = glob_regex("*.toml, Cargo.*").unwrap();
+        assert!(g.is_match("x.toml") && g.is_match("Cargo.lock") && !g.is_match("x.rs"));
+        let g = glob_regex("src/**/*.rs").unwrap();
+        assert!(g.is_match("/w/crate/src/a/b.rs") && !g.is_match("/w/crate/tests/b.rs"));
+    }
+
+    #[test]
+    fn basic_grep_patterns_become_extended_ones() {
+        assert_eq!(bre_to_ere(r"fn \(draw\|flush\)"), "fn (draw|flush)");
+        assert_eq!(bre_to_ere(r"foo(x) + 1"), r"foo\(x\) \+ 1");
+        assert_eq!(bre_to_ere(r"a\{2\}[(|]"), "a{2}[(|]");
+        assert_eq!(bre_to_ere(r"\.rs$"), r"\.rs$");
+    }
+
+    #[test]
+    fn a_long_line_is_cut_around_its_match() {
+        let re = regex::Regex::new("needle").unwrap();
+        let line = format!("{}needle{}", "a".repeat(300), "b".repeat(300));
+        let w = window(&line, &re, 60);
+        assert!(w.starts_with('…') && w.ends_with('…') && w.contains("needle"), "{w}");
+        assert_eq!(w.chars().count(), 62);
     }
 }
 

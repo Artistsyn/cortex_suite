@@ -80,6 +80,113 @@ enum Command {
     /// Example:
     ///   quartz-ctx boundaries --source vr_workspace/scene_editor_web
     Boundaries(BoundariesArgs),
+
+    /// Code navigation from a shell: the answers of the MCP tools get_source,
+    /// search_code, find_references and get_outline, for subagents, scripts and
+    /// hooks that cannot call MCP.
+    ///
+    /// Roots come from the nearest `.cortex/index-sources.json` at or above the
+    /// working directory, or --sources-from. Relative paths are the caller's.
+    ///
+    /// Examples:
+    ///   quartz-ctx nav search 'reach|slope' src/renderer
+    ///   quartz-ctx nav read src/main.rs 120-160,300-320
+    ///   quartz-ctx nav source Canvas::draw
+    Nav(NavArgs),
+}
+
+#[derive(Parser, Debug)]
+struct NavArgs {
+    /// Sources manifest (the `.cortex/index-sources.json` shape). Default: the
+    /// nearest one at or above the working directory.
+    #[arg(long, global = true)]
+    sources_from: Option<PathBuf>,
+    /// Answering a command a hook rewrote: say so, and treat a path that does
+    /// not exist as grep and sed would.
+    #[arg(long, global = true, hide = true)]
+    hook: bool,
+    #[command(subcommand)]
+    cmd: NavCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum NavCmd {
+    /// A definition by name, like get_source(name).
+    Source {
+        /// `draw`, `Canvas::draw`, or several as `a|b`.
+        name: String,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        lines: Option<String>,
+        #[arg(long)]
+        max_lines: Option<usize>,
+    },
+    /// Lines of a file by number, like get_source(file, lines): `120-160,300-`, `-40`.
+    Read {
+        file: String,
+        lines: Option<String>,
+        #[arg(long)]
+        max_lines: Option<usize>,
+    },
+    /// Lines matching a pattern, like search_code.
+    Search {
+        #[arg(allow_hyphen_values = true)]
+        pattern: String,
+        /// Files or directories (default: every indexed root).
+        paths: Vec<String>,
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
+        #[arg(short = 'w', long)]
+        word: bool,
+        #[arg(short = 'F', long)]
+        fixed: bool,
+        /// Basic grep syntax (no -E): `\(` and `\|` are the operators.
+        #[arg(long)]
+        basic: bool,
+        #[arg(short = 'C', long, default_value_t = 0)]
+        context: usize,
+        /// Lines after each match, like grep -A.
+        #[arg(short = 'A', long)]
+        after: Option<usize>,
+        /// Lines before each match, like grep -B.
+        #[arg(short = 'B', long)]
+        before: Option<usize>,
+        /// Lines of matches and context printed at most, like `| head -N`.
+        #[arg(long)]
+        head: Option<usize>,
+        #[arg(long)]
+        glob: Option<String>,
+        /// Each matching file with its count.
+        #[arg(short = 'l', long)]
+        files: bool,
+        /// The totals only.
+        #[arg(short = 'c', long)]
+        count: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Fold lines that differ only in numbers, to summarise a log.
+        #[arg(long)]
+        collapse: Option<bool>,
+    },
+    /// Uses of a name, like find_references.
+    Refs {
+        name: String,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        include_comments: bool,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// A file's items or a directory's files, like get_outline.
+    Outline { path: String },
+    /// Claude Code PreToolUse hook: reads the event on stdin and, for a Bash
+    /// grep or `sed -n` it can answer at least as fully, returns the nav
+    /// command to run instead. Prints nothing otherwise. QX_HOOK=off disables it.
+    Hook,
+    /// Show what the hook would run for a command, or `(as written)`.
+    Rewrite { command: String },
 }
 
 #[derive(Parser, Debug)]
@@ -257,7 +364,194 @@ fn main() -> Result<()> {
         Command::Serve(args)    => run_serve(args),
         Command::Selfcheck(args)=> run_selfcheck(args),
         Command::Boundaries(args)=> run_boundaries(args),
+        Command::Nav(args)      => run_nav(args),
     }
+}
+
+/// The nearest `.cortex/index-sources.json` at or above `dir`.
+fn find_manifest(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors().map(|d| d.join(".cortex/index-sources.json")).find(|m| m.is_file())
+}
+
+/// The PreToolUse hook: a Bash read rewritten into a nav command, or nothing.
+fn run_nav_hook() -> Result<()> {
+    use std::io::Read;
+    if std::env::var("QX_HOOK").is_ok_and(|v| v == "off") {
+        return Ok(());
+    }
+    let mut raw = String::new();
+    std::io::stdin().read_to_string(&mut raw)?;
+    let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else { return Ok(()) };
+    if event["tool_name"].as_str() != Some("Bash") {
+        return Ok(());
+    }
+    let Some(command) = event["tool_input"]["command"].as_str() else { return Ok(()) };
+    let cwd = event["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok());
+    let manifest = cwd
+        .as_deref()
+        .and_then(find_manifest)
+        .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok().and_then(|d| find_manifest(Path::new(&d))));
+    let exe = std::env::current_exe()?.display().to_string();
+    let manifest_text = manifest.as_ref().map(|m| m.display().to_string());
+    let Some(rw) = quartz_ctx::rewrite::rewrite(command, &quartz_ctx::rewrite::shell_quote(&exe), manifest_text.as_deref())
+    else {
+        return Ok(());
+    };
+    let mut input = event["tool_input"].clone();
+    input["command"] = json!(rw.command);
+    // A ledger for measuring the hook: which calls it answered, never what
+    // they said (the transcript has that).
+    if let Some(dir) = manifest.as_ref().and_then(|m| m.parent()) {
+        let line = json!({
+            "at": chrono_now(),
+            "session_id": event["session_id"],
+            "tool_use_id": event["tool_use_id"],
+            "kinds": rw.kinds,
+        });
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("nav-rewrites.jsonl")) {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+    }
+    let out = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": "quartz-ctx answers this read-only grep/sed from the source, grouped by item",
+            "updatedInput": input,
+        }
+    });
+    println!("{out}");
+    Ok(())
+}
+
+/// Seconds since the epoch, as text.
+fn chrono_now() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
+}
+
+fn run_nav(args: NavArgs) -> Result<()> {
+    match &args.cmd {
+        NavCmd::Hook => return run_nav_hook(),
+        NavCmd::Rewrite { command } => {
+            let manifest = std::env::current_dir().ok().as_deref().and_then(find_manifest);
+            let manifest_text = manifest.as_ref().map(|m| m.display().to_string());
+            match quartz_ctx::rewrite::rewrite(command, "quartz-ctx", manifest_text.as_deref()) {
+                Some(rw) => println!("{}", rw.command),
+                None => println!("(as written)"),
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    let cwd = std::env::current_dir().context("no working directory")?;
+    let manifest = match &args.sources_from {
+        Some(m) if m.is_absolute() => Some(m.clone()),
+        Some(m) => Some(cwd.join(m)),
+        None => find_manifest(&cwd),
+    };
+    // The caller's relative paths, made absolute before moving to the
+    // workspace; a path that does not exist from here stays as given, to be
+    // matched as the end of a path under the roots.
+    let mine = |p: &str| -> String {
+        let pb = Path::new(p);
+        if pb.is_absolute() || !cwd.join(pb).exists() {
+            p.to_string()
+        } else {
+            cwd.join(pb).display().to_string()
+        }
+    };
+    let roots: Vec<(PathBuf, String, bool)> = match &manifest {
+        Some(m) => {
+            // Manifest roots are relative to the workspace holding `.cortex/`.
+            if let Some(ws) = m.parent().and_then(Path::parent) {
+                std::env::set_current_dir(ws).with_context(|| format!("cannot enter {}", ws.display()))?;
+            }
+            let plan = SourcePlan { explicit: Vec::new(), manifest: Some(m.clone()), discover: None, include_private: true };
+            plan.resolve().sources
+        }
+        None => vec![(cwd.clone(), String::new(), true)],
+    };
+    // A hook-rewritten command reports a missing path the way grep and sed
+    // do, instead of guessing at a file elsewhere with the same ending.
+    if args.hook {
+        let missing: Vec<String> = match &args.cmd {
+            NavCmd::Read { file, .. } => vec![file.clone()],
+            NavCmd::Search { paths, .. } => paths.clone(),
+            _ => Vec::new(),
+        }
+        .into_iter()
+        .filter(|p| !Path::new(&mine(p)).exists())
+        .collect();
+        for p in &missing {
+            eprintln!("{p}: No such file or directory");
+        }
+        let all_missing = match &args.cmd {
+            NavCmd::Read { .. } => !missing.is_empty(),
+            NavCmd::Search { paths, .. } => !paths.is_empty() && missing.len() == paths.len(),
+            _ => false,
+        };
+        if all_missing {
+            std::process::exit(2);
+        }
+    }
+    let mut nav = nav::Nav::new();
+    // Paths come back the way the caller would write them.
+    nav.display_base = Some(cwd.clone());
+    nav.terse = args.hook;
+    let hook = args.hook;
+    let out = match args.cmd {
+        NavCmd::Source { name, file, lines, max_lines } => {
+            let lines = match lines.as_deref().map(nav::parse_range) {
+                Some(None) => return Err(anyhow!("--lines must look like 120-160")),
+                Some(r) => r,
+                None => None,
+            };
+            nav.get_source(&roots, &name, file.as_deref(), lines, max_lines.unwrap_or(nav::DEFAULT_MAX_LINES))
+        }
+        NavCmd::Read { file, lines, max_lines } => {
+            nav.read_lines(&roots, &mine(&file), lines.as_deref(), max_lines.unwrap_or(nav::DEFAULT_READ_LINES))
+        }
+        NavCmd::Search { pattern, paths, ignore_case, word, fixed, basic, context, after, before, head, glob, files, count, limit, collapse } => {
+            let opts = nav::SearchOpts {
+                paths: paths.iter().map(|p| mine(p)).filter(|p| !hook || Path::new(p).exists()).collect(),
+                glob,
+                ignore_case,
+                word,
+                fixed,
+                basic,
+                context,
+                before,
+                after,
+                head,
+                output: if count {
+                    nav::SearchOutput::Count
+                } else if files {
+                    nav::SearchOutput::Files
+                } else {
+                    nav::SearchOutput::Lines
+                },
+                limit: limit.unwrap_or(nav::DEFAULT_REF_LIMIT),
+                collapse,
+            };
+            nav.search(&roots, &pattern, &opts)
+        }
+        NavCmd::Refs { name, file, include_comments, limit } => {
+            nav.find_references(&roots, &name, file.as_deref(), include_comments, limit.unwrap_or(nav::DEFAULT_REF_LIMIT))
+        }
+        NavCmd::Outline { path } => nav.outline(&roots, &mine(&path)),
+        NavCmd::Hook | NavCmd::Rewrite { .. } => unreachable!("handled above"),
+    };
+    if hook && out.ends_with('\n') {
+        // A rewritten read already ends as sed's output did.
+        print!("{out}");
+    } else {
+        println!("{out}");
+    }
+    Ok(())
 }
 
 fn parse_cli_with_diagnostics() -> Result<Cli> {

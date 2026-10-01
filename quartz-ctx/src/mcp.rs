@@ -293,20 +293,25 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "
 /// the tools and when each beats grep. Every session pays for it on every
 /// request, so it stays short.
 pub const INSTRUCTIONS: &str = "\
-Code navigation over the indexed source roots, read from disk at call time - as current \
-as sed, private items included, with exact line numbers.
+Code navigation read from disk at call time - as current as grep and sed, private items \
+included, exact line numbers - and organised by the function or type each line sits in.
 - Reading a function, method or type: get_source(name) - one call instead of grep then \
-sed/cat. Takes `Type::method`, several names as `a|b`, and returns the whole definition \
+sed/cat. Takes `Type::method` and several names as `a|b`; returns the whole definition \
 (doc comments to closing brace); a type also lists its methods with line ranges.
-- Where a name is used (callers, before changing a signature): find_references(name) instead \
-of grep -n. Grouped by file and enclosing function; comments and strings are left out \
-unless include_comments=true, which a rename needs.
+- Reading lines by number (sed -n, head, tail, cat): get_source(file, lines=\"120-160,300-320\") \
+- any text file; the items the lines sit in are named first.
+- Searching (grep, rg): search_code(pattern) - a regex over the indexed roots or any `path`, \
+logs included; grouped by file and enclosing item with its line range, as `12:text` (`~` a \
+comment line, `-` context); matches past the limit counted per file.
+- Where a name is used (callers, before changing a signature): find_references(name) - whole \
+identifiers in code, comments and strings left out unless include_comments=true (a rename).
 - What a file or directory holds: get_outline(path) instead of reading it whole.
 - Starting a coding task: get_api_context(hint) for the relevant types, variants and \
 signatures in one packet.
-Use grep for free text, string literals, logs, config and files outside the indexed roots. \
-Read a file before editing it, at the lines these tools report. If these tools are deferred, \
-load all three with one tool search.";
+Where a hook answers a shell grep or sed -n read from these tools, it comes back in the \
+same format; QX_RAW=1 in the command keeps the raw tool. grep stays right for filtering a \
+command's output. Read a file before editing it, at the lines these tools report. If these \
+tools are deferred, load them with one tool search.";
 
 fn initialize_result(engine_name: &str, params: &Value) -> Value {
     let asked = params["protocolVersion"].as_str().unwrap_or("");
@@ -342,18 +347,19 @@ fn tools_list_result() -> Value {
                                 line numbers - one call instead of grep followed by sed or cat. Returns \
                                 the whole definition from its doc comments to its closing brace, read \
                                 from disk now (private items included). A type also lists its methods \
-                                with line ranges. Long definitions are cut at max_lines with the range \
-                                to ask for next.",
+                                with line ranges. Or, with `file` and no name, read lines of any file by \
+                                number - instead of sed -n, head, tail or cat - with the items those \
+                                lines sit in named first. Long output is cut with the range to ask for next.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "A name (`draw`), a qualified method (`Canvas::draw`), or several separated by `|` (`draw|flush_batch`)."
+                            "description": "A name (`draw`), a qualified method (`Canvas::draw`), or several separated by `|` (`draw|flush_batch`). Omit it to read `file` by line numbers."
                         },
                         "file": {
                             "type": "string",
-                            "description": "Only definitions in files whose path contains this (e.g. `canvas/core.rs`)."
+                            "description": "With a name: only definitions in files whose path contains this (`canvas/core.rs`). Without one: the file to read - absolute, relative to the workspace, or the end of a path under the roots; any text file."
                         },
                         "origin": {
                             "type": "string",
@@ -361,14 +367,14 @@ fn tools_list_result() -> Value {
                         },
                         "lines": {
                             "type": "string",
-                            "description": "Show this line range of the definition's file instead (e.g. `120-160`), for the rest of a cut definition."
+                            "description": "With a name: this range of the definition's file (`120-160`). Without one: `120-160`, several as `120-160,300-320`, `200-` to the end, `-40` for the last 40; omit for the whole file."
                         },
                         "max_lines": {
                             "type": "integer",
-                            "description": "Lines shown per definition before it is cut (default 150)."
+                            "description": "Lines shown before the output is cut (default 150 per definition, 400 for a file read)."
                         }
                     },
-                    "required": ["name"]
+                    "required": []
                 }
             },
             {
@@ -429,6 +435,62 @@ fn tools_list_result() -> Value {
                         }
                     },
                     "required": ["path"]
+                }
+            },
+            {
+                "name": "search_code",
+                // Loaded with the session rather than behind a tool search
+                // (Claude Code's per-tool `anthropic/alwaysLoad`): it replaces
+                // grep and rg, which are always present.
+                "_meta": { "anthropic/alwaysLoad": true },
+                "description": "Every line matching a pattern - instead of grep or rg - grouped by file and \
+                                by the function or type each line sits in, with that item's line range, \
+                                so the next read can ask for exactly it. Searches the indexed roots, or \
+                                any file or directory given as `path` (logs, docs and config too). \
+                                Lines read `12:text`; `~` marks a comment line and `-` a context line. \
+                                Matches past `limit` are counted per file, not dropped, and long lines \
+                                are cut around the match.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "A regular expression read like `grep -E` (`\\|` works as `|`). Set fixed=true for literal text."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "A file or directory: absolute, relative to the workspace, or the end of a path under the roots (`renderer/lights.rs`). Default: every indexed root."
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Only files whose name matches: `*.rs`, `*.{rs,wgsl}`, several separated by commas."
+                        },
+                        "ignore_case": { "type": "boolean", "description": "Like grep -i." },
+                        "word": { "type": "boolean", "description": "Whole words only, like grep -w." },
+                        "fixed": { "type": "boolean", "description": "Literal text, like grep -F." },
+                        "context": {
+                            "type": "integer",
+                            "description": "Lines shown around each match, like grep -C (default 0)."
+                        },
+                        "output": {
+                            "type": "string",
+                            "enum": ["lines", "files", "count"],
+                            "description": "lines (default); files, each with its match count (grep -l / -c); or count, the totals only."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Matching lines listed (default 80); the rest are counted per file."
+                        },
+                        "collapse": {
+                            "type": "boolean",
+                            "description": "Fold lines that differ only in numbers into one with a count, to summarise a log (default false)."
+                        },
+                        "origin": {
+                            "type": "string",
+                            "description": "Only this source root tag."
+                        }
+                    },
+                    "required": ["pattern"]
                 }
             },
             // ── Core Lookup Tools (Original 4) ────────────────────────────────────
@@ -715,6 +777,7 @@ fn tools_call(
         "get_source"                  => tool_get_source(&args, sources, nav),
         "find_references"             => tool_find_references(&args, sources, nav),
         "get_outline"                 => tool_get_outline(&args, sources, nav),
+        "search_code"                 => tool_search_code(&args, sources, nav),
         // ── Phase 1 additions ──
         other                         => Err(format!("unknown tool: {other}")),
     }?;
@@ -754,8 +817,21 @@ fn arg_usize(args: &Value, key: &str) -> Option<usize> {
 }
 
 fn tool_get_source(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut Nav) -> Result<String, String> {
-    let name = args["name"].as_str().filter(|n| !n.trim().is_empty()).ok_or("missing `name`")?;
     let roots = nav_roots(args, sources)?;
+    let Some(name) = args["name"].as_str().filter(|n| !n.trim().is_empty()) else {
+        // No name: read `file` by line numbers.
+        let file = args["file"].as_str().filter(|f| !f.trim().is_empty()).ok_or(
+            "give a `name` to show its definition, or a `file` (and `lines`) to read",
+        )?;
+        let lines = match &args["lines"] {
+            Value::Null => None,
+            Value::Number(n) => Some(n.to_string()),
+            Value::String(s) => Some(s.clone()),
+            _ => return Err("`lines` must look like \"120-160\"".into()),
+        };
+        let max_lines = arg_usize(args, "max_lines").unwrap_or(nav::DEFAULT_READ_LINES).clamp(10, 5000);
+        return Ok(nav.read_lines(&roots, &file.replace('\\', "/"), lines.as_deref(), max_lines));
+    };
     let lines = match &args["lines"] {
         Value::Null => None,
         Value::Number(n) => n.as_u64().map(|v| (v as usize, v as usize)),
@@ -775,6 +851,34 @@ fn tool_find_references(args: &Value, sources: &[(PathBuf, String, bool)], nav: 
     let limit = arg_usize(args, "limit").unwrap_or(nav::DEFAULT_REF_LIMIT).clamp(1, 2000);
     let file = args["file"].as_str().filter(|f| !f.is_empty()).map(|f| f.replace('\\', "/"));
     Ok(nav.find_references(&roots, name, file.as_deref(), include_comments, limit))
+}
+
+fn tool_search_code(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut Nav) -> Result<String, String> {
+    let pattern = args["pattern"].as_str().filter(|p| !p.is_empty()).ok_or("missing `pattern`")?;
+    let roots = nav_roots(args, sources)?;
+    let output = match args["output"].as_str().unwrap_or("lines") {
+        "" | "lines" => nav::SearchOutput::Lines,
+        "files" => nav::SearchOutput::Files,
+        "count" => nav::SearchOutput::Count,
+        other => return Err(format!("`output` is lines, files or count, not `{other}`")),
+    };
+    let text = |k: &str| args[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(|v| v.replace('\\', "/"));
+    let opts = nav::SearchOpts {
+        paths: text("path").into_iter().collect(),
+        glob: text("glob"),
+        ignore_case: args["ignore_case"].as_bool().unwrap_or(false),
+        word: args["word"].as_bool().unwrap_or(false),
+        fixed: args["fixed"].as_bool().unwrap_or(false),
+        basic: false,
+        context: arg_usize(args, "context").unwrap_or(0).min(50),
+        before: None,
+        after: None,
+        head: None,
+        output,
+        limit: arg_usize(args, "limit").unwrap_or(nav::DEFAULT_REF_LIMIT).clamp(1, 5000),
+        collapse: args["collapse"].as_bool(),
+    };
+    Ok(nav.search(&roots, pattern, &opts))
 }
 
 fn tool_get_outline(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut Nav) -> Result<String, String> {
@@ -1785,7 +1889,7 @@ mod tool_list_tests {
             let always = tool["_meta"]["anthropic/alwaysLoad"] == true;
             let nav = matches!(
                 tool["name"].as_str(),
-                Some("get_source" | "find_references" | "get_outline")
+                Some("get_source" | "find_references" | "get_outline" | "search_code")
             );
             assert_eq!(always, nav, "{}", tool["name"]);
         }
