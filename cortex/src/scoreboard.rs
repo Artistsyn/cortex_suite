@@ -128,6 +128,10 @@ pub struct TokenWindow {
     pub nav_calls: i64,
     pub grep_calls: i64,
     pub sed_reads: i64,
+    /// Bash calls quartz-ctx answered through the PreToolUse hook (their ids
+    /// are in .cortex/nav-rewrites.jsonl). The transcript keeps the command as
+    /// written, so these are also inside the grep and sed counts.
+    pub hook_answered: i64,
     /// Calls whose only purpose is waiting (`sleep`).
     pub wait_calls: i64,
     /// The bill at list prices, for models with a known price.
@@ -468,10 +472,21 @@ fn bash_kind(command: &str) -> Option<&'static str> {
     }
 }
 
+/// Tool-use ids of the Bash calls quartz-ctx's nav hook rewrote, from the
+/// ledger it appends to. A missing or unreadable ledger is an empty set.
+pub fn nav_rewrite_ids(ledger: &Path) -> HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(ledger) else { return HashSet::new() };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("tool_use_id").and_then(|x| x.as_str()).map(str::to_string))
+        .collect()
+}
+
 /// Read the bill that was actually paid, per window, from transcript `usage`
 /// fields. Lines before the previous window are skipped without parsing, so the
 /// cost is proportional to recent activity, not to transcript size.
-pub fn token_ledger(dir: &Path, window_days: u32) -> Result<TokenLedger> {
+/// `rewritten` holds the Bash calls quartz-ctx answered (`nav_rewrite_ids`).
+pub fn token_ledger(dir: &Path, window_days: u32, rewritten: &HashSet<String>) -> Result<TokenLedger> {
     let now = Utc::now().timestamp();
     let w = window_days as i64 * 86400;
     let (prev_start, cur_start) = (now - 2 * w, now - w);
@@ -575,6 +590,9 @@ pub fn token_ledger(dir: &Path, window_days: u32) -> Result<TokenLedger> {
                                 if name.starts_with("mcp__quartz-ctx__") {
                                     win.nav_calls += 1;
                                 } else if name == "Bash" {
+                                    if rewritten.contains(id) {
+                                        win.hook_answered += 1;
+                                    }
                                     let cmd = b.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or("");
                                     match bash_kind(cmd) {
                                         Some("grep") => win.grep_calls += 1,
@@ -924,6 +942,10 @@ fn format_guards(c: &TokenWindow, p: &TokenWindow) -> String {
         c.nav_calls, p.nav_calls, c.grep_calls, c.sed_reads, p.grep_calls, p.sed_reads, c.wait_calls, p.wait_calls
     ));
     o.push_str(&format!(
+        "      of those shell reads, answered by quartz-ctx through the Bash hook: {} (prev {})\n",
+        c.hook_answered, p.hook_answered
+    ));
+    o.push_str(&format!(
         "    At list prices: ${:.0} (prev ${:.0}){}\n",
         c.cost_usd,
         p.cost_usd,
@@ -1085,10 +1107,17 @@ mod tests {
             format!(r#"{{"type":"attachment","timestamp":"{ts}","attachment":{{"type":"hook_additional_context","content":["[cortex] a.rs touches a recorded trap #1"],"hookName":"PostToolUse:Edit"}}}}"#),
             format!(r#"{{"type":"attachment","timestamp":"{ts}","attachment":{{"type":"hook_non_blocking_error","stderr":"MCP server 'cortex' not connected","hookName":"PostToolUse:Bash"}}}}"#),
             format!(r#"{{"type":"attachment","timestamp":"{ts}","attachment":{{"type":"hook_additional_context","content":["No preview server is running."],"hookName":"PostToolUse:Edit"}}}}"#),
+            // A later record of response m3 with two greps; quartz-ctx's hook
+            // answered the first.
+            format!(r#"{{"type":"assistant","timestamp":"{ts}","message":{{"id":"m3","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{"command":"grep -n foo src/a.rs"}}}},{{"type":"tool_use","id":"b2","name":"Bash","input":{{"command":"grep -rn bar ."}}}}],"usage":{{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":5}}}}}}"#),
         ];
         std::fs::write(dir.join("s.jsonl"), lines.join("\n")).unwrap();
-        let l = token_ledger(&dir, 14).unwrap();
+        // The real ledger lives in .cortex/, not among the transcripts.
+        let ledger = std::env::temp_dir().join(format!("cortex_nav_rewrites_{}.jsonl", std::process::id()));
+        std::fs::write(&ledger, "{\"at\":\"1\",\"kinds\":[\"search\"],\"session_id\":\"s\",\"tool_use_id\":\"b1\"}\nnot json\n").unwrap();
+        let l = token_ledger(&dir, 14, &nav_rewrite_ids(&ledger)).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&ledger).ok();
         let c = &l.current;
         assert_eq!(c.api_calls, 3, "a response split over records counts once");
         assert_eq!(c.cache_read, 1500);
@@ -1098,6 +1127,8 @@ mod tests {
         assert_eq!(c.first_call_context_median, 1010);
         assert_eq!(c.cortex_contexts_delivered, 1, "only cortex's own delivered context counts");
         assert_eq!(c.cortex_hook_errors, 1);
+        assert_eq!((c.grep_calls, c.hook_answered), (2, 1), "a rewritten grep is still a grep, and is counted as answered");
+        assert!(nav_rewrite_ids(&dir.join("absent.jsonl")).is_empty());
     }
 
     #[test]

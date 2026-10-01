@@ -1036,7 +1036,11 @@ fn run_scoreboard(db_path: &Path, window_days: u32, no_tokens: bool, format: Out
         // The workspace is the directory holding .cortex/.
         let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
         match scoreboard::transcripts_dir_for(repo_root) {
-            Some(dir) => match scoreboard::token_ledger(&dir, window_days) {
+            Some(dir) => match scoreboard::token_ledger(
+                &dir,
+                window_days,
+                &scoreboard::nav_rewrite_ids(&db_path.with_file_name("nav-rewrites.jsonl")),
+            ) {
                 Ok(ledger) => sb.tokens = Some(ledger),
                 Err(e) => eprintln!("[cortex] token bill unavailable: {e}"),
             },
@@ -1197,7 +1201,21 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
             "input": { "transcript_path": "${transcript_path}", "hook_event_name": "SessionStart" }
         }]
     });
-    for event in ["Stop", "PreCompact", "SessionStart"] {
+    // Bash reads answered by quartz-ctx (quartz-ctx/src/rewrite.rs): a grep or
+    // `sed -n` of files it fully understands becomes the same search or read,
+    // grouped by the item each line sits in, at the same size (replayed on
+    // 1,200 real commands: recall 99.98% and 100%). A command hook, because it
+    // must hand back the whole tool input; `None` where no quartz-ctx is served.
+    // `|| true` because exit 2 from a PreToolUse hook BLOCKS the call, and clap
+    // exits 2 on an unknown subcommand: a quartz-ctx built before `nav` existed
+    // would stop every Bash call. Any failure must mean "run it as written".
+    let nav_hook = quartz_ctx_command(root).map(|qx| {
+        json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": format!("{qx} nav hook || true"), "timeout": 10 }]
+        })
+    });
+    for event in ["Stop", "PreCompact", "SessionStart", "PreToolUse"] {
         hooks_obj
             .entry(event.to_string())
             .or_insert_with(|| Value::Array(vec![]));
@@ -1217,6 +1235,11 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     let is_challenge = |e: &Value| names_tool(e, "note_challenge");
     let is_capture = |e: &Value| names_tool(e, "capture_markers");
     let is_restore = |e: &Value| names_tool(e, "restore_after_compact");
+    let is_nav = |e: &Value| {
+        e.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
+            hooks.iter().any(|h| h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains(" nav hook")))
+        })
+    };
 
     // A hook is up to date only if it is present AND byte-identical to what we
     // would write. Anything else is refreshed — including a hook from an older
@@ -1234,7 +1257,8 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         && prompt_now.iter().find(|e| is_challenge(e)).is_some_and(|e| *e == challenge_hook)
         && array_of(hooks_obj, "Stop").iter().find(|e| is_capture(e)).is_some_and(|e| *e == stop_hook)
         && array_of(hooks_obj, "PreCompact").iter().find(|e| is_capture(e)).is_some_and(|e| *e == precompact_hook)
-        && array_of(hooks_obj, "SessionStart").iter().find(|e| is_restore(e)).is_some_and(|e| *e == restore_hook);
+        && array_of(hooks_obj, "SessionStart").iter().find(|e| is_restore(e)).is_some_and(|e| *e == restore_hook)
+        && nav_hook.as_ref().is_none_or(|h| array_of(hooks_obj, "PreToolUse").iter().find(|e| is_nav(e)) == Some(h));
     if !force && up_to_date {
         return Ok(HookOutcome::AlreadyPresent);
     }
@@ -1280,11 +1304,34 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         .ok_or_else(|| anyhow::anyhow!("`hooks.SessionStart` in {filename} is not an array"))?;
     start_arr.retain(|e| !is_restore(e));
     start_arr.push(restore_hook);
+    if let Some(nav_hook) = nav_hook {
+        let pre_arr = hooks_obj
+            .get_mut("PreToolUse")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| anyhow::anyhow!("`hooks.PreToolUse` in {filename} is not an array"))?;
+        pre_arr.retain(|e| !is_nav(e));
+        pre_arr.push(nav_hook);
+    }
 
     let rendered = serde_json::to_string_pretty(&Value::Object(root_obj))?;
     std::fs::write(&settings_path, rendered)
         .with_context(|| format!("failed to write {}", settings_path.display()))?;
     Ok(HookOutcome::Written)
+}
+
+/// How a hook runs the workspace's quartz-ctx: the command `.mcp.json` serves
+/// it with, anchored at the project directory when relative. `None` when no
+/// quartz-ctx is configured or its binary is not there.
+fn quartz_ctx_command(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(".mcp.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let cmd = v["mcpServers"]["quartz-ctx"]["command"].as_str()?;
+    let path = Path::new(cmd);
+    if path.is_absolute() {
+        path.is_file().then(|| quartz_ctx::rewrite::shell_quote(cmd))
+    } else {
+        root.join(path).is_file().then(|| format!("\"${{CLAUDE_PROJECT_DIR}}\"/{}", quartz_ctx::rewrite::shell_quote(cmd)))
+    }
 }
 
 fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()> {
@@ -1311,6 +1358,10 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
              \x20 restore_after_compact on SessionStart(compact) — after a compaction, reads back \
              from the transcript what the summary blurs (latest requests, files edited, what went \
              green, errors still open, verbatim) in at most ~1.5k tokens.\n\
+             \x20 quartz-ctx nav hook on PreToolUse(Bash), when .mcp.json serves quartz-ctx — a \
+             grep or `sed -n` of files it fully understands runs as the same search or read, \
+             grouped by the function each line sits in, at the same size. Anything else runs as \
+             written; QX_RAW=1 in a command, or QX_HOOK=off in the environment, opts out.\n\
              Restart Claude Code (or reload the session) for them to take effect.\n\
              Note: these are Claude Code hooks. VS Code Copilot cannot observe tool output or \
              edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
@@ -1433,7 +1484,11 @@ fn auto_install_hook_on_serve(repo: &Path) {
     //    it is written, not when a closeout remembers it)
     // 5: added restore_after_compact on SessionStart(compact) (state a
     //    compaction's summary blurs, read back from the transcript)
-    const HOOK_SET_VERSION: u32 = 5;
+    // 6: added quartz-ctx's nav hook on PreToolUse(Bash) (greps and sed reads
+    //    answered from the source)
+    // 7: the nav hook ends `|| true`, so a quartz-ctx without `nav` cannot
+    //    block Bash
+    const HOOK_SET_VERSION: u32 = 7;
     let cortex_dir = repo.join(".cortex");
     let sentinel = cortex_dir.join(format!(".claude-hooks-installed.v{HOOK_SET_VERSION}"));
     if sentinel.exists() {
@@ -4960,6 +5015,69 @@ mod tests {
         assert_eq!(v["model"], "keep-me");
 
         assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::AlreadyPresent);
+    }
+
+    /// The Bash rewrite hook goes on PreToolUse, runs the quartz-ctx the MCP
+    /// config serves, from the project directory, and is left out where no
+    /// quartz-ctx binary exists.
+    #[test]
+    fn the_nav_hook_runs_the_served_quartz_ctx_and_only_where_it_exists() {
+        let d = crate::test_support::TempDir::new("nav_hook").expect("temp dir");
+        let settings = d.path().join(".claude").join("settings.local.json");
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v["hooks"]["PreToolUse"].as_array().is_none_or(|a| a.is_empty()), "no quartz-ctx, no hook: {v}");
+
+        std::fs::create_dir_all(d.path().join("bin")).unwrap();
+        std::fs::write(d.path().join("bin/quartz-ctx"), "").unwrap();
+        std::fs::write(
+            d.path().join(".mcp.json"),
+            r#"{"mcpServers":{"quartz-ctx":{"command":"bin/quartz-ctx","args":["serve"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let pre = &v["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "Bash");
+        assert_eq!(pre["hooks"][0]["command"], "\"${CLAUDE_PROJECT_DIR}\"/bin/quartz-ctx nav hook || true");
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::AlreadyPresent);
+
+        // Hook set 6 wrote it without `|| true`: replaced, not kept beside it.
+        let mut old = v.clone();
+        old["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = json!("\"${CLAUDE_PROJECT_DIR}\"/bin/quartz-ctx nav hook");
+        std::fs::write(&settings, serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let pre_all = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_all.len(), 1, "{v}");
+        assert_eq!(pre_all[0]["hooks"][0]["command"], "\"${CLAUDE_PROJECT_DIR}\"/bin/quartz-ctx nav hook || true");
+    }
+
+    /// Exit 2 from a PreToolUse hook blocks the tool call, and clap exits 2 on
+    /// an unknown subcommand. Run as the host runs it, the installed command
+    /// lets Bash through even when the quartz-ctx it finds predates `nav`.
+    #[cfg(unix)]
+    #[test]
+    fn a_quartz_ctx_without_nav_cannot_block_bash() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::test_support::TempDir::new("nav_hook_old").expect("temp dir");
+        std::fs::create_dir_all(d.path().join("bin")).unwrap();
+        let bin = d.path().join("bin/quartz-ctx");
+        std::fs::write(&bin, "#!/bin/sh\necho \"error: unrecognized subcommand 'nav'\" >&2\nexit 2\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(d.path().join(".mcp.json"), r#"{"mcpServers":{"quartz-ctx":{"command":"bin/quartz-ctx"}}}"#).unwrap();
+        ensure_compact_hook(d.path(), true, false).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(d.path().join(".claude/settings.local.json")).unwrap()).unwrap();
+        let cmd = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+        let run = |c: &str| {
+            std::process::Command::new("sh").arg("-c").arg(c).env("CLAUDE_PROJECT_DIR", d.path()).output().unwrap()
+        };
+        let bare = run(cmd.trim_end_matches(" || true"));
+        assert_eq!(bare.status.code(), Some(2), "the hazard: without `|| true` the host would block the call");
+        let out = run(&cmd);
+        assert_eq!(out.status.code(), Some(0), "{cmd}");
+        assert!(out.stdout.is_empty(), "no decision, so the command runs as written");
     }
 
     /// VS Code shows a PostToolUse reply a request late, so the edit guard needs
