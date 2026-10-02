@@ -12,15 +12,16 @@
 //!   delta, leaving the cached prompt as it was. Without the declaration it does
 //!   not listen.
 //! - The client listens for it only on a connection it subscribed: one opened
-//!   at session start or reconnected from /mcp, or one its MCP discovery cache
-//!   adopted (when that is on).
+//!   at session start or reconnected with /mcp in a terminal, or one its MCP
+//!   discovery cache adopted (when that is on).
 //! - When a stdio server's process ends, the client starts it again on the
 //!   session's next call to it and keeps the tool list from before. A
 //!   connection whose first request is a tool call, with no `tools/list` before
 //!   it, is therefore holding an old list, and is told to fetch it again. A
 //!   client that did not subscribe that connection ignores this (observed
-//!   2026-10-01: the session kept 13 tools while the server listed 14); a
-//!   reconnect from /mcp is then the way to refresh it.
+//!   2026-10-01: the session kept 13 tools while the server listed 14). Only a
+//!   fresh connection refreshes it: /mcp reconnect in a terminal, or a new
+//!   process. The desktop app offers neither for a local server.
 //!
 //! While waiting for a request the server compares its binary on disk with the
 //! one it started from, every couple of seconds. Once a rebuild has replaced it,

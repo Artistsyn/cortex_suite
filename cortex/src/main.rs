@@ -410,7 +410,8 @@ enum Command {
     /// Put running cortex and quartz-ctx MCP servers on the binary now on disk.
     /// Stops idle servers of Claude Code sessions that run a replaced binary;
     /// each starts again on its session's next call to it. The session keeps
-    /// its tool list until the server is reconnected from /mcp. Servers built
+    /// its tool list until it gets a fresh connection (/mcp reconnect in a
+    /// terminal; restarting the desktop app, which cannot). Servers built
     /// from this version on move themselves onto a rebuild while idle, so this
     /// is for older ones.
     ReloadServers {

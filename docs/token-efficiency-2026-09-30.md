@@ -92,11 +92,14 @@ Replayed against 14 days of real grep → read episodes:
     the list again and adds the difference to the conversation as a tool delta,
     so the inline snapshot and the prompt cache stay as they were. That happens
     only on a connection the session subscribed: one opened at session start or
-    reconnected from `/mcp`. A stdio server Claude Code restarted by itself after
-    it exited runs the new code but keeps the old list. Observed: the restarted
-    quartz-ctx served 14 tools and sent the notice, and the session kept 13 and
-    could not find `search_code`. `cortex reload-servers` moves older servers
-    onto the current binary; reconnecting once from `/mcp` brings their tools.
+    reconnected with `/mcp` in a terminal. A stdio server Claude Code restarted
+    by itself after it exited runs the new code but keeps the old list. Observed:
+    the restarted quartz-ctx served 14 tools and sent the notice, and the session
+    kept 13 and could not find `search_code`. `cortex reload-servers` moves older
+    servers onto the current binary; their tools need a fresh connection, which
+    in the desktop app means restarting the app: its `/mcp` reconnects only
+    remote servers, and the typed `/mcp reconnect quartz-ctx` answered
+    "Reconnect, enable, and disable aren't available in this session".
   - Verified in a new session (2026-10-01, 075cc1e0). Its first snapshot carries
     `get_source`, `find_references` and `get_outline` inline among 47 tools, while the
     other ten quartz-ctx tools and all cortex tools stay deferred. Plan-mode access

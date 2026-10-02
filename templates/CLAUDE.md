@@ -384,11 +384,14 @@ replaced it and the new build answers an MCP handshake, the server becomes the
 new build on the same connection (exec: macOS and Linux) and sends
 `tools/list_changed`, so the client fetches the tool list again. No new session
 is needed. The client listens only on a connection it subscribed: one opened at
-session start or reconnected from `/mcp`. A server that predates this, or one
-Claude Code started again by itself after it exited, runs the current code but
-leaves the session's tool list as it was: reconnect it once from `/mcp`.
-`reload-servers` moves every idle older server onto the current binary in one
-step. On Windows, reconnect from the host.
+session start, or reconnected with `/mcp` in a terminal session. A server that
+predates this, or one Claude Code started again by itself after it exited, runs
+the current code but leaves the session's tool list as it was until the session
+gets a fresh connection. The desktop app cannot give it one: its `/mcp`
+reconnects only remote servers, and the typed `/mcp reconnect` is refused in
+app-hosted sessions, so there it takes restarting the app. `reload-servers`
+moves every idle older server onto the current binary in one step. On Windows,
+reconnect from the host.
 <!-- cortex_suite:end -->
 
 ## Editing safety

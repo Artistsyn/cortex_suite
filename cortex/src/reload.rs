@@ -8,12 +8,15 @@
 //!
 //! That moves the code, not the session's tool list. The new build tells the
 //! session to fetch the list again, but Claude Code 2.1.284 listens for that
-//! only on a connection it opened at session start or reconnected from /mcp
-//! (or adopted through its MCP discovery cache, when that is on); a server it
-//! started again by itself after a call is not one of those. Observed
-//! 2026-10-01: the restarted quartz-ctx served 14 tools and sent the notice,
-//! and the session kept the 13 it had. A reconnect from /mcp refreshes the list
-//! and subscribes the connection, after which rebuilds reach it with its tools.
+//! only on a connection it opened at session start or reconnected with /mcp in
+//! a terminal (or adopted through its MCP discovery cache, when that is on); a
+//! server it started again by itself after a call is not one of those.
+//! Observed 2026-10-01: the restarted quartz-ctx served 14 tools and sent the
+//! notice, and the session kept the 13 it had. A fresh connection refreshes the
+//! list and subscribes it, after which rebuilds reach the session with their
+//! tools. The desktop app has no way to give a local server one short of a
+//! restart: its /mcp reconnects only remote servers, and the typed
+//! `/mcp reconnect` answers "aren't available in this session".
 //!
 //! Only cortex and quartz-ctx servers (`serve`, `graphify-serve`) whose parent
 //! is a Claude Code process are stopped. Other hosts are reported and left
@@ -264,9 +267,10 @@ mod imp {
         if !dry_run && !stopped.is_empty() {
             println!(
                 "Each stopped server starts again on its session's next call to it, on the current \
-                 binary. The session keeps the tool list it had until the server is reconnected \
-                 from its /mcp; after that, rebuilds reach the session with their tools, because \
-                 servers built from now on move themselves onto a rebuild while idle."
+                 binary. The session keeps the tool list it had until it gets a fresh connection: \
+                 /mcp reconnect in a terminal session, a restart of the desktop app there. After \
+                 that, rebuilds reach it with their tools, because servers built from now on move \
+                 themselves onto a rebuild while idle."
             );
         }
         Ok(())
