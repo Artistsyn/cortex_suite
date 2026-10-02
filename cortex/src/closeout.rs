@@ -1,9 +1,15 @@
 /// Phase 0D: Session closeout logic.
 ///
 /// closeout_session is the single MCP tool that replaces the 7-step manual checklist.
-/// With inline_approve=true (triggered by "KNOWLEDGE COMMITTED"), all markers are
-/// immediately committed to the DB. With inline_approve=false (default), markers
-/// are staged in knowledge_markers for later review.
+///
+/// Markers commit through the same gates whichever way they arrive -- captured
+/// from the transcript when written (capture.rs), passed as `markers_text`, or
+/// scraped from a host's chat store. Since 2026-09-30 they commit without a
+/// per-item approval while `loop.auto_commit` is on (the default): the approval
+/// passed 99.3-100% of what reached it, and the protocol around it lost 30% of
+/// what was approved. Every such commit is a `loop_changes` row, audited by
+/// sample (`cortex knowledge audit`); too many bad verdicts switch the gate back
+/// on, and then inline_approve=true ("KNOWLEDGE COMMITTED") is required again.
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -23,10 +29,15 @@ pub struct CloseoutResult {
     pub patterns_committed:     usize,
     pub anti_patterns_committed: usize,
     pub corrections_committed:   usize,
+    pub walls_committed:         usize,
     pub adrs_committed:          usize,
     pub prefs_notes_committed:   usize,
     pub skill_candidates_staged: usize,
     pub markers_staged:          usize,
+    /// Committed without a person approving this closeout (loop.auto_commit).
+    pub auto_committed:          bool,
+    /// Markers already in the store (an earlier capture or closeout).
+    pub markers_known:           usize,
     pub outcome_logged:          bool,
     /// Patterns whose use/reverted telemetry was updated from this session's
     /// targeted retrievals × outcome (survival feedback loop).
@@ -78,32 +89,45 @@ pub fn run_closeout(
     };
     let extracted_markers = markers.clone();
 
-    if inline_approve {
-        // Tier 1: commit immediately.
-        for marker in &markers {
-            match commit_marker(store, session_key, marker, prefs_path) {
-                Ok(committed) => {
-                    // Log it either way: a marker that turned out to be a
-                    // duplicate was still produced by this session, and the
-                    // capture metric is about what the agent emitted.
-                    // `promoted` is what distinguishes new from already-known.
-                    let _ = record_marker(store, session_key, marker, committed);
-                    if committed {
-                        match marker {
-                            KnowledgeMarker::Pattern { .. }        => result.patterns_committed += 1,
-                            KnowledgeMarker::AntiPattern { .. }    => result.anti_patterns_committed += 1,
-                            KnowledgeMarker::Correction { .. }     => result.corrections_committed += 1,
-                            KnowledgeMarker::Adr { .. }            => result.adrs_committed += 1,
-                            KnowledgeMarker::PrefsNote { .. }      => result.prefs_notes_committed += 1,
-                            KnowledgeMarker::SkillCandidate { .. } => result.skill_candidates_staged += 1,
-                        }
-                    }
+    let auto = crate::loop_ledger::auto_commit_enabled(store);
+    if inline_approve || auto {
+        result.auto_committed = !inline_approve;
+        // A person's approval also releases what capture staged while the
+        // gate was on; an automatic closeout never does.
+        let mut to_commit: Vec<(Option<i64>, KnowledgeMarker)> = Vec::new();
+        if inline_approve {
+            for (row, marker) in staged_captures(store) {
+                to_commit.push((Some(row), marker));
+            }
+        }
+        to_commit.extend(markers.iter().cloned().map(|m| (None, m)));
+        let class = if inline_approve { "approved" } else { "entry" };
+        for (staged_row, marker) in &to_commit {
+            let outcome = commit_one(store, session_key, marker, "", prefs_path, class, "closeout", staged_row.is_none(), Some(Utc::now()));
+            if let Some(row) = staged_row {
+                if matches!(outcome, CommitOutcome::Committed { .. } | CommitOutcome::Updated { .. } | CommitOutcome::Known) {
+                    let _ = store.conn().execute("UPDATE knowledge_markers SET promoted = 1 WHERE id = ?1", params![row]);
                 }
-                Err(e) => {
-                    // Emitted but did not land — log it unpromoted so the
-                    // session is not silently credited with zero output.
-                    let _ = record_marker(store, session_key, marker, false);
+            }
+            match outcome {
+                CommitOutcome::Committed { merged, .. } => {
+                    count_committed(&mut result, marker);
+                    result.notes.extend(merged);
+                }
+                CommitOutcome::Updated { replaced, target } => {
+                    count_committed(&mut result, marker);
+                    result.notes.push(format!("{target} replaces {replaced} (same name, new text)"));
+                }
+                CommitOutcome::Known => result.markers_known += 1,
+                CommitOutcome::Refused(e) => {
+                    // Emitted but did not land; say why in the report:
+                    // stderr reaches no one.
                     eprintln!("[closeout] warn: failed to commit marker: {e}");
+                    result.notes.push(format!(
+                        "{} marker \"{}\" was not committed: {e}",
+                        marker.marker_type(),
+                        marker.display_name()
+                    ));
                 }
             }
         }
@@ -348,14 +372,26 @@ fn extract_session_markers() -> Result<Vec<KnowledgeMarker>> {
 // ── Commit a marker to its target DB table ────────────────────────────────────
 
 /// Returns true if the marker was committed, false if it was skipped (e.g. duplicate).
-fn commit_marker(
+pub(crate) fn commit_marker(
     store: &Store,
     session_key: &str,
     marker: &KnowledgeMarker,
     prefs_path: Option<&Path>,
 ) -> Result<bool> {
+    commit_marker_at(store, session_key, marker, prefs_path, Utc::now())
+}
+
+/// `commit_marker`, dating patterns and anti-patterns `at` -- when the marker
+/// was written, which for a captured or backfilled marker is not now.
+pub(crate) fn commit_marker_at(
+    store: &Store,
+    session_key: &str,
+    marker: &KnowledgeMarker,
+    prefs_path: Option<&Path>,
+    at: chrono::DateTime<Utc>,
+) -> Result<bool> {
     match marker {
-        KnowledgeMarker::Pattern { name, intent, body, trust, kind, uses, tags } => {
+        KnowledgeMarker::Pattern { name, .. } => {
             // Check for duplicate name.
             let exists: bool = store.conn().query_row(
                 "SELECT COUNT(*) > 0 FROM patterns WHERE name = ?1",
@@ -363,34 +399,24 @@ fn commit_marker(
             ).unwrap_or(false);
             if exists { return Ok(false); }
 
-            let body_with_trust = format!("{body}\nTrust: {trust} {}", Utc::now().format("%Y-%m-%d"));
-            let p = Pattern {
-                id: None,
-                name: name.clone(),
-                intent: intent.clone(),
-                body: body_with_trust,
-                uses: uses.clone(),
-                tags: tags.clone(),
-                approved_at: Utc::now(),
-                use_count: 0,
-                reverted_count: 0,
-                survival_rate: 1.0,
-                credibility: 0.0,
-                trust_level: crate::model::TrustLevel::default(),
-                kind: crate::model::MemoryKind::from_str(kind),
-                tier: crate::model::EpistemicTier::default(),
-                hash: None,
-                included_in_context_count: 0,
-                confirmed_count: 0,
-                corrected_count: 0,
-                superseded_by: None,
-            };
+            let mut p = pattern_from_marker(marker).expect("a Pattern marker");
+            p.approved_at = at;
             store.insert_pattern(&p)?;
             mark_promoted_nonfatal(store, session_key, "pattern", name);
             Ok(true)
         }
 
         KnowledgeMarker::AntiPattern { description, wrong, correct, tags } => {
+            // A trap without a remedy teaches nothing. The parser fills in
+            // "see body above" when a marker has no `correct:` line of its own
+            // (often a mismatched closing tag); refuse it with the reason rather
+            // than store a placeholder the store-health check then flags.
+            if correct.trim().is_empty() || correct.trim() == "see body above" {
+                anyhow::bail!(
+                    "no usable remedy: the marker has no `correct:` line of its own \
+                     (check that it closes with [/CORTEX-AP])"
+                );
+            }
             // Check for duplicate description.
             let exists: bool = store.conn().query_row(
                 "SELECT COUNT(*) > 0 FROM anti_patterns WHERE description = ?1",
@@ -404,7 +430,7 @@ fn commit_marker(
                 wrong: wrong.clone(),
                 correct: correct.clone(),
                 tags: tags.clone(),
-                added_at: Utc::now(),
+                added_at: at,
                 hash: None,
                 superseded_by: None,
             };
@@ -413,7 +439,26 @@ fn commit_marker(
             Ok(true)
         }
 
+        KnowledgeMarker::Wall(new) => {
+            // Same rules as record_wall; a marker that fails them is refused
+            // with the reason rather than stored half-formed.
+            if crate::walls::find_by_claim(store, &new.claim)?.is_some() {
+                return Ok(false);
+            }
+            crate::walls::record(store, new.clone())?;
+            mark_promoted_nonfatal(store, session_key, "wall", &new.claim.chars().take(60).collect::<String>());
+            Ok(true)
+        }
+
         KnowledgeMarker::Correction { attempted, reason, fix, tags } => {
+            // Keyed on what was attempted: the table's own key also includes the
+            // reason, so a restatement with other wording became a second row
+            // (found replaying transcripts, 2026-09-30).
+            let exists: bool = store.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM self_corrections WHERE lower(trim(attempted)) = lower(trim(?1)))",
+                params![attempted], |r| r.get(0),
+            ).unwrap_or(false);
+            if exists { return Ok(false); }
             store.insert_self_correction(attempted, reason, fix, tags)?;
             mark_promoted_nonfatal(store, session_key, "correction", attempted);
             Ok(true)
@@ -421,6 +466,12 @@ fn commit_marker(
 
         KnowledgeMarker::Adr { title, context, decision, tags } => {
             use crate::model::Adr;
+            // One ADR per title; a replayed marker used to take a new number.
+            let exists: bool = store.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM adrs WHERE lower(trim(title)) = lower(trim(?1)))",
+                params![title], |r| r.get(0),
+            ).unwrap_or(false);
+            if exists { return Ok(false); }
             let number = store.next_adr_number()?;
             let adr = Adr {
                 id: None,
@@ -446,6 +497,12 @@ fn commit_marker(
             // Append to prefs.toml notes array if a path is provided.
             if let Some(path) = prefs_path {
                 if let Ok(mut prefs) = crate::prefs::load(path) {
+                    // The same note arriving twice (captured, then passed at
+                    // closeout) must not be appended twice.
+                    let head: String = body.chars().take(60).collect();
+                    if prefs.project.notes.iter().any(|n| n.starts_with(&head)) {
+                        return Ok(false);
+                    }
                     // Add trust annotation.
                     let dated = format!("{} Trust: annotated {}", body, Utc::now().format("%Y-%m-%d"));
                     prefs.project.notes.push(dated);
@@ -543,6 +600,18 @@ fn record_marker(
     marker: &KnowledgeMarker,
     promoted: bool,
 ) -> Result<()> {
+    record_marker_raw(store, session_key, marker, promoted, "")
+}
+
+/// `record_marker`, keeping the marker's source text in `raw_tag`, so a marker
+/// captured while the approval gate is on can be committed when it is approved.
+pub(crate) fn record_marker_raw(
+    store: &Store,
+    session_key: &str,
+    marker: &KnowledgeMarker,
+    promoted: bool,
+    raw: &str,
+) -> Result<()> {
     let body = marker_body(marker);
     let name = marker.display_name();
     let tags = marker_tags_json(marker);
@@ -554,11 +623,378 @@ fn record_marker(
     store.conn().execute(
         "INSERT INTO knowledge_markers
              (session_key, marker_type, name, body, tags, trust_level, raw_tag, promoted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, ?7)",
         params![session_key, marker.marker_type(), name, body, tags, trust,
-                if promoted { 1 } else { 0 }],
+                if promoted { 1 } else { 0 }, raw],
     )?;
     Ok(())
+}
+
+// ── One marker, whichever way it arrived ─────────────────────────────────────
+
+/// What happened to one marker.
+#[derive(Debug)]
+pub(crate) enum CommitOutcome {
+    /// Newly stored at `target`; `merged` names any older duplicate it replaced.
+    Committed { target: String, merged: Vec<String> },
+    /// A pattern with this name existed with different text: the new version
+    /// replaced it.
+    Updated { target: String, replaced: String },
+    /// Already in the store.
+    Known,
+    /// Refused by a gate, with the reason.
+    Refused(String),
+}
+
+fn count_committed(result: &mut CloseoutResult, marker: &KnowledgeMarker) {
+    match marker {
+        KnowledgeMarker::Pattern { .. }        => result.patterns_committed += 1,
+        KnowledgeMarker::AntiPattern { .. }    => result.anti_patterns_committed += 1,
+        KnowledgeMarker::Correction { .. }     => result.corrections_committed += 1,
+        KnowledgeMarker::Adr { .. }            => result.adrs_committed += 1,
+        KnowledgeMarker::PrefsNote { .. }      => result.prefs_notes_committed += 1,
+        KnowledgeMarker::SkillCandidate { .. } => result.skill_candidates_staged += 1,
+        KnowledgeMarker::Wall(_)               => result.walls_committed += 1,
+    }
+}
+
+/// Commit one marker through the gates and record what happened: the
+/// knowledge_markers log (when `log`), a `loop_changes` row of `class` for
+/// anything new, and the replacement rules below.
+///
+/// A marker that restates a stored entry replaces it -- same pattern name with
+/// new text, or cosine >= 0.9 with a live entry of the same kind -- ONLY when
+/// the marker was written after that entry. Catching up on a transcript meets
+/// drafts that a later, corrected version had already replaced; found
+/// 2026-09-30 when a first capture on a copy of the live store put a session's
+/// 03:43 draft of a pattern over the version committed at 04:40. `written_at`
+/// is when the marker was written (the transcript line's time); an entry
+/// committed from it is dated then, so later comparisons stay truthful. An
+/// undatable marker never replaces anything.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_one(
+    store: &Store,
+    session_key: &str,
+    marker: &KnowledgeMarker,
+    raw: &str,
+    prefs_path: Option<&Path>,
+    class: &str,
+    evidence: &str,
+    log: bool,
+    written_at: Option<chrono::DateTime<Utc>>,
+) -> CommitOutcome {
+    let known = || {
+        // Still logged, once per session: the session produced it, and the log
+        // is how a re-derived lesson is told apart from one never written.
+        if log && !logged_in_session(store, session_key, marker) {
+            let _ = record_marker_raw(store, session_key, marker, false, raw);
+        }
+        CommitOutcome::Known
+    };
+    if already_committed(store, marker) {
+        return known();
+    }
+    let newer_than = |stored: Option<chrono::DateTime<Utc>>| -> bool {
+        matches!((written_at, stored), (Some(w), Some(s)) if w > s)
+    };
+    let at = written_at.unwrap_or_else(Utc::now);
+
+    // Same pattern name, new text: a new version.
+    if let KnowledgeMarker::Pattern { name, intent, body, .. } = marker {
+        if let Some((old_id, old_intent, old_body, old_at)) = live_pattern_named(store, name) {
+            let stored = old_body.rsplit_once("\nTrust: ").map(|(b, _)| b).unwrap_or(&old_body);
+            // A version under half the length of the live one is a recap of
+            // it (a closing summary), not a revision: replaying transcripts
+            // met 1,234-character entries restated in 774.
+            let recap = body.trim().len() * 2 < stored.trim().len();
+            if (stored.trim() == body.trim() && old_intent.trim() == intent.trim()) || recap || !newer_than(old_at) {
+                return known();
+            }
+            return match insert_replacing(store, session_key, marker, "patterns", old_id, at, class, evidence, "same name, new text") {
+                Ok(target) => {
+                    if log {
+                        let _ = record_marker_raw(store, session_key, marker, true, raw);
+                    }
+                    CommitOutcome::Updated { target, replaced: format!("patterns:{old_id}") }
+                }
+                Err(e) => CommitOutcome::Refused(e.to_string()),
+            };
+        }
+    }
+
+    // An older wording of a live anti-pattern: same opening, stored later.
+    // Catching up on old transcripts met entries reworded when they were
+    // committed (four in one replay); the transcript's draft is not news.
+    if let KnowledgeMarker::AntiPattern { description, .. } = marker {
+        let opening: String = description.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase().chars().take(40).collect();
+        if opening.chars().count() == 40 {
+            let same_opening: Option<i64> = store
+                .conn()
+                .query_row(
+                    "SELECT id FROM anti_patterns WHERE superseded_by IS NULL AND lower(substr(trim(description), 1, 40)) = ?1
+                     ORDER BY id DESC LIMIT 1",
+                    params![opening],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(id) = same_opening {
+                if !newer_than(stored_time(store, "anti_patterns", id)) {
+                    return known();
+                }
+            }
+        }
+    }
+
+    // A restatement of a live entry under different words.
+    let restates = entry_text(marker).and_then(|(table, text)| {
+        crate::knowledge_sim::nearest(store, table, &text, None)
+            .ok()
+            .flatten()
+            .filter(|n| n.cosine >= crate::knowledge_sim::DUPLICATE_COSINE)
+            .map(|n| (table, n))
+    });
+    if let Some((table, near)) = &restates {
+        if !newer_than(stored_time(store, table, near.id)) {
+            return known();
+        }
+    }
+
+    match commit_marker_at(store, session_key, marker, prefs_path, at) {
+        Ok(true) => {
+            if log {
+                let _ = record_marker_raw(store, session_key, marker, true, raw);
+            }
+            let target = entry_target(store, marker);
+            let _ = crate::loop_ledger::record(store, &crate::loop_ledger::NewChange {
+                class,
+                target: &target,
+                after: &marker.display_name(),
+                evidence,
+                session_id: session_key,
+                ..Default::default()
+            });
+            let mut merged = Vec::new();
+            if restates.is_none() {
+                if let (Some((table, text)), Some(new_id)) = (
+                    entry_text(marker),
+                    target.split_once(':').and_then(|(_, id)| id.parse::<i64>().ok()),
+                ) {
+                    let _ = crate::reconcile::pair_new_entry(store, table, new_id, &text);
+                }
+            }
+            if let Some((table, near)) = restates {
+                if let Some(new_id) = target.split_once(':').and_then(|(_, id)| id.parse::<i64>().ok()) {
+                    if store.supersede(table, near.id, new_id).is_ok() {
+                        let old = format!("{table}:{}", near.id);
+                        let _ = crate::loop_ledger::record(store, &crate::loop_ledger::NewChange {
+                            class: "duplicate",
+                            target: &old,
+                            before: "live",
+                            after: &format!("superseded by {new_id}"),
+                            evidence: &format!("cosine {:.2} with {target}", near.cosine),
+                            session_id: session_key,
+                            ..Default::default()
+                        });
+                        merged.push(format!("{target} replaces {old} (cosine {:.2}: a restatement)", near.cosine));
+                    }
+                }
+            }
+            CommitOutcome::Committed { target, merged }
+        }
+        Ok(false) => known(),
+        Err(e) => {
+            if log {
+                let _ = record_marker_raw(store, session_key, marker, false, raw);
+            }
+            CommitOutcome::Refused(e.to_string())
+        }
+    }
+}
+
+/// Committed before, by any path, in any session.
+pub(crate) fn already_committed(store: &Store, marker: &KnowledgeMarker) -> bool {
+    store
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_markers
+                           WHERE marker_type = ?1 AND body = ?2 AND promoted = 1)",
+            params![marker.marker_type(), marker_body(marker)],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+}
+
+fn logged_in_session(store: &Store, session_key: &str, marker: &KnowledgeMarker) -> bool {
+    store
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_markers
+                           WHERE session_key = ?1 AND marker_type = ?2 AND body = ?3)",
+            params![session_key, marker.marker_type(), marker_body(marker)],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+}
+
+fn parse_time(s: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
+}
+
+/// When a stored entry was written (added_at / approved_at).
+fn stored_time(store: &Store, table: &str, id: i64) -> Option<chrono::DateTime<Utc>> {
+    let col = match table {
+        "patterns" => "approved_at",
+        "anti_patterns" => "added_at",
+        _ => return None,
+    };
+    let raw: String = store
+        .conn()
+        .query_row(&format!("SELECT {col} FROM {table} WHERE id = ?1"), params![id], |r| r.get(0))
+        .ok()?;
+    parse_time(&raw)
+}
+
+fn live_pattern_named(store: &Store, name: &str) -> Option<(i64, String, String, Option<chrono::DateTime<Utc>>)> {
+    store
+        .conn()
+        .query_row(
+            "SELECT id, intent, body, approved_at FROM patterns WHERE name = ?1 AND superseded_by IS NULL
+             ORDER BY id DESC LIMIT 1",
+            params![name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?)),
+        )
+        .ok()
+        .map(|(id, intent, body, at)| (id, intent, body, parse_time(&at)))
+}
+
+/// Where a committed marker landed, as `table:id` (or a file for prefs notes).
+pub(crate) fn entry_target(store: &Store, marker: &KnowledgeMarker) -> String {
+    let id = |sql: &str, key: &str| -> Option<i64> {
+        store.conn().query_row(sql, params![key], |r| r.get(0)).ok()
+    };
+    let found = match marker {
+        KnowledgeMarker::Pattern { name, .. } => id(
+            "SELECT id FROM patterns WHERE name = ?1 AND superseded_by IS NULL ORDER BY id DESC LIMIT 1",
+            name,
+        )
+        .map(|i| format!("patterns:{i}")),
+        KnowledgeMarker::AntiPattern { description, .. } => {
+            id("SELECT id FROM anti_patterns WHERE description = ?1 ORDER BY id DESC LIMIT 1", description)
+                .map(|i| format!("anti_patterns:{i}"))
+        }
+        KnowledgeMarker::Correction { attempted, .. } => {
+            id("SELECT id FROM self_corrections WHERE attempted = ?1 ORDER BY id DESC LIMIT 1", attempted)
+                .map(|i| format!("self_corrections:{i}"))
+        }
+        KnowledgeMarker::Adr { title, .. } => {
+            id("SELECT id FROM adrs WHERE title = ?1 ORDER BY id DESC LIMIT 1", title).map(|i| format!("adrs:{i}"))
+        }
+        KnowledgeMarker::Wall(w) => crate::walls::find_by_claim(store, &w.claim)
+            .ok()
+            .flatten()
+            .map(|id| format!("walls:{id}")),
+        KnowledgeMarker::PrefsNote { .. } => Some("prefs.toml".to_string()),
+        KnowledgeMarker::SkillCandidate { name, .. } => Some(format!("skill_candidates:{name}")),
+    };
+    found.unwrap_or_else(|| format!("{}:?", marker.marker_type()))
+}
+
+/// The text similarity is measured on, matching knowledge_sim::live_docs.
+fn entry_text(marker: &KnowledgeMarker) -> Option<(&'static str, String)> {
+    match marker {
+        KnowledgeMarker::AntiPattern { description, wrong, correct, tags } => {
+            Some(("anti_patterns", format!("{description} {wrong} {correct} {}", tags.join(" "))))
+        }
+        KnowledgeMarker::Pattern { name, intent, body, tags, .. } => {
+            Some(("patterns", format!("{name} {intent} {body} {}", tags.join(" "))))
+        }
+        _ => None,
+    }
+}
+
+/// Store a pattern marker as a new version and retire `old_id` in its favour.
+#[allow(clippy::too_many_arguments)]
+fn insert_replacing(
+    store: &Store,
+    session_key: &str,
+    marker: &KnowledgeMarker,
+    table: &str,
+    old_id: i64,
+    at: chrono::DateTime<Utc>,
+    class: &str,
+    evidence: &str,
+    why: &str,
+) -> Result<String> {
+    let mut p = pattern_from_marker(marker).context("not a pattern marker")?;
+    p.approved_at = at;
+    let new_id = store.insert_pattern(&p)?;
+    store.supersede(table, old_id, new_id)?;
+    if let KnowledgeMarker::Pattern { name, .. } = marker {
+        mark_promoted_nonfatal(store, session_key, "pattern", name);
+    }
+    let target = format!("{table}:{new_id}");
+    let replaced = format!("{table}:{old_id}");
+    let _ = crate::loop_ledger::record(store, &crate::loop_ledger::NewChange {
+        class,
+        target: &target,
+        after: &marker.display_name(),
+        evidence,
+        session_id: session_key,
+        ..Default::default()
+    });
+    let _ = crate::loop_ledger::record(store, &crate::loop_ledger::NewChange {
+        class: "duplicate",
+        target: &replaced,
+        before: "live",
+        after: &format!("superseded by {new_id}"),
+        evidence: why,
+        session_id: session_key,
+        ..Default::default()
+    });
+    Ok(target)
+}
+
+pub(crate) fn pattern_from_marker(marker: &KnowledgeMarker) -> Option<Pattern> {
+    let KnowledgeMarker::Pattern { name, intent, body, trust, kind, uses, tags } = marker else { return None };
+    Some(Pattern {
+        id: None,
+        name: name.clone(),
+        intent: intent.clone(),
+        body: format!("{body}\nTrust: {trust} {}", Utc::now().format("%Y-%m-%d")),
+        uses: uses.clone(),
+        tags: tags.clone(),
+        approved_at: Utc::now(),
+        use_count: 0,
+        reverted_count: 0,
+        survival_rate: 1.0,
+        credibility: 0.0,
+        trust_level: crate::model::TrustLevel::default(),
+        kind: crate::model::MemoryKind::from_str(kind),
+        tier: crate::model::EpistemicTier::default(),
+        hash: None,
+        included_in_context_count: 0,
+        confirmed_count: 0,
+        corrected_count: 0,
+        superseded_by: None,
+    })
+}
+
+/// Markers captured while the approval gate was on, waiting for a person.
+fn staged_captures(store: &Store) -> Vec<(i64, KnowledgeMarker)> {
+    let Ok(mut stmt) = store.conn().prepare(
+        "SELECT id, raw_tag FROM knowledge_markers
+         WHERE promoted = 0 AND raw_tag != '' AND extracted_at >= unixepoch() - 86400
+         ORDER BY id",
+    ) else {
+        return Vec::new();
+    };
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|(id, raw)| markers::parse_markers(&raw).into_iter().next().map(|m| (id, m)))
+        .collect()
 }
 
 fn marker_body(marker: &KnowledgeMarker) -> String {
@@ -572,6 +1008,7 @@ fn marker_body(marker: &KnowledgeMarker) -> String {
             format!("Context: {context}\nDecision: {decision}"),
         KnowledgeMarker::PrefsNote { body, .. }      => body.clone(),
         KnowledgeMarker::SkillCandidate { summary, .. } => summary.clone(),
+        KnowledgeMarker::Wall(w)                     => crate::walls::marker_body(w),
     }
 }
 
@@ -583,6 +1020,7 @@ fn marker_tags_json(marker: &KnowledgeMarker) -> String {
         KnowledgeMarker::Adr { tags, .. }         => tags.clone(),
         KnowledgeMarker::PrefsNote { tags, .. }   => tags.clone(),
         KnowledgeMarker::SkillCandidate { .. }    => vec![],
+        KnowledgeMarker::Wall(w)                  => w.topic.clone(),
     };
     serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string())
 }
@@ -724,6 +1162,7 @@ fn write_session_snapshot(
         "adr":            markers.iter().filter(|m| matches!(m, KnowledgeMarker::Adr { .. })).count(),
         "prefs_note":     markers.iter().filter(|m| matches!(m, KnowledgeMarker::PrefsNote { .. })).count(),
         "skill_candidate":markers.iter().filter(|m| matches!(m, KnowledgeMarker::SkillCandidate { .. })).count(),
+        "wall":           markers.iter().filter(|m| matches!(m, KnowledgeMarker::Wall(_))).count(),
     });
 
     // Read recent tool sequences from mcp_calls for this session.
@@ -859,6 +1298,33 @@ mod tests {
 
     fn test_store(name: &str) -> crate::test_support::TempStore {
         crate::test_support::TempStore::new(name).unwrap()
+    }
+
+    #[test]
+    fn a_wall_marker_commits_through_the_ledger_rules_and_a_bad_one_says_why() {
+        let store = test_store("walls_marker");
+        let _g = crate::test_support::TempDir::new("closeout_walls").unwrap();
+        let markers_text = r#"
+[CORTEX-WALL: claim="Hardware ray queries are unavailable on Quest 3" provenance="platform" topic="quest,raytracing" untested="driver exposure" cheapest_test="log VK_KHR_ray_query at startup (~15 min)"]
+paper: Mesa Turnip exposes accelerated ray queries on a740+ @ phoronix @ 2025
+[/CORTEX-WALL]
+[CORTEX-WALL: claim="Splat relighting is not a Quest 3 technique" provenance="because I said so"]
+inferred: desktop papers are slow
+[/CORTEX-WALL]
+"#;
+        let result = run_closeout(
+            &store, "s-walls", "build_pass", None, None, true, _g.path(), None, Some(markers_text),
+        )
+        .unwrap();
+        assert_eq!(result.walls_committed, 1);
+        let wall = crate::walls::all(&store).unwrap().pop().unwrap();
+        assert_eq!((wall.provenance.as_str(), wall.status.as_str()), ("platform", "open"));
+        assert_eq!(wall.evidence[0].date, "2025");
+        assert!(
+            result.notes.iter().any(|n| n.contains("wall marker") && n.contains("whose limit")),
+            "the refused marker is reported with its reason: {:?}",
+            result.notes
+        );
     }
 
     /// Regression: closeout must COUNT what it commits. The old mark_promoted

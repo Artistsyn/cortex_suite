@@ -473,30 +473,36 @@ pub fn compute_index_version(
         }
     }
 
-    // Hash pattern count + latest approved_at — invalidates when a pattern is added.
-    if let Ok((count, latest)) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(approved_at), '') FROM patterns",
-        [],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-    ) {
-        hasher.update(b"patterns:");
-        hasher.update(count.to_string().as_bytes());
-        hasher.update(b"@");
-        hasher.update(latest.as_bytes());
-        hasher.update(b"\n");
-    }
-
-    // Hash anti-pattern count + latest added_at.
-    if let Ok((count, latest)) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(added_at), '') FROM anti_patterns",
-        [],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-    ) {
-        hasher.update(b"anti_patterns:");
-        hasher.update(count.to_string().as_bytes());
-        hasher.update(b"@");
-        hasher.update(latest.as_bytes());
-        hasher.update(b"\n");
+    // Hash the knowledge that answers are built from. Count and latest
+    // timestamp alone moved only when an entry was ADDED: superseding or
+    // retracting one (an UPDATE of superseded_by) and editing its text left the
+    // key unchanged, so a cached get_context or recall went on serving an entry
+    // that had been taken out of service. Found 2026-09-30 while building
+    // `cortex knowledge undo`. The retirement columns and a text-length sum
+    // move with every change that alters what is served.
+    for (label, sql) in [
+        (
+            &b"patterns:"[..],
+            "SELECT COUNT(*) || ':' || COUNT(superseded_by) || ':' || COALESCE(SUM(superseded_by), 0)
+                    || ':' || COALESCE(MAX(id), 0)
+                    || ':' || COALESCE(SUM(length(name) + length(intent) + length(body) + length(tags)), 0)
+                    || '@' || COALESCE(MAX(approved_at), '')
+             FROM patterns",
+        ),
+        (
+            &b"anti_patterns:"[..],
+            "SELECT COUNT(*) || ':' || COUNT(superseded_by) || ':' || COALESCE(SUM(superseded_by), 0)
+                    || ':' || COALESCE(MAX(id), 0)
+                    || ':' || COALESCE(SUM(length(description) + length(wrong) + length(correct) + length(tags)), 0)
+                    || '@' || COALESCE(MAX(added_at), '')
+             FROM anti_patterns",
+        ),
+    ] {
+        if let Ok(fingerprint) = conn.query_row(sql, [], |r| r.get::<_, String>(0)) {
+            hasher.update(label);
+            hasher.update(fingerprint.as_bytes());
+            hasher.update(b"\n");
+        }
     }
 
     // Hash the build identity.

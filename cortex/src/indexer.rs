@@ -945,10 +945,12 @@ pub fn refresh_stale(store: &Store, repo_root: &Path) -> RefreshSummary {
 
 static SESSION_START: std::sync::OnceLock<chrono::DateTime<chrono::Utc>> = std::sync::OnceLock::new();
 
-/// Record when this server process began serving. A host starts one server per
-/// session, so "since the session started" is "since this".
-pub fn mark_session_start() {
-    let _ = SESSION_START.set(chrono::Utc::now());
+/// Record when this server began serving its client: now, or the time a build
+/// before this one recorded, when a rebuilt binary took the connection over. A
+/// host starts one server per session, so "since the session started" is
+/// "since this".
+pub fn mark_session_start(at: Option<chrono::DateTime<chrono::Utc>>) {
+    let _ = SESSION_START.set(at.unwrap_or_else(chrono::Utc::now));
 }
 
 pub fn session_start() -> chrono::DateTime<chrono::Utc> {

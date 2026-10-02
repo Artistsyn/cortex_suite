@@ -37,10 +37,12 @@ chmod +x scripts/setup.sh
 ./scripts/setup.sh ~/code/my-project
 ```
 
-The script builds both binaries, writes `.mcp.json`, `.vscode/mcp.json`,
-`.cortex/index-sources.json`, `CLAUDE.md` and `.github/copilot-instructions.md`
-into your workspace, and never overwrites an existing file unless you pass
-`-Force` / `--force`.
+The script builds both binaries and writes `.mcp.json`, `.vscode/mcp.json` and
+`.cortex/index-sources.json` into your workspace, never overwriting an existing
+one unless you pass `-Force` / `--force`. It also adds the cortex_suite section
+to `CLAUDE.md` and `.github/copilot-instructions.md`: a missing file is written
+from the template, and in an existing one only the text between the
+`cortex_suite` markers is ever touched (section 4).
 
 Then:
 
@@ -573,21 +575,78 @@ The history behind each metric, and the ones it replaced, is in
 Embed markers in your responses as you discover things:
 
 ```
-[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
+[CORTEX-AP: description="..." tags="..."]wrong: ...
+correct: ...[/CORTEX-AP]
 [CORTEX-PATTERN: name="..." intent="..." trust="verified"]body[/CORTEX-PATTERN]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
+[CORTEX-WALL: claim="..." provenance="hardware" cheapest_test="..."]
+measured: what was measured @ where @ 2026-09-30
+[/CORTEX-WALL]
 ```
+
+`correct:` must start its own line; the split is per line.
 
 A pattern takes an optional `kind="constraint|policy|fact"` (default
 `procedure`). Constraints and policies are served in their own sections ahead
 of ordinary patterns in `get_context`.
 
-Then at the end of a verified task, the agent presents a summary and you reply
-`KNOWLEDGE COMMITTED` to commit them.
+A **WALL** records a limit: an agent accepted, declared, disputed or tested
+it. It needs:
 
-> On Claude Code the agent **must** pass its markers as `markers_text` to
-> `closeout_session`. There is no chat store to scrape outside VS Code, so
-> omitting it commits nothing and reports success.
+- a `provenance`: physics, hardware, platform, library-default,
+  library-version, our-design, implementation, authority or budget;
+- at least one evidence line, `kind: text @ source @ date`, with kind one of
+  measured, vendor-doc, paper, implementation, authority or inferred. A
+  vendor-doc or paper needs a date.
+
+An open wall must name `cheapest_test`. Closeout refuses a WALL that breaks
+these rules and says why in its report. The same rules apply to the
+`record_wall` and `update_wall` tools. A verdict (holds or moved) changes only
+with a new measurement or a dated source.
+
+**Seeding a workspace:** `cortex walls import walls.json`, a JSON array of
+`{claim, provenance, evidence: [{kind, text, source, date}], status, topic,
+untested, cheapest_test, revisit_when, revisit_after}`. Claims already on
+record are skipped. `cortex walls list` prints the ledger and its base rate.
+
+**Settling a limit dispute:** when a challenge disputed a limit,
+`resolve_challenge` requires `wall_id`, so the answer lands in the ledger. The
+only exception is the verdict `unresolved`.
+
+**When a dependency moves,** the ledger speaks up on its own. An edit to
+`Cargo.toml`, `Cargo.lock` or `package.json` (the edit hook), or `cargo update`
+output reporting `Updating <crate> vA -> vB` (the Bash observer), pushes every
+open or held wall bound to that package, once per wall per session. To bind a
+wall, name the package in `revisit_when`, e.g. "an openxr crate release". A
+`library-version` or `library-default` wall is also bound when its claim or
+topic names the package. Open walls whose `cheapest_test` states 30 minutes or
+less are flagged in retrieval: write the estimate as "(~20 min)", "(~1 h)" or
+"half a day".
+
+Markers commit themselves. On Claude Code the Stop and PreCompact hooks capture
+them from the transcript as they are written (installed by `cortex hooks-init`);
+in VS Code, `closeout_session` reads them from the chat. Nothing waits for you to
+approve each one: before 2026-09-30 that approval passed 99.3-100% of what reached
+it, while the protocol around it lost 123 of 411 markers across compactions.
+
+What you do instead, about a minute a week:
+
+```bash
+./.cortex/cortex.sh knowledge audit      # 5 random automatic commits: r / w / u / s
+./.cortex/cortex.sh knowledge status     # automatic commit, audit precision, capture health
+./.cortex/cortex.sh knowledge undo ap:<id>        # take one entry back (nothing is deleted)
+./.cortex/cortex.sh knowledge undo --class backfill   # take a whole group back
+./.cortex/cortex.sh knowledge digest           # the week in one page (also .cortex/loop-digest.md)
+./.cortex/cortex.sh knowledge skills --dry-run  # what skill triage would reject, trial or retire
+```
+
+A wrong or useless verdict retracts the entry on the spot. More than 3 bad
+verdicts in the last 20 switch automatic commit off; markers are then staged, and
+the agent asks for `KNOWLEDGE COMMITTED` as before, until
+`cortex knowledge auto-commit on`.
+
+> `markers_text` is optional on Claude Code once the capture hooks are
+> installed. `cortex knowledge status` says whether the capture hook has run.
 
 ### What the system asks of you, and when
 
@@ -660,7 +719,19 @@ coverage report naming every undocumented item, which doubles as a worklist.
 ## 4. Writing the instruction files
 
 `CLAUDE.md` and `.github/copilot-instructions.md` are what make this reliable
-rather than merely available. Templates are in `templates/`. What matters:
+rather than merely available. Templates are in `templates/`.
+
+The part of each file between the `cortex_suite` markers belongs to the suite,
+and `cortex instructions` maintains it: setup runs it, and after updating the
+suite you run it again (`./.cortex/cortex.sh instructions`, or
+`.\.cortex\cortex.ps1 instructions` on Windows). It replaces that section and
+nothing else, so write your own rules outside it. A section you edited is left
+alone until you pass `--force`. A file copied before the markers existed is
+reported, and `--adopt` converts it. Both keep the old file under
+`.cortex/backups/`. Closeout lists a section with a newer version available
+under AWAITING YOUR REVIEW.
+
+For the rules you write yourself, what matters:
 
 **Do:**
 - State the **routing rule** in one place: structure → quartz-ctx, judgment →
@@ -700,7 +771,8 @@ names.
 | Index has units from deleted sources | indexing never prunes | `cortex prune-index --keep <root> ... --apply` |
 | Empty index for an app | `pub`-only extraction | `include_private: true` (2.11) |
 | 0 items on a non-Rust project | the root points at the wrong level, or `include_private` is off | point at the app directory; `include_private: true` (see §7) |
-| `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | restart the session (or reconnect cortex in `/mcp`); see 2.14 |
+| `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | `./.cortex/cortex.sh reload-servers` (or reconnect cortex in `/mcp`); see 2.14 |
+| A rebuilt server's new tool never appears in a running session | the session never subscribed that connection to `tools/list_changed`: it predates the server declaring it, or Claude Code restarted the server by itself | in a terminal session, reconnect it with `/mcp`; in the desktop app, which cannot reconnect a local server, restart the app; `reload-servers` moves older servers onto the current code but leaves tool lists as they were |
 | Failed builds missing from the scoreboard | hook set older than v3 (no `PostToolUseFailure` entry) | `./.cortex/cortex.sh hooks-init`; see 2.15 |
 | `hook_non_blocking_error: MCP server 'cortex' not connected` | the server was down (usually mid-deploy) | none needed; hooks are non-blocking and resume when it reconnects |
 | Copilot never gets `[cortex]` warnings | no `.github/hooks/cortex.json`, `chat.useHooks` off, or the workspace is not trusted | `./.cortex/cortex.sh hooks-init --vscode`; check the setting and Workspace Trust; `fired` shows whether `cortex hook` ever ran |

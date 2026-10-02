@@ -69,6 +69,9 @@ pub enum Work {
     /// (file, text the edit adds), one per file touched.
     Edits(Vec<(String, String)>),
     Prompt(String),
+    /// Stop or PreCompact with a transcript: capture the markers written since
+    /// the last capture. Never answers: a Stop reply can block the turn.
+    Capture(String),
     Nothing,
 }
 
@@ -190,6 +193,10 @@ pub fn work(event: &str, p: &Value) -> Work {
             return if prompt.is_empty() { Work::Nothing } else { Work::Prompt(prompt) };
         }
         "PostToolUse" | "PostToolUseFailure" | "PreToolUse" => {}
+        "Stop" | "PreCompact" => {
+            let path = str_at(p, "transcript_path");
+            return if path.is_empty() { Work::Nothing } else { Work::Capture(path) };
+        }
         _ => return Work::Nothing,
     }
     let input = p.get("tool_input").cloned().unwrap_or(Value::Null);
@@ -305,6 +312,11 @@ fn run_at(event_arg: Option<&str>, stdin: &str, db_path: &Path, now: f64) -> Str
             }
         }
         Work::Prompt(prompt) => vec![call("note_challenge", json!({ "prompt": prompt }))],
+        Work::Capture(path) => {
+            call("capture_markers", json!({ "transcript_path": path, "hook_event_name": event }));
+            let _ = crate::corrections::beat_named(&store, "cli_hook", false);
+            return String::new();
+        }
         Work::Nothing => Vec::new(),
     };
     let text = texts.into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
@@ -320,6 +332,11 @@ fn offer_edits(store: &Store, session: &str, call_id: &str, edits: Vec<(String, 
     let mut offered: Vec<i64> = Vec::new();
     let mut texts = Vec::new();
     for (file, added) in edits {
+        // A manifest change that moves a package a wall is bound to. Recorded
+        // as delivered now: it is one line, once per wall per session.
+        if let Some(t) = crate::mcp::tools::dependency_revisits(store, session, &file, &added) {
+            texts.push(t);
+        }
         let args = json!({ "file_path": file, "added": added });
         let Ok(Some(hit)) = crate::mcp::tools::edit_guard_match(&args, store, session, &offered) else {
             continue;
@@ -416,6 +433,11 @@ mod tests {
         let pre = json!({"tool_name": "run_in_terminal", "tool_input": {"command": "ls"}});
         assert_eq!(work("PreToolUse", &pre), Work::Nothing);
         assert_eq!(work("Stop", &json!({})), Work::Nothing);
+        assert_eq!(
+            work("Stop", &json!({"transcript_path": "/u/.claude/projects/p/s.jsonl"})),
+            Work::Capture("/u/.claude/projects/p/s.jsonl".into())
+        );
+        assert_eq!(work("PreCompact", &json!({"transcript_path": "/t.jsonl"})), Work::Capture("/t.jsonl".into()));
         let prompt = json!({"prompt": "that's wrong"});
         assert_eq!(work("UserPromptSubmit", &prompt), Work::Prompt("that's wrong".into()));
     }
@@ -583,6 +605,42 @@ mod tests {
             assert_eq!(run_at(None, &edit_call("PostToolUse", call, "src/x.rs"), &db, 1000.4), "");
         }
         assert_eq!(delivered(&db), (1, 1));
+    }
+
+    #[test]
+    fn a_vscode_manifest_edit_hears_about_a_bound_wall_before_it_lands() {
+        let (_d, db) = guard_store("hook_cli_dep");
+        {
+            let store = Store::open(&db).unwrap();
+            crate::walls::record(
+                &store,
+                crate::walls::NewWall {
+                    claim: "openxrs lacks XR_META_recommended_layer_resolution bindings".into(),
+                    provenance: "library-version".into(),
+                    status: Some("holds".into()),
+                    evidence: vec![crate::walls::Evidence {
+                        kind: "measured".into(),
+                        text: "openxr-sys 0.10 has no such binding".into(),
+                        source: String::new(),
+                        date: "2026-09-25".into(),
+                    }],
+                    topic: vec!["openxr".into()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let payload = json!({
+            "hook_event_name": "PreToolUse", "session_id": "v1", "tool_use_id": "m1",
+            "transcript_path": "/x/GitHub.copilot-chat/transcripts/v1.jsonl",
+            "tool_name": "replace_string_in_file",
+            "tool_input": {"filePath": "quest_app/Cargo.toml", "oldString": "o", "newString": "openxr = \"0.19\""},
+        })
+        .to_string();
+        let out = run_at(None, &payload, &db, 1000.0);
+        let v: Value = serde_json::from_str(&out).expect("valid JSON reply");
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert!(v["hookSpecificOutput"]["additionalContext"].as_str().unwrap().contains("changes `openxr`"));
     }
 
     #[test]

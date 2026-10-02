@@ -1,10 +1,27 @@
 # Copilot Instructions — <PROJECT>
 
+The section between the `cortex_suite` markers is maintained by
+`.cortex/cortex.sh instructions` (`.\.cortex\cortex.ps1 instructions` on
+Windows): an update replaces that section and leaves the rest of this file
+alone, so keep your own rules outside it.
+
+<!-- cortex_suite:begin -->
+## Code navigation and project memory
+
 Two MCP servers back this workspace. Use them before writing code.
 
 - **quartz-ctx** — structure: what the code *is*. Parsed live from source, never
   stale.
 - **cortex** — judgment: what we *learned*. Patterns, anti-patterns, decisions.
+
+Reading code under the indexed roots: `get_source(name)` instead of grep then
+sed/cat (whole definition with line numbers, `Type::method`, `a|b`),
+`find_references(name)` instead of `grep -n` (uses grouped by enclosing
+function; `include_comments=true` for renames), `get_outline(path)` instead of
+reading a whole file, `search_code(pattern)` instead of grep/rg for code, logs
+and config (a `grep -E` regex; matches grouped by enclosing item as `12:text`,
+`~` a comment line), and `get_source(file, lines="120-160")` instead of
+`sed -n`/head/tail. grep stays right for filtering a command's output.
 
 ## Before writing any non-trivial code
 
@@ -13,7 +30,8 @@ Two MCP servers back this workspace. Use them before writing code.
 2. `get_anti_patterns(hint: "<same>")` — known traps for this kind of change.
 3. `list_patterns(hint: "<same>")` — approaches already vetted here.
 
-Skip only for renames, typos and comments.
+Skip only for renames, typos and comments. Follow `get_preferences(hint: ...)`
+for naming, error handling and line length.
 
 ## The hint is required
 
@@ -48,9 +66,10 @@ you see the same thing. Use both.
 
 ## When you get stuck
 
+A failed build or test that matches a recorded trap is pushed to you by the failure hook; the rows below cover what it cannot see.
+
 | Situation | Call |
 |---|---|
-| First approach failed | `recall <error keyword>` before trying a second |
 | Two attempts failed | Stop. `recall` or `semantic_search` before a third |
 | Unfamiliar compiler error | `semantic_search <description>` first |
 | Compiles but behaves wrong | `recall <behaviour>` — may be a known runtime trap |
@@ -71,6 +90,14 @@ A nudge that a failure has recurred across sessions with nothing recorded is a
 request. Once you know the cause, record it with the printed
 `anti-pattern add ... --resolves '<signature>'` command.
 
+## Limits
+
+A limit is a claim with a provenance. Before accepting one — including one you
+retrieved — say whose limit it is and what cheap check would move it. Check
+`get_walls(hint: "<the limit>")` first, and record what you accept, dispute or
+test with `record_wall` / `update_wall`: a verdict changes only with a new fact
+(a measurement or a dated source).
+
 ## API facts
 
 - `get_item(name)` returns the full definition including methods from **every**
@@ -81,21 +108,21 @@ request. Once you know the cause, record it with the printed
 - `get_variants(enum)` before using any enum. Prefer an existing variant over
   inventing a parallel representation.
 
-## Style
-
-- Follow `get_preferences(hint: ...)` for naming, error handling and line length.
-- Smallest safe patch. No unrelated refactors.
-- Never run git commands unless explicitly asked.
-
 ## Recording what you learn
 
 Embed markers as you go:
 
 ```
-[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
+[CORTEX-AP: description="..." tags="..."]wrong: ...
+correct: ...[/CORTEX-AP]
 [CORTEX-PATTERN: name="..." intent="..." trust="verified"]body[/CORTEX-PATTERN]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
+[CORTEX-WALL: claim="..." provenance="hardware" cheapest_test="..."]measured: what @ where @ 2026-09-30[/CORTEX-WALL]
 ```
+
+`correct:` must start its own line; the split is per line. A WALL needs a
+`provenance` and at least one evidence line `kind: text @ source @ date`
+(sources dated), or closeout refuses it and says why.
 
 A pattern takes an optional `kind="constraint|policy|fact"` (default
 `procedure`). Constraints and policies are served in their own sections ahead
@@ -117,20 +144,20 @@ report and in `get_session_health`, with the command that resolves it
 
 ### Closing the session
 
-Markers alone do not save anything. When the work is verifiably done, present a
-short summary of what you captured and ask for the word:
+When the work is verifiably done, call `closeout_session(outcome_type="build_pass")`.
+It commits your `[CORTEX-*]` markers through the gates without waiting for approval:
+in VS Code it reads them from this chat; in any other host, pass them as
+`markers_text`. A person audits a random sample (`cortex knowledge audit`) instead
+of approving every entry. If the work did not verify, call
+`closeout_session(outcome_type="build_fail")`.
 
-```
-KNOWLEDGE COMMITTED
-```
+**Close the session.** In VS Code, markers reach the store only through
+closeout; a session that never closes loses them. (Claude Code also captures
+them from its transcript as they are written.)
 
-On that reply, call `closeout_session(outcome_type="build_pass",
-inline_approve=true, markers_text=<your [CORTEX-*] markers from this session>)`.
-
-**Pass `markers_text`.** Outside VS Code there is no chat store to scrape, so
-omitting it commits nothing — the session ends and every marker you wrote is
-lost. If the work did not verify, call `closeout_session(outcome_type="build_fail")`
-and do not pass `inline_approve`.
+If closeout answers "staged mode", the audit has switched automatic commit off.
+Present a short summary and ask for the word `KNOWLEDGE COMMITTED`; on that reply
+call `closeout_session(outcome_type="build_pass", inline_approve=true)`.
 
 ### Freshness - what "current" means here
 
@@ -182,11 +209,21 @@ commands on both.
 | `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone |
 | `-- <args>` | pass anything straight through to the binary |
 
 `deploy` exists because Windows blocks deleting a running executable. It renames
 the live binary out of the way, which Windows does permit, so a rebuild never
 requires hunting and killing the server first.
+<!-- cortex_suite:end -->
+
+## Style
+
+- Smallest safe patch. No unrelated refactors.
+- Never run git commands unless explicitly asked.
+- Fewer, fuller requests: every request re-sends the whole conversation. Run
+  independent reads, searches and edits together, and wait on long jobs in the
+  background instead of polling with `sleep` or repeated checks.
 
 ## Verify before claiming done
 

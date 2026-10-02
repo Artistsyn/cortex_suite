@@ -149,10 +149,13 @@ fired` → "pushes delivered to agents" should turn live.
   bytes; no windowing.
 * **Observation masking beats summarisation.** Hiding old tool outputs halves
   cost and matches LLM summarisation
-  ([The Complexity Trap](https://arxiv.org/abs/2508.21433)). Claude Code
-  already does this ("microcompact"), so cortex must not duplicate it. It does
-  mean cortex's own injected results can silently disappear, which argues for
-  small, re-fetchable, just-in-time memory over boot dumps.
+  ([The Complexity Trap](https://arxiv.org/abs/2508.21433)).
+  **Corrected 2026-09-29:** this said Claude Code already does this
+  ("microcompact"). That came from a search result, and the data does not
+  support it. Across 34,460 calls, context dropped by more than 20% without a
+  compaction boundary only twice (`docs/wall0-context-length-2026-09-29.md`).
+  Old tool output stays resident until compaction. Small, re-fetchable,
+  just-in-time memory is still the right shape for cortex's own output.
 * **The real lever is context length.** Anthropic's
   [context-engineering guidance](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents)
   (just-in-time retrieval by lightweight identifiers; structured notes outside

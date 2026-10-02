@@ -1,9 +1,12 @@
 # Agent Operating Manual
 
-Replace `<PROJECT>` and the example crate names with your own. Keep this file
-short — a long manual gets skimmed.
+The section between the `cortex_suite` markers is maintained by
+`.cortex/cortex.sh instructions` (`.\.cortex\cortex.ps1 instructions` on
+Windows): an update replaces that section and leaves the rest of this file
+alone, so keep your own rules outside it. Keep the file short — a long manual
+gets skimmed.
 
-## 0) How to work
+## How to work
 
 - **Act, don't overplan.** When you have enough to act, act. Give a
   recommendation, not a survey.
@@ -13,11 +16,36 @@ short — a long manual gets skimmed.
 - **Assess, don't act uninvited.** If the user is describing a problem, the
   deliverable is your assessment. Report and stop.
 - **Match effort to the task.** Deep reasoning for hard work, fast for routine.
+- **Fewer, fuller calls.** Every call re-sends the whole conversation. Issue
+  independent reads, searches and edits together in one message, and wait on
+  long jobs with `run_in_background` or `Monitor`, never by polling (`sleep`,
+  repeated `tail`/`ps` checks).
+- **A limit is a claim with a provenance.** Before accepting one — including one
+  you retrieved — say whose limit it is and what cheap check would move it
+  (`get_walls`, the `frontier` skill).
 
-## 1) Tool routing — structure vs judgment
+<!-- cortex_suite:begin -->
+## Tool routing — structure vs judgment
 
 **quartz-ctx owns STRUCTURE — what the code *is*.** Parsed live from source, so
 it is never stale.
+- `get_source(name)` / `find_references(name)` / `get_outline(path)` —
+  **instead of grep then sed/cat** for code under the indexed roots. One call
+  returns a whole definition with line numbers (private items, `Type::method`,
+  `a|b`, WGSL inside Rust strings), every use grouped by enclosing function
+  (comments and strings only with `include_comments=true`), or a file's items
+  with line ranges. Read from disk at call time.
+- `search_code(pattern)` — **instead of grep/rg**, for code, logs and config
+  alike: a regex (read like `grep -E`) over the roots or any `path`, matches
+  grouped by file and enclosing item as `12:text` (`~` a comment line, `-`
+  context), the overflow counted per file. `get_source(file, lines="120-160")`
+  reads by line number (sed -n, head, tail, cat) from any text file.
+- **A shell grep or `sed -n 'A,Bp'` is answered by quartz-ctx anyway.** The
+  PreToolUse Bash hook (`hooks-init`) rewrites a read-only one into
+  `quartz-ctx nav`, which prints the same lines plus the item each match is in.
+  Anything it cannot reproduce runs untouched. `QX_RAW=1` in a command keeps
+  the raw tool; `QX_HOOK=off` in Claude Code's environment turns the hook off.
+  grep stays right for filtering a command's output.
 - `get_api_context(hint)` — **start here for any coding task**; one budgeted
   packet of the relevant types, variants and signatures
 - `get_item(name)` — full definition, including methods from every `impl` file
@@ -53,13 +81,17 @@ it is never stale.
   where a long task stands across compaction; `scope="any"` after a restart
 - `list_memory_handles` / `expand_memory(id)` — every pattern as one line, then
   only the bodies you need
+- `get_walls(hint)` / `record_wall` / `update_wall` — limits on record: whose
+  limit each is, its evidence, and the cheapest test that would decide it. Check
+  before accepting or declaring a limit; a verdict changes only with a new fact
+  (a measurement or a dated source)
 
 **Decision rule:**
 - What the code *is* → **quartz-ctx**
 - What we *learned* → **cortex**
 - Both in one task → run both
 
-## 2) The `hint` is required — say what you are doing
+## The `hint` is required — say what you are doing
 
 `get_anti_patterns`, `list_patterns` and `get_preferences` will refuse a call
 without a `hint`. That is deliberate and it is not about tidiness:
@@ -96,7 +128,7 @@ so the saving comes out of repetition, not out of the answer.
 The hint controls how much of each entry you see; `since` controls how many times
 you see the same thing. Use both.
 
-## 3) Pre-code check (no trigger word needed)
+## Pre-code check (no trigger word needed)
 
 Before writing any non-trivial function — anything that constructs, ticks,
 spawns, or touches shared state:
@@ -110,13 +142,14 @@ Skip only for renames, typos and comments.
 **Why:** these hold project-specific failure modes that are not in training data.
 Three calls beat one debug cycle.
 
-## 4) Mid-task checks — the ones that get skipped
+## Mid-task checks — the ones that get skipped
 
 Consult memory at every "I'm not sure" moment, not only at session start.
 
+A failed build or test that matches a recorded trap is pushed to you by the failure hook; the rows below cover what it cannot see.
+
 | Situation | Call |
 |---|---|
-| First approach failed | `recall <error keyword>` **before** trying a second |
 | Two attempts failed | STOP. `recall` / `semantic_search` before a third |
 | Unfamiliar compiler error | `semantic_search <description>` before reading source |
 | Compiles but behaves wrong | `recall <behaviour>` — may be a known runtime trap |
@@ -150,6 +183,14 @@ resolve_challenge(id, verdict, subject, evidence)
 `evidence` is required and a verdict without it is refused. Everything raised
 here is a proposal pending human review; nothing reaches memory directly.
 
+- `not_a_challenge` — the hook fired on a message that disputed nothing. Stores
+  nothing, and labels the false fire the cues are tuned from.
+
+**When the user disputes something and no challenge reminder arrived**, the hook
+missed it. Call `note_challenge(prompt=<their message>, source="agent")`, adding
+`limit=true` when they disputed a limit. That records the miss (the other label
+the cues learn from) and hands you the settling procedure.
+
 ### When a `[cortex]` warning arrives
 
 Hooks put a recorded trap into your context at two moments. The first is after
@@ -164,21 +205,37 @@ is a request. Once you know the cause, record it with the printed
 `anti-pattern add ... --resolves '<signature>'` command. That links the trap to
 the failure, so the next occurrence arrives with the fix.
 
-## 5) Capturing what you learn
+## Capturing what you learn
 
 Embed markers in your responses as you discover things:
 
 ```
-[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
-[CORTEX-PATTERN: name="..." intent="..." trust="verified"]body[/CORTEX-PATTERN]
+[CORTEX-AP: description="..." tags="..."]wrong: ...
+correct: ...[/CORTEX-AP]
+[CORTEX-PATTERN: name="..." intent="..." tags="..." trust="verified"]body[/CORTEX-PATTERN]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
 [CORTEX-ADR: title="..." tags="..."]Context: ... Decision: ...[/CORTEX-ADR]
 [CORTEX-PREFS-NOTE: tags="..."]note[/CORTEX-PREFS-NOTE]
+[CORTEX-WALL: claim="..." provenance="hardware" cheapest_test="..."]measured: what @ where @ 2026-09-30[/CORTEX-WALL]
 ```
+
+A WALL records a limit. Closeout refuses one without a `provenance` (physics,
+hardware, platform, library-default, library-version, our-design,
+implementation, authority, budget) and at least one evidence line
+`kind: text @ source @ date` (measured, vendor-doc, paper, implementation,
+authority, inferred; sources need a date). An open wall must name
+`cheapest_test`.
 
 A pattern takes an optional `kind="constraint|policy|fact"` (default
 `procedure`). Constraints and policies are served in their own sections ahead
 of ordinary patterns in `get_context`.
+
+`correct:` must begin its own line — the split is done per line. Written after
+a literal `\n` instead, the whole body lands in `wrong` and the remedy becomes a
+placeholder.
+
+`tags` works on a pattern too. A pattern without tags is findable by its name
+and intent alone.
 
 When a task is **verifiably** complete (build passes, tests pass), end with:
 
@@ -186,15 +243,22 @@ When a task is **verifiably** complete (build passes, tests pass), end with:
 ✓ TASK COMPLETE: [one line]
 Verified: [compile/test output]
 Knowledge captured: [list]
-
-Reply KNOWLEDGE COMMITTED to commit, anything else to skip.
 ```
 
-On `KNOWLEDGE COMMITTED`, call `closeout_session(outcome_type="build_pass",
-inline_approve=true, markers_text=<your markers>)`.
+then call `closeout_session(outcome_type="build_pass")` to log the outcome.
 
-**`markers_text` is required on Claude Code.** There is no chat store to scrape
-outside VS Code, so omitting it commits nothing while reporting success.
+**Markers commit themselves.** The Stop and PreCompact hooks capture every
+`[CORTEX-*]` marker from the transcript when it is written and commit it through
+the same gates (`cortex hooks-init` installs them). Nothing waits for a closeout a
+compaction can outrun: that lost 123 of 411 markers before 2026-09-30. A person
+audits a random sample (`cortex knowledge audit`) instead of approving each
+entry, and `cortex knowledge undo ap:<id>` takes any one back. `markers_text` is
+optional; pass it only if `cortex knowledge status` says the capture hook has
+never run.
+
+If the audit has switched automatic commit **off** (`cortex knowledge status`),
+markers are staged instead: end with "Reply KNOWLEDGE COMMITTED to commit", and
+on that reply call `closeout_session(outcome_type="build_pass", inline_approve=true)`.
 
 Tag entries so they are findable by concept, not just exact API name: include the
 API name, the behaviour, the domain, and the colloquial term people actually use.
@@ -290,13 +354,15 @@ commands on both.
 | `reindex` | full rebuild of every manifest source (never needed for correctness - see Freshness) |
 | `refresh` | re-index only roots whose source changed; what the servers do before answering |
 | `knowledge-drift` | patterns/anti-patterns naming code that changed after they were written |
-| `deploy` | rebuild cortex without stopping the MCP server |
+| `deploy` | rebuild cortex without stopping the MCP server; running servers move onto the rebuild while idle |
+| `reload-servers` | move running servers that predate self-updating onto the binary on disk (`--dry-run` lists them) |
 | `check-mcp` | validate both MCP configs: every command resolves, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
 | `fired` | which mechanisms have actually run, and which are silently idle |
 | `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
 | `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note); `--vscode` installs the same for VS Code Copilot |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone |
 | `-- <args>` | pass anything straight through to the binary |
 
 `fired` answers the one question nothing else asks: *has this ever actually
@@ -312,7 +378,23 @@ result cannot distinguish a working mechanism from an uninstalled one.
 the live binary out of the way, which Windows does permit, so a rebuild never
 requires hunting and killing the server first.
 
-## 6) Editing safety
+**A rebuild reaches sessions already running.** A cortex or quartz-ctx server
+waiting for a request looks at its binary every two seconds. Once a rebuild has
+replaced it and the new build answers an MCP handshake, the server becomes the
+new build on the same connection (exec: macOS and Linux) and sends
+`tools/list_changed`, so the client fetches the tool list again. No new session
+is needed. The client listens only on a connection it subscribed: one opened at
+session start, or reconnected with `/mcp` in a terminal session. A server that
+predates this, or one Claude Code started again by itself after it exited, runs
+the current code but leaves the session's tool list as it was until the session
+gets a fresh connection. The desktop app cannot give it one: its `/mcp`
+reconnects only remote servers, and the typed `/mcp reconnect` is refused in
+app-hosted sessions, so there it takes restarting the app. `reload-servers`
+moves every idle older server onto the current binary in one step. On Windows,
+reconnect from the host.
+<!-- cortex_suite:end -->
+
+## Editing safety
 
 - Smallest safe patch; match surrounding style.
 - No unrelated refactors, no scope expansion.
@@ -320,7 +402,7 @@ requires hunting and killing the server first.
   conversation.
 - If unexpected external edits appear in a file you touched, pause and confirm.
 
-## 7) Verify before claiming
+## Verify before claiming
 
 - Run the build or focused tests; report pass/fail with the actual output.
 - `cargo test` builds a *separate* binary — passing tests do not mean the CLI or
@@ -329,8 +411,20 @@ requires hunting and killing the server first.
 - A failed build leaves the previous binary in place. Ask the artifact its
   version rather than trusting an exit code.
 
-## 8) Housekeeping
+## Housekeeping
 
 After changing any tool surface, **grep this file for removed tool names**. A
 manual that routes to a tool which no longer exists misdirects every future
 session, and nothing errors.
+
+# Compact instructions
+
+When compacting, keep in the summary, verbatim where it matters:
+- the user's current request and every constraint or approval they gave;
+- the objective, what is done and verified (with the command that proved it), and the exact next step;
+- every file being edited or about to be, and why;
+- open errors and failing test names, quoted exactly;
+- decisions made and approaches rejected, with the reason;
+- anything promised to the user and not yet done.
+
+Drop tool output already acted on and file contents that can be re-read.

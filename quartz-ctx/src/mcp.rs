@@ -19,7 +19,7 @@
 ///       }
 ///     }
 ///   }
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::model::{ApiItem, Confidence, ItemKind, Visibility};
+use crate::nav::{self, Nav};
 use crate::{helpers, incremental, parser, Resolved, SourcePlan};
 
 // ── Keeping the served data current ─────────────────────────────────────────
@@ -51,6 +52,9 @@ struct Live {
     /// Parse errors already announced, so a persistent one is not re-sent on
     /// every answer - it is re-sent on answers it could explain (not-found).
     announced_errors: Vec<String>,
+    /// Source navigation (get_source, find_references, get_outline), which
+    /// reads the files themselves and caches them by size and mtime.
+    nav: Nav,
 }
 
 impl Live {
@@ -150,28 +154,26 @@ impl Live {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn serve(
-    ws: incremental::Workspace,
+    loader: std::thread::JoinHandle<incremental::Workspace>,
     engine_name: &str,
     resolved: Resolved,
     plan: SourcePlan,
 ) -> Result<()> {
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    // Moves this connection onto a rebuilt binary, and tells the client when
+    // its tool list may be out of date (see mcp_session).
+    let mut session = quartz_ctx::mcp_session::Session::open("quartz-ctx");
 
-    let mut live = Live {
-        manifest: manifest_stamp(&plan),
-        ws,
-        state: resolved,
-        plan,
-        last_replan: Instant::now(),
-        announced_errors: Vec::new(),
-    };
-    // Broken files at startup are announced on the first answer.
-    eprintln!("quartz-ctx MCP server ready ({} items loaded)", live.ws.items().len());
+    // The index is still being built (see run_serve). `initialize` and
+    // `tools/list` need none of it, so they are answered at once; the first
+    // tool call takes the index, waiting for it if it must.
+    let manifest = manifest_stamp(&plan);
+    let mut pending = Some((loader, resolved, plan, manifest));
+    let mut live: Option<Live> = None;
+    eprintln!("quartz-ctx MCP server ready (index loading)");
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    while let Some(line) = session.next_line(&mut out)? {
         if line.trim().is_empty() {
             continue;
         }
@@ -193,38 +195,65 @@ pub fn serve(
             // e.g. "notifications/initialized" — just swallow it
             continue;
         }
+        session.saw(method);
 
         let id = req["id"].clone();
         let params = req.get("params").cloned().unwrap_or(Value::Null);
 
+        // Every parse appends its source to proc-macro2's thread-local span
+        // map, which is never freed and wraps at 4 GiB; a long session of
+        // re-parses grows it without bound, then panics. Nothing holds a Span
+        // between requests (parsers keep line numbers only), so clear it here.
+        proc_macro2::extra::invalidate_current_thread_spans();
+
         if method == "tools/call" {
+            let live = live.get_or_insert_with(|| {
+                let (loader, state, plan, manifest) =
+                    pending.take().expect("the index is taken once, by the first tool call");
+                // Parse failures are per file and never panic the loader; if it
+                // panics anyway, load here so the failure surfaces as it did.
+                let ws = loader
+                    .join()
+                    .unwrap_or_else(|_| incremental::Workspace::load(&state.sources));
+                // Broken files at startup are announced on the first answer.
+                Live {
+                    manifest,
+                    ws,
+                    state,
+                    plan,
+                    last_replan: Instant::now(),
+                    announced_errors: Vec::new(),
+                    nav: Nav::new(),
+                }
+            });
             live.sync();
         }
 
-        let mut result = match method {
-            "initialize"  => Ok(initialize_result(engine_name)),
-            "tools/list"  => Ok(tools_list_result()),
-            "tools/call"  => tools_call(&params, live.ws.items(), &live.state),
-            other         => Err(format!("unknown method: {other}")),
+        let mut result = match (method, live.as_mut()) {
+            ("initialize", _)       => Ok(initialize_result(engine_name, &params)),
+            ("tools/list", _)       => Ok(tools_list_result()),
+            ("tools/call", Some(l)) => tools_call(&params, l.ws.items(), &l.state, &mut l.nav),
+            (other, _)              => Err(format!("unknown method: {other}")),
         };
 
-        if method == "tools/call" && !live.ws.items().is_empty() {
-            if let Some(err) = &live.state.manifest_error {
-                let notice = format!(
-                    "\n\n[manifest] the sources manifest cannot be read ({err}) - serving \
-                     the last good source list until it can."
-                );
-                match &mut result {
-                    Ok(r) => {
-                        if let Some(text) = r["content"][0]["text"].as_str() {
-                            r["content"][0]["text"] = json!(format!("{text}{notice}"));
+        let called = if method == "tools/call" { live.as_mut() } else { None };
+        if let Some(live) = called {
+            if !live.ws.items().is_empty() {
+                if let Some(err) = &live.state.manifest_error {
+                    let notice = format!(
+                        "\n\n[manifest] the sources manifest cannot be read ({err}) - serving \
+                         the last good source list until it can."
+                    );
+                    match &mut result {
+                        Ok(r) => {
+                            if let Some(text) = r["content"][0]["text"].as_str() {
+                                r["content"][0]["text"] = json!(format!("{text}{notice}"));
+                            }
                         }
+                        Err(msg) => msg.push_str(&notice),
                     }
-                    Err(msg) => msg.push_str(&notice),
                 }
             }
-        }
-        if method == "tools/call" {
             if let Some(notice) = live.parse_error_notice(result.is_err()) {
                 match &mut result {
                     Ok(r) => {
@@ -255,21 +284,218 @@ pub fn serve(
 
 // ── MCP protocol handlers ─────────────────────────────────────────────────────
 
-fn initialize_result(engine_name: &str) -> Value {
+/// Protocol revisions this server can answer in. It serves tools only, and
+/// tools look the same in each; answering in the client's own revision is what
+/// lets a host read `instructions`, which arrived in 2025-03-26.
+const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Read into the host's system prompt, so it is the one place that can tell an
+/// agent these tools exist without being asked to look. Hosts that defer MCP
+/// tool schemas behind a search still show this text, which is why it names
+/// the tools and when each beats grep. Every session pays for it on every
+/// request, so it stays short.
+pub const INSTRUCTIONS: &str = "\
+Code navigation read from disk at call time - as current as grep and sed, private items \
+included, exact line numbers - and organised by the function or type each line sits in.
+- Reading a function, method or type: get_source(name) - one call instead of grep then \
+sed/cat. Takes `Type::method` and several names as `a|b`; returns the whole definition \
+(doc comments to closing brace); a type also lists its methods with line ranges.
+- Reading lines by number (sed -n, head, tail, cat): get_source(file, lines=\"120-160,300-320\") \
+- any text file; the items the lines sit in are named first.
+- Searching (grep, rg): search_code(pattern) - a regex over the indexed roots or any `path`, \
+logs included; grouped by file and enclosing item with its line range, as `12:text` (`~` a \
+comment line, `-` context); matches past the limit counted per file.
+- Where a name is used (callers, before changing a signature): find_references(name) - whole \
+identifiers in code, comments and strings left out unless include_comments=true (a rename).
+- What a file or directory holds: get_outline(path) instead of reading it whole.
+- Starting a coding task: get_api_context(hint) for the relevant types, variants and \
+signatures in one packet.
+Where a hook answers a shell grep or sed -n read from these tools, it comes back in the \
+same format; QX_RAW=1 in the command keeps the raw tool. grep stays right for filtering a \
+command's output. Read a file before editing it, at the lines these tools report. If these \
+tools are deferred, load them with one tool search.";
+
+fn initialize_result(engine_name: &str, params: &Value) -> Value {
+    let asked = params["protocolVersion"].as_str().unwrap_or("");
+    let version = PROTOCOL_VERSIONS
+        .iter()
+        .find(|v| **v == asked)
+        .copied()
+        .unwrap_or("2024-11-05");
     json!({
-        "protocolVersion": "2024-11-05",
-        "capabilities": { "tools": {} },
+        "protocolVersion": version,
+        // listChanged: a rebuilt binary announces its tools (mcp_session).
+        "capabilities": { "tools": { "listChanged": true } },
         "serverInfo": {
             "name": "quartz-ctx",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": format!("{engine_name} API reference tool")
-        }
+            "description": format!("{engine_name} code navigation and API reference")
+        },
+        "instructions": INSTRUCTIONS
     })
 }
 
 fn tools_list_result() -> Value {
-    let full = json!({
+    let mut full = json!({
         "tools": [
+            // ── Source navigation: read from disk, private items included ────────
+            {
+                "name": "get_source",
+                // Loaded with the session rather than behind a tool search
+                // (Claude Code's per-tool `anthropic/alwaysLoad`): these replace
+                // grep and sed, which are always present, and a tool the model
+                // has to go looking for is not a default.
+                "_meta": { "anthropic/alwaysLoad": true },
+                "description": "Show the source of a function, method, type or constant by name, with \
+                                line numbers - one call instead of grep followed by sed or cat. Returns \
+                                the whole definition from its doc comments to its closing brace, read \
+                                from disk now (private items included). A type also lists its methods \
+                                with line ranges. Or, with `file` and no name, read lines of any file by \
+                                number - instead of sed -n, head, tail or cat - with the items those \
+                                lines sit in named first. Long output is cut with the range to ask for next.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "A name (`draw`), a qualified method (`Canvas::draw`), or several separated by `|` (`draw|flush_batch`). Omit it to read `file` by line numbers."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "With a name: only definitions in files whose path contains this (`canvas/core.rs`). Without one: the file to read - absolute, relative to the workspace, or the end of a path under the roots; any text file."
+                        },
+                        "origin": {
+                            "type": "string",
+                            "description": "Only this source root tag."
+                        },
+                        "lines": {
+                            "type": "string",
+                            "description": "With a name: this range of the definition's file (`120-160`). Without one: `120-160`, several as `120-160,300-320`, `200-` to the end, `-40` for the last 40; omit for the whole file."
+                        },
+                        "max_lines": {
+                            "type": "integer",
+                            "description": "Lines shown before the output is cut (default 150 per definition, 400 for a file read)."
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "name": "find_references",
+                // Loaded with the session rather than behind a tool search
+                // (Claude Code's per-tool `anthropic/alwaysLoad`): these replace
+                // grep and sed, which are always present, and a tool the model
+                // has to go looking for is not a default.
+                "_meta": { "anthropic/alwaysLoad": true },
+                "description": "Every use of a name across the indexed roots, grouped by file and by the \
+                                function each use sits in, with the line text - instead of grep -n. \
+                                Matches whole identifiers in code only: substrings, comments and string \
+                                literals are left out unless include_comments is true (use that for a \
+                                rename). The definition is marked.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "An identifier (`flush_batch`), or several separated by `|`. `Type::method` searches for `method`."
+                        },
+                        "include_comments": {
+                            "type": "boolean",
+                            "description": "Also list whole-word matches in comments and strings, marked ~ (default false)."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Only files whose path contains this."
+                        },
+                        "origin": {
+                            "type": "string",
+                            "description": "Only this source root tag."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Most uses listed (default 80); the rest are counted per file."
+                        }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "get_outline",
+                // Loaded with the session rather than behind a tool search
+                // (Claude Code's per-tool `anthropic/alwaysLoad`): these replace
+                // grep and sed, which are always present, and a tool the model
+                // has to go looking for is not a default.
+                "_meta": { "anthropic/alwaysLoad": true },
+                "description": "The items in a source file - functions, types, impl blocks and their \
+                                methods - with signatures and line ranges, instead of reading the whole \
+                                file. Given a directory, lists its source files with their top-level items.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "A file or directory path, absolute or a unique suffix (e.g. `src/canvas/core.rs`)."
+                        }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "search_code",
+                // Loaded with the session rather than behind a tool search
+                // (Claude Code's per-tool `anthropic/alwaysLoad`): it replaces
+                // grep and rg, which are always present.
+                "_meta": { "anthropic/alwaysLoad": true },
+                "description": "Every line matching a pattern - instead of grep or rg - grouped by file and \
+                                by the function or type each line sits in, with that item's line range, \
+                                so the next read can ask for exactly it. Searches the indexed roots, or \
+                                any file or directory given as `path` (logs, docs and config too). \
+                                Lines read `12:text`; `~` marks a comment line and `-` a context line. \
+                                Matches past `limit` are counted per file, not dropped, and long lines \
+                                are cut around the match.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "A regular expression read like `grep -E` (`\\|` works as `|`). Set fixed=true for literal text."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "A file or directory: absolute, relative to the workspace, or the end of a path under the roots (`renderer/lights.rs`). Default: every indexed root."
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Only files whose name matches: `*.rs`, `*.{rs,wgsl}`, several separated by commas."
+                        },
+                        "ignore_case": { "type": "boolean", "description": "Like grep -i." },
+                        "word": { "type": "boolean", "description": "Whole words only, like grep -w." },
+                        "fixed": { "type": "boolean", "description": "Literal text, like grep -F." },
+                        "context": {
+                            "type": "integer",
+                            "description": "Lines shown around each match, like grep -C (default 0)."
+                        },
+                        "output": {
+                            "type": "string",
+                            "enum": ["lines", "files", "count"],
+                            "description": "lines (default); files, each with its match count (grep -l / -c); or count, the totals only."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Matching lines listed (default 80); the rest are counted per file."
+                        },
+                        "collapse": {
+                            "type": "boolean",
+                            "description": "Fold lines that differ only in numbers into one with a count, to summarise a log (default false)."
+                        },
+                        "origin": {
+                            "type": "string",
+                            "description": "Only this source root tag."
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            },
             // ── Core Lookup Tools (Original 4) ────────────────────────────────────
             {
                 "name": "get_item",
@@ -384,9 +610,8 @@ fn tools_list_result() -> Value {
                 "name": "get_variants",
                 "description": "Get every variant of a named enum with full details. \
                                 Returns all variants with their field types and documentation. \
-                                **Primary use case for Quartz workflows**: call this before writing an Action, \
-                                Condition, or GameEvent to find the exact variant you need. \
-                                E.g., get_variants({\"name\": \"Action\"}) to see all available actions.",
+                                Call it before matching on or constructing an enum, so you use a \
+                                variant that exists rather than inventing one.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -492,7 +717,7 @@ fn tools_list_result() -> Value {
                         },
                         "origin": {
                             "type": "string",
-                            "description": "Optional origin filter: e.g. 'quartz', 'synful-quartz', 'path-forge'."
+                            "description": "Optional source root tag, to search one root only."
                         }
                     },
                     "required": ["hint"]
@@ -505,6 +730,16 @@ fn tools_list_result() -> Value {
     // is valid on any Rust project. There is nothing left to gate on engine name:
     // the hand-curated Quartz knowledge that used to be served here now lives in
     // cortex, where it is queryable and can be updated without a recompile.
+    //
+    // Every tool only reads, and says so. Claude Code treats an MCP tool without
+    // `readOnlyHint` as a writer: plan mode refuses it ("Cannot call ... while
+    // in plan mode") while Grep and Read go through, and its calls never run in
+    // parallel. A default the agent cannot use in plan mode is not a default.
+    if let Some(tools) = full["tools"].as_array_mut() {
+        for tool in tools {
+            tool["annotations"] = json!({ "readOnlyHint": true });
+        }
+    }
     full
 }
 
@@ -514,6 +749,7 @@ fn tools_call(
     params: &Value,
     items: &[ApiItem],
     state: &Resolved,
+    nav: &mut Nav,
 ) -> Result<Value, String> {
     let tool_name = params["name"]
         .as_str()
@@ -541,6 +777,10 @@ fn tools_call(
         "get_return_type_usage"       => tool_get_return_type_usage(&args, items),
         "find_related_types"          => tool_find_related_types(&args, items),
         "trace_across_languages"      => tool_trace_across_languages(&args, items, sources),
+        "get_source"                  => tool_get_source(&args, sources, nav),
+        "find_references"             => tool_find_references(&args, sources, nav),
+        "get_outline"                 => tool_get_outline(&args, sources, nav),
+        "search_code"                 => tool_search_code(&args, sources, nav),
         // ── Phase 1 additions ──
         other                         => Err(format!("unknown tool: {other}")),
     }?;
@@ -551,6 +791,103 @@ fn tools_call(
 }
 
 // ── Tool implementations ──────────────────────────────────────────────────────
+
+/// The roots a navigation call searches: all of them, or those whose origin
+/// tag matches `origin`.
+fn nav_roots(args: &Value, sources: &[(PathBuf, String, bool)]) -> Result<Vec<(PathBuf, String, bool)>, String> {
+    match args["origin"].as_str().filter(|o| !o.is_empty()) {
+        None => Ok(sources.to_vec()),
+        Some(o) => {
+            let roots: Vec<_> = sources.iter().filter(|(_, t, _)| t.eq_ignore_ascii_case(o)).cloned().collect();
+            if roots.is_empty() {
+                let mut tags: Vec<&str> = sources.iter().map(|(_, t, _)| t.as_str()).collect();
+                tags.sort();
+                tags.dedup();
+                return Err(format!("no source root has origin `{o}`; origins: {}", tags.join(", ")));
+            }
+            Ok(roots)
+        }
+    }
+}
+
+/// A usize argument given as a number or a numeric string.
+fn arg_usize(args: &Value, key: &str) -> Option<usize> {
+    match &args[key] {
+        Value::Number(n) => n.as_u64().map(|v| v as usize),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn tool_get_source(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut Nav) -> Result<String, String> {
+    let roots = nav_roots(args, sources)?;
+    let Some(name) = args["name"].as_str().filter(|n| !n.trim().is_empty()) else {
+        // No name: read `file` by line numbers.
+        let file = args["file"].as_str().filter(|f| !f.trim().is_empty()).ok_or(
+            "give a `name` to show its definition, or a `file` (and `lines`) to read",
+        )?;
+        let lines = match &args["lines"] {
+            Value::Null => None,
+            Value::Number(n) => Some(n.to_string()),
+            Value::String(s) => Some(s.clone()),
+            _ => return Err("`lines` must look like \"120-160\"".into()),
+        };
+        let max_lines = arg_usize(args, "max_lines").unwrap_or(nav::DEFAULT_READ_LINES).clamp(10, 5000);
+        return Ok(nav.read_lines(&roots, &file.replace('\\', "/"), lines.as_deref(), max_lines));
+    };
+    let lines = match &args["lines"] {
+        Value::Null => None,
+        Value::Number(n) => n.as_u64().map(|v| (v as usize, v as usize)),
+        Value::String(s) if s.trim().is_empty() => None,
+        Value::String(s) => Some(nav::parse_range(s).ok_or_else(|| format!("`lines` must look like \"120-160\", got `{s}`"))?),
+        _ => return Err("`lines` must look like \"120-160\"".into()),
+    };
+    let max_lines = arg_usize(args, "max_lines").unwrap_or(nav::DEFAULT_MAX_LINES).clamp(10, 1000);
+    let file = args["file"].as_str().filter(|f| !f.is_empty()).map(|f| f.replace('\\', "/"));
+    Ok(nav.get_source(&roots, name, file.as_deref(), lines, max_lines))
+}
+
+fn tool_find_references(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut Nav) -> Result<String, String> {
+    let name = args["name"].as_str().filter(|n| !n.trim().is_empty()).ok_or("missing `name`")?;
+    let roots = nav_roots(args, sources)?;
+    let include_comments = args["include_comments"].as_bool().unwrap_or(false);
+    let limit = arg_usize(args, "limit").unwrap_or(nav::DEFAULT_REF_LIMIT).clamp(1, 2000);
+    let file = args["file"].as_str().filter(|f| !f.is_empty()).map(|f| f.replace('\\', "/"));
+    Ok(nav.find_references(&roots, name, file.as_deref(), include_comments, limit))
+}
+
+fn tool_search_code(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut Nav) -> Result<String, String> {
+    let pattern = args["pattern"].as_str().filter(|p| !p.is_empty()).ok_or("missing `pattern`")?;
+    let roots = nav_roots(args, sources)?;
+    let output = match args["output"].as_str().unwrap_or("lines") {
+        "" | "lines" => nav::SearchOutput::Lines,
+        "files" => nav::SearchOutput::Files,
+        "count" => nav::SearchOutput::Count,
+        other => return Err(format!("`output` is lines, files or count, not `{other}`")),
+    };
+    let text = |k: &str| args[k].as_str().map(str::trim).filter(|v| !v.is_empty()).map(|v| v.replace('\\', "/"));
+    let opts = nav::SearchOpts {
+        paths: text("path").into_iter().collect(),
+        glob: text("glob"),
+        ignore_case: args["ignore_case"].as_bool().unwrap_or(false),
+        word: args["word"].as_bool().unwrap_or(false),
+        fixed: args["fixed"].as_bool().unwrap_or(false),
+        basic: false,
+        context: arg_usize(args, "context").unwrap_or(0).min(50),
+        before: None,
+        after: None,
+        head: None,
+        output,
+        limit: arg_usize(args, "limit").unwrap_or(nav::DEFAULT_REF_LIMIT).clamp(1, 5000),
+        collapse: args["collapse"].as_bool(),
+    };
+    Ok(nav.search(&roots, pattern, &opts))
+}
+
+fn tool_get_outline(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut Nav) -> Result<String, String> {
+    let path = args["path"].as_str().filter(|p| !p.trim().is_empty()).ok_or("missing `path`")?;
+    Ok(nav.outline(sources, &path.replace('\\', "/")))
+}
 
 /// One line that says exactly which of several same-named items this is.
 ///
@@ -1538,4 +1875,26 @@ fn tool_trace_across_languages(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tool_list_tests {
+    use super::tools_list_result;
+
+    /// Plan mode refuses an MCP tool that does not declare itself read-only,
+    /// and only the navigation tools are loaded without a tool search.
+    #[test]
+    fn every_tool_reads_only_and_the_navigation_tools_load_with_the_session() {
+        let list = tools_list_result();
+        let tools = list["tools"].as_array().expect("tools array");
+        for tool in tools {
+            assert_eq!(tool["annotations"]["readOnlyHint"], true, "{}", tool["name"]);
+            let always = tool["_meta"]["anthropic/alwaysLoad"] == true;
+            let nav = matches!(
+                tool["name"].as_str(),
+                Some("get_source" | "find_references" | "get_outline" | "search_code")
+            );
+            assert_eq!(always, nav, "{}", tool["name"]);
+        }
+    }
 }

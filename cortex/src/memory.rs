@@ -64,7 +64,9 @@ mirror_consolidation_threshold = 0.75
 /// Bump it whenever a migration rewrites existing data or needs one-time work,
 /// and add that work to `Store::open`. A database behind this number gets a
 /// fresh pre-migration backup, so every bump is protected, not only the first.
-const SCHEMA_VERSION: i32 = 1;
+// 2: the self-learning loop's ledger (loop_changes, loop_audits, loop_evaluators,
+//    capture_offsets) and challenges.source.
+const SCHEMA_VERSION: i32 = 2;
 
 pub struct Store {
     conn: Connection,
@@ -244,7 +246,10 @@ impl Store {
             }
         }
 
-        eprintln!("[cortex] First-run setup complete. See README.md for the recommended copilot-instructions.md snippet.");
+        eprintln!(
+            "[cortex] First-run setup complete. `{}` adds the cortex_suite section to CLAUDE.md and .github/copilot-instructions.md.",
+            crate::cache::launcher_command("instructions")
+        );
         Ok(())
     }
 
@@ -1124,7 +1129,44 @@ impl Store {
         self.ensure_edit_guard_file_column()?;
         self.ensure_upgrade_columns()?;
         self.ensure_push_delivery_schema()?;
+        self.ensure_walls_schema()?;
+        self.ensure_loop_schema()?;
 
+        Ok(())
+    }
+
+    /// The walls ledger (`walls.rs`), and `challenges.wall_id`, which links a
+    /// settled limit dispute to the wall it was about (idempotent, additive).
+    /// The self-learning loop's ledger, and `challenges.source`: `hook` when the
+    /// UserPromptSubmit hook noted a challenge, `agent` when the agent noted one
+    /// the hook missed -- the miss label cue tuning learns from.
+    fn ensure_loop_schema(&self) -> Result<()> {
+        self.conn.execute_batch(crate::loop_ledger::SCHEMA)?;
+        self.conn.execute_batch(crate::reconcile::SCHEMA)?;
+        self.conn.execute_batch(crate::maintenance::SCHEMA)?;
+        let has_source: bool = self
+            .conn
+            .prepare("PRAGMA table_info(challenges)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|c| c == "source");
+        if !has_source {
+            self.conn.execute("ALTER TABLE challenges ADD COLUMN source TEXT NOT NULL DEFAULT 'hook'", [])?;
+        }
+        Ok(())
+    }
+
+    fn ensure_walls_schema(&self) -> Result<()> {
+        self.conn.execute_batch(crate::walls::SCHEMA)?;
+        let has_link: bool = self
+            .conn
+            .prepare("PRAGMA table_info(challenges)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|c| c.ok())
+            .any(|c| c == "wall_id");
+        if !has_link {
+            self.conn.execute("ALTER TABLE challenges ADD COLUMN wall_id INTEGER", [])?;
+        }
         Ok(())
     }
 

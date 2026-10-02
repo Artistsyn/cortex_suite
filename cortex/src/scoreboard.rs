@@ -115,6 +115,28 @@ pub struct TokenWindow {
     /// cortex hook calls the host reported as failed (server not connected,
     /// unknown tool, unparseable output).
     pub cortex_hook_errors: i64,
+    /// Guards for earlier compaction (docs/token-efficiency-2026-09-30.md §5).
+    /// Context growth over the 30 calls after a compaction, and elsewhere: a
+    /// summary that loses state shows up as the agent re-reading it.
+    pub post_compact_growth: i64,
+    pub post_compact_calls: i64,
+    pub other_growth: i64,
+    pub other_calls: i64,
+    /// Prompts a person typed (not tool results, reminders or summaries).
+    pub user_turns: i64,
+    /// Navigation: quartz-ctx calls against the shell reads they replace.
+    pub nav_calls: i64,
+    pub grep_calls: i64,
+    pub sed_reads: i64,
+    /// Bash calls quartz-ctx answered through the PreToolUse hook (their ids
+    /// are in .cortex/nav-rewrites.jsonl). The transcript keeps the command as
+    /// written, so these are also inside the grep and sed counts.
+    pub hook_answered: i64,
+    /// Calls whose only purpose is waiting (`sleep`).
+    pub wait_calls: i64,
+    /// The bill at list prices, for models with a known price.
+    pub cost_usd: f64,
+    pub unpriced_calls: i64,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -143,6 +165,14 @@ pub struct Scoreboard {
     pub skills_candidate: i64,
     pub skills_drafted: i64,
     pub skills_approved: i64,
+    /// The self-learning loop (docs/self-learning-loop-2026-09-30.md).
+    pub loop_auto_commit: bool,
+    pub loop_counts: Vec<(String, String, i64)>,
+    pub loop_audited: i64,
+    pub loop_bad_in_window: i64,
+    pub loop_unaudited: i64,
+    /// Capture hook: runs, runs that found markers, last run (unix seconds).
+    pub capture_hook: Option<(i64, i64, i64)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenLedger>,
 }
@@ -327,6 +357,19 @@ pub fn compute(store: &Store, window_days: u32) -> Result<Scoreboard> {
         skills_candidate: count("SELECT COUNT(*) FROM skill_candidates WHERE status = 'candidate'"),
         skills_drafted: count("SELECT COUNT(*) FROM skill_candidates WHERE status = 'drafted'"),
         skills_approved: count("SELECT COUNT(*) FROM skill_candidates WHERE status = 'approved'"),
+        loop_auto_commit: crate::loop_ledger::auto_commit_enabled(store),
+        loop_counts: crate::loop_ledger::counts(store),
+        loop_audited: crate::loop_ledger::audit_stats(store).0,
+        loop_bad_in_window: crate::loop_ledger::audit_stats(store).1,
+        loop_unaudited: crate::loop_ledger::unaudited(store),
+        capture_hook: store
+            .conn()
+            .query_row(
+                "SELECT fired, matched, last_fired FROM hook_heartbeat WHERE hook = 'capture_markers'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok(),
         tokens: None,
     })
 }
@@ -395,10 +438,55 @@ fn text_len(content: &serde_json::Value) -> i64 {
     }
 }
 
+/// List prices per million tokens: (input, 5-minute cache write, 1-hour cache
+/// write, cache read, output). Only models whose prices were checked against
+/// Anthropic's pricing page on 2026-09-30; anything else is counted, not priced.
+fn price_of(model: &str) -> Option<(f64, f64, f64, f64, f64)> {
+    if model.starts_with("claude-opus-5-5") {
+        Some((4.0, 5.0, 8.0, 0.20, 20.0))
+    } else if model.starts_with("claude-opus-5") {
+        Some((5.0, 6.25, 10.0, 0.50, 25.0))
+    } else {
+        None
+    }
+}
+
+/// What a Bash command does, for the navigation and waiting counts.
+fn bash_kind(command: &str) -> Option<&'static str> {
+    let mut c = command.trim();
+    while let Some(rest) = c.strip_prefix("cd ") {
+        match rest.find("&&") {
+            Some(i) => c = rest[i + 2..].trim_start(),
+            None => break,
+        }
+    }
+    let first = c.lines().next().unwrap_or("");
+    if first.starts_with("grep ") || first.starts_with("rg ") || first.starts_with("egrep ") {
+        Some("grep")
+    } else if first.contains("sed -n") && first.chars().any(|ch| ch.is_ascii_digit()) && first.contains('p') {
+        Some("sed")
+    } else if first.starts_with("sleep ") {
+        Some("wait")
+    } else {
+        None
+    }
+}
+
+/// Tool-use ids of the Bash calls quartz-ctx's nav hook rewrote, from the
+/// ledger it appends to. A missing or unreadable ledger is an empty set.
+pub fn nav_rewrite_ids(ledger: &Path) -> HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(ledger) else { return HashSet::new() };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("tool_use_id").and_then(|x| x.as_str()).map(str::to_string))
+        .collect()
+}
+
 /// Read the bill that was actually paid, per window, from transcript `usage`
 /// fields. Lines before the previous window are skipped without parsing, so the
 /// cost is proportional to recent activity, not to transcript size.
-pub fn token_ledger(dir: &Path, window_days: u32) -> Result<TokenLedger> {
+/// `rewritten` holds the Bash calls quartz-ctx answered (`nav_rewrite_ids`).
+pub fn token_ledger(dir: &Path, window_days: u32, rewritten: &HashSet<String>) -> Result<TokenLedger> {
     let now = Utc::now().timestamp();
     let w = window_days as i64 * 86400;
     let (prev_start, cur_start) = (now - 2 * w, now - w);
@@ -427,6 +515,10 @@ pub fn token_ledger(dir: &Path, window_days: u32) -> Result<TokenLedger> {
         // Resident tool-result chars by source since the last compaction.
         let (mut res_cortex, mut res_bash) = (0i64, 0i64);
         let mut first_call_seen = false;
+        // Calls still inside the 30 that follow a compaction, and the last
+        // call's context size (None right after a boundary).
+        let mut post_left = 0i64;
+        let mut prev_ctx: Option<i64> = None;
 
         for line in reader.lines() {
             let Ok(line) = line else { continue };
@@ -441,6 +533,31 @@ pub fn token_ledger(dir: &Path, window_days: u32) -> Result<TokenLedger> {
                 win.compactions += 1;
                 res_cortex = 0;
                 res_bash = 0;
+                post_left = 30;
+                prev_ctx = None;
+                continue;
+            }
+            // A prompt a person typed: a user record with no tool result, not
+            // injected and not a compaction summary.
+            if line.contains("\"type\":\"user\"")
+                && !line.contains("\"tool_result\"")
+                && !line.contains("\"isMeta\":true")
+                && !line.contains("\"isCompactSummary\":true")
+                && !line.contains("\"isSidechain\":true")
+            {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let typed = match v.get("message").and_then(|m| m.get("content")) {
+                        Some(serde_json::Value::String(t)) => !t.trim_start().starts_with('<'),
+                        Some(serde_json::Value::Array(parts)) => parts.iter().any(|p| {
+                            p.get("type").and_then(|x| x.as_str()) == Some("text")
+                                && p.get("text").and_then(|x| x.as_str()).is_some_and(|t| !t.trim_start().starts_with('<'))
+                        }),
+                        _ => false,
+                    };
+                    if typed {
+                        win.user_turns += 1;
+                    }
+                }
                 continue;
             }
             // Hook attachments: what the host did with cortex's hook output.
@@ -470,6 +587,20 @@ pub fn token_ledger(dir: &Path, window_days: u32) -> Result<TokenLedger> {
                                 b.get("name").and_then(|x| x.as_str()),
                             ) {
                                 tool_names.insert(id.to_string(), source_of(name));
+                                if name.starts_with("mcp__quartz-ctx__") {
+                                    win.nav_calls += 1;
+                                } else if name == "Bash" {
+                                    if rewritten.contains(id) {
+                                        win.hook_answered += 1;
+                                    }
+                                    let cmd = b.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or("");
+                                    match bash_kind(cmd) {
+                                        Some("grep") => win.grep_calls += 1,
+                                        Some("sed") => win.sed_reads += 1,
+                                        Some("wait") => win.wait_calls += 1,
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                     }
@@ -488,6 +619,39 @@ pub fn token_ledger(dir: &Path, window_days: u32) -> Result<TokenLedger> {
                 win.cache_write += write;
                 win.cache_read += read;
                 win.output += g("output_tokens");
+                let ctx = fresh + write + read;
+                if let Some(p) = prev_ctx {
+                    let grew = (ctx - p).clamp(0, 100_000);
+                    if post_left > 0 {
+                        win.post_compact_growth += grew;
+                        win.post_compact_calls += 1;
+                    } else {
+                        win.other_growth += grew;
+                        win.other_calls += 1;
+                    }
+                }
+                post_left = (post_left - 1).max(0);
+                prev_ctx = Some(ctx);
+                let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("");
+                match price_of(model) {
+                    Some((p_in, p_w5, p_w1h, p_read, p_out)) => {
+                        let cc = u.get("cache_creation");
+                        let w1h = cc.and_then(|c| c.get("ephemeral_1h_input_tokens")).and_then(|x| x.as_i64());
+                        let w5 = cc.and_then(|c| c.get("ephemeral_5m_input_tokens")).and_then(|x| x.as_i64());
+                        // Without the split, Claude Code's writes are 1-hour.
+                        let (w1h, w5) = match (w1h, w5) {
+                            (None, None) => (write, 0),
+                            (a, b) => (a.unwrap_or(0), b.unwrap_or(0)),
+                        };
+                        win.cost_usd += (fresh as f64 * p_in
+                            + w5 as f64 * p_w5
+                            + w1h as f64 * p_w1h
+                            + read as f64 * p_read
+                            + g("output_tokens") as f64 * p_out)
+                            / 1e6;
+                    }
+                    None => win.unpriced_calls += 1,
+                }
                 win.reread_cortex += res_cortex / 4;
                 win.reread_bash += res_bash / 4;
                 if !first_call_seen {
@@ -652,11 +816,33 @@ pub fn format_text(sb: &Scoreboard) -> String {
 
     o.push_str("\n  CAPTURE\n");
     o.push_str(&format!(
-        "    Markers committed: {} (prev {})   per worked session: {:.1}\n",
+        "    Markers logged: {} (prev {})   per worked session: {:.1}\n",
         c.markers_captured,
         p.markers_captured,
         ratio(c.markers_captured, c.sessions_worked)
     ));
+
+    o.push_str(&format!(
+        "\n  LOOP (automatic learning, audited by sample)\n\
+         \x20   Automatic commit: {}   audited: {}   wrong/useless in the last {}: {} (off above {})   unaudited: {}\n",
+        if sb.loop_auto_commit { "on" } else { "OFF" },
+        sb.loop_audited,
+        crate::loop_ledger::AUDIT_WINDOW,
+        sb.loop_bad_in_window,
+        crate::loop_ledger::AUDIT_MAX_BAD,
+        sb.loop_unaudited
+    ));
+    if !sb.loop_counts.is_empty() {
+        let parts: Vec<String> = sb.loop_counts.iter().map(|(c, st, n)| format!("{c}/{st} {n}")).collect();
+        o.push_str(&format!("    Ledger: {}\n", parts.join(", ")));
+    }
+    match sb.capture_hook {
+        Some((fired, matched, last)) => o.push_str(&format!(
+            "    Capture hook: ran {fired}x, found markers {matched}x, last {:.1}h ago\n",
+            (Utc::now().timestamp() - last) as f64 / 3600.0
+        )),
+        None => o.push_str("    ! Capture hook has never run: markers reach the store only at closeout\n"),
+    }
 
     o.push_str(&format!(
         "\n  STORE (live entries only): {} patterns ({} retired), {} anti-patterns ({} retired)\n\
@@ -727,6 +913,45 @@ fn format_tokens(t: &TokenLedger) -> String {
         "    Host-confirmed cortex context deliveries: {} (prev {})   cortex hook errors: {} (prev {})\n",
         c.cortex_contexts_delivered, p.cortex_contexts_delivered, c.cortex_hook_errors, p.cortex_hook_errors
     ));
+    o.push_str(&format_guards(c, p));
+    o
+}
+
+/// The numbers that decide whether earlier compaction and the navigation
+/// tools are paying (docs/token-efficiency-2026-09-30.md §5).
+fn format_guards(c: &TokenWindow, p: &TokenWindow) -> String {
+    let per = |n: i64, d: i64| if d > 0 { n / d } else { 0 };
+    let tok = |n: i64| format!("{:.2}k", n as f64 / 1000.0);
+    let per_turn = |w: &TokenWindow| if w.user_turns > 0 { w.api_calls as f64 / w.user_turns as f64 } else { 0.0 };
+    // Baselines measured by THIS code over the 7 days to 2026-09-30, before the
+    // compaction window, the navigation tools and the ranked listings shipped.
+    let mut o = String::from("\n  GUARDS (docs/token-efficiency-2026-09-30.md §5)\n");
+    o.push_str(&format!(
+        "    Context growth per call: {} in the 30 calls after a compaction vs {} elsewhere (prev {} vs {}; baseline 3.24k vs 2.32k)\n",
+        tok(per(c.post_compact_growth, c.post_compact_calls)),
+        tok(per(c.other_growth, c.other_calls)),
+        tok(per(p.post_compact_growth, p.post_compact_calls)),
+        tok(per(p.other_growth, p.other_calls)),
+    ));
+    o.push_str(&format!(
+        "    Calls per user turn: {:.1} (prev {:.1}; baseline 31.1)   compactions: {} (prev {})\n",
+        per_turn(c), per_turn(p), c.compactions, p.compactions
+    ));
+    o.push_str(&format!(
+        "    Navigation: quartz-ctx calls {} (prev {}) vs Bash greps {} and sed range reads {} (prev {} and {}; baseline 15 vs 3,083 and 2,940)   waiting with sleep: {} (prev {})\n",
+        c.nav_calls, p.nav_calls, c.grep_calls, c.sed_reads, p.grep_calls, p.sed_reads, c.wait_calls, p.wait_calls
+    ));
+    o.push_str(&format!(
+        "      of those shell reads, answered by quartz-ctx through the Bash hook: {} (prev {})\n",
+        c.hook_answered, p.hook_answered
+    ));
+    o.push_str(&format!(
+        "    At list prices: ${:.0} (prev ${:.0}){}\n",
+        c.cost_usd,
+        p.cost_usd,
+        if c.unpriced_calls > 0 { format!("; {} call(s) on models without a checked price left out", c.unpriced_calls) } else { String::new() }
+    ));
+    o.push_str("    Step back a compaction stage if growth after a compaction or calls per turn rise over 50% above baseline.\n");
     o
 }
 
@@ -882,10 +1107,17 @@ mod tests {
             format!(r#"{{"type":"attachment","timestamp":"{ts}","attachment":{{"type":"hook_additional_context","content":["[cortex] a.rs touches a recorded trap #1"],"hookName":"PostToolUse:Edit"}}}}"#),
             format!(r#"{{"type":"attachment","timestamp":"{ts}","attachment":{{"type":"hook_non_blocking_error","stderr":"MCP server 'cortex' not connected","hookName":"PostToolUse:Bash"}}}}"#),
             format!(r#"{{"type":"attachment","timestamp":"{ts}","attachment":{{"type":"hook_additional_context","content":["No preview server is running."],"hookName":"PostToolUse:Edit"}}}}"#),
+            // A later record of response m3 with two greps; quartz-ctx's hook
+            // answered the first.
+            format!(r#"{{"type":"assistant","timestamp":"{ts}","message":{{"id":"m3","content":[{{"type":"tool_use","id":"b1","name":"Bash","input":{{"command":"grep -n foo src/a.rs"}}}},{{"type":"tool_use","id":"b2","name":"Bash","input":{{"command":"grep -rn bar ."}}}}],"usage":{{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":5}}}}}}"#),
         ];
         std::fs::write(dir.join("s.jsonl"), lines.join("\n")).unwrap();
-        let l = token_ledger(&dir, 14).unwrap();
+        // The real ledger lives in .cortex/, not among the transcripts.
+        let ledger = std::env::temp_dir().join(format!("cortex_nav_rewrites_{}.jsonl", std::process::id()));
+        std::fs::write(&ledger, "{\"at\":\"1\",\"kinds\":[\"search\"],\"session_id\":\"s\",\"tool_use_id\":\"b1\"}\nnot json\n").unwrap();
+        let l = token_ledger(&dir, 14, &nav_rewrite_ids(&ledger)).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&ledger).ok();
         let c = &l.current;
         assert_eq!(c.api_calls, 3, "a response split over records counts once");
         assert_eq!(c.cache_read, 1500);
@@ -895,6 +1127,8 @@ mod tests {
         assert_eq!(c.first_call_context_median, 1010);
         assert_eq!(c.cortex_contexts_delivered, 1, "only cortex's own delivered context counts");
         assert_eq!(c.cortex_hook_errors, 1);
+        assert_eq!((c.grep_calls, c.hook_answered), (2, 1), "a rewritten grep is still a grep, and is counted as answered");
+        assert!(nav_rewrite_ids(&dir.join("absent.jsonl")).is_empty());
     }
 
     #[test]

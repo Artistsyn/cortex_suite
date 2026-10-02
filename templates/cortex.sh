@@ -345,7 +345,7 @@ doctor|selfcheck|status|recall|health-report|graph-diff|meta|prune|review|crysta
 consolidate|correction|cluster-sessions|detect-skills|propose-gaps|propose-survival|\
 consolidate-pipeline|consolidate-if-stale|review-proposals|skill-status|skill-approve|\
 skill-reject|recurring-dismiss|proposal-approve|proposal-reject|scoreboard|pattern|anti-pattern|prefs|annotate|context|graph|index|watch|\
-fired|refresh|knowledge-drift|graphify-serve|hooks-init)
+fired|refresh|knowledge-drift|graphify-serve|hooks-init|walls|knowledge|instructions|reload-servers)
     # `fired` is on this list because it was documented as a launcher command
     # and was not on it: an unlisted command falls through to the help text
     # below, which prints and exits 0. Asking "has this mechanism ever actually
@@ -375,7 +375,16 @@ cortex launcher (bash) - workspace: $NAME
   fired         which mechanisms have actually run, and which are silently idle
   hooks-init    install or upgrade the Claude Code hooks (.claude/settings.local.json);
                 --vscode for VS Code Copilot (.github/hooks/cortex.json)
+  instructions  add or update the cortex_suite section of CLAUDE.md and
+                .github/copilot-instructions.md, leaving the rest of each file alone
+                (--check reports only, --force replaces a hand-edited section,
+                --adopt converts a copy made before the section markers)
+  reload-servers  move running MCP servers that predate self-updating onto the
+                binary on disk (--dry-run lists them); newer ones move themselves
   skill-status  drafts awaiting review   skill-approve <name>
+  walls         limits on record: list | show <id> | import <file.json>
+  knowledge     the self-learning loop: status | audit | undo <ap:id> | restore | auto-commit [on|off]
+                | capture <transcript> | backfill [--write] | coverage | changes
   -- <args>     pass anything straight through to the binary
 
   Overrides: CORTEX_NAME, CORTEX_DB

@@ -13,6 +13,7 @@ mod graph;
 mod graph_diff;
 mod graphify_proxy;
 mod indexer;
+mod instructions;
 mod knowledge;
 mod markers;
 mod memory;
@@ -35,6 +36,16 @@ mod search;
 mod session_store;
 mod skills;
 mod verify;
+mod walls;
+mod loop_ledger;
+mod capture;
+mod restore;
+mod knowledge_sim;
+mod reconcile;
+mod reload;
+mod maintenance;
+mod cue_miner;
+mod skill_triage;
 mod watcher;
 
 use std::collections::{HashSet, VecDeque};
@@ -114,6 +125,17 @@ enum Command {
     /// Annotation management.
     #[command(subcommand)]
     Annotate(AnnotateCmd),
+
+    /// The walls ledger: limits recorded with whose limit they are, their
+    /// evidence, and the cheapest test that would decide them.
+    #[command(subcommand)]
+    Walls(WallsCmd),
+
+    /// The self-learning loop: knowledge committed without per-item approval,
+    /// its sample audit and undo, transcript capture, backfill and coverage
+    /// (docs/self-learning-loop-2026-09-30.md).
+    #[command(subcommand)]
+    Knowledge(KnowledgeCmd),
 
     /// Print the indexed sources from .cortex/index-sources.json as TSV.
     ///
@@ -384,6 +406,43 @@ enum Command {
         /// They run `cortex hook`, because VS Code runs command hooks only.
         #[arg(long)]
         vscode: bool,
+    },
+    /// Put running cortex and quartz-ctx MCP servers on the binary now on disk.
+    /// Stops idle servers of Claude Code sessions that run a replaced binary;
+    /// each starts again on its session's next call to it. The session keeps
+    /// its tool list until it gets a fresh connection (/mcp reconnect in a
+    /// terminal; restarting the desktop app, which cannot). Servers built
+    /// from this version on move themselves onto a rebuild while idle, so this
+    /// is for older ones.
+    ReloadServers {
+        /// List what would be stopped and stop nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Add or update the cortex_suite section of CLAUDE.md and
+    /// .github/copilot-instructions.md. Only the text between the section's
+    /// markers is ours: the rest of each file is left as it is, and a missing
+    /// file is written from the template.
+    Instructions {
+        /// Workspace root (default: current dir).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Report what would change and write nothing; exits 1 if anything would
+        /// change or waits on a decision.
+        #[arg(long)]
+        check: bool,
+        /// Also replace a section that was edited by hand (the old file is kept
+        /// under .cortex/backups/).
+        #[arg(long)]
+        force: bool,
+        /// Convert a copy made before the section markers existed: its
+        /// cortex_suite sections are replaced by the managed one (the old file
+        /// is kept under .cortex/backups/).
+        #[arg(long)]
+        adopt: bool,
+        /// Project name for a new file's title (default: the root's folder name).
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// Run cortex's hooks as a command, for hosts that cannot call an MCP tool
@@ -749,6 +808,118 @@ enum AntiPatternCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum WallsCmd {
+    /// Every wall, one line each, with this project's base rate.
+    List,
+    /// One wall in full.
+    Show { id: i64 },
+    /// Record walls from a JSON array of {claim, provenance, evidence, ...}.
+    /// Claims already on record are skipped; refused entries are listed.
+    Import { file: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum KnowledgeCmd {
+    /// Automatic commit, audit precision, the ledger's counts, capture health.
+    Status,
+    /// Audit automatically committed entries. With no arguments, walks a random
+    /// sample and asks r(ight) / w(rong) / u(seless) / s(kip) for each. A wrong
+    /// or useless entry is taken out of service on the spot.
+    Audit {
+        /// Answer one directly: a loop change id ...
+        change: Option<i64>,
+        /// ... and a verdict: right, wrong or useless.
+        verdict: Option<String>,
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Print the sample and exit.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Take an entry out of service: ap:<id> or pattern:<id>. Nothing is deleted.
+    /// `--class backfill` takes out everything the backfill brought in.
+    Undo {
+        entry: Option<String>,
+        #[arg(long)]
+        class: Option<String>,
+        #[arg(long, default_value = "undone by hand")]
+        reason: String,
+    },
+    /// Put a retracted or superseded entry back in service.
+    Restore { entry: String },
+    /// Show automatic commit, or switch it: on | off.
+    AutoCommit { state: Option<String> },
+    /// Capture the markers in one transcript now.
+    Capture { transcript: PathBuf },
+    /// Markers written in past transcripts that never reached the store.
+    Backfill {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Commit them, tagged `backfill`, after a VACUUM INTO backup.
+        #[arg(long)]
+        write: bool,
+    },
+    /// Markers written in recent transcripts, and how many the store holds.
+    Coverage {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 14)]
+        days: u32,
+    },
+    /// Look-alike entries never reconciled, and disputes. `--seed` opens the
+    /// pairs the loop would have opened had it been running; `--backtest`
+    /// replays the rules over the whole history.
+    Pairs {
+        #[arg(long)]
+        seed: bool,
+        #[arg(long)]
+        backtest: bool,
+    },
+    /// The week in one page (also written to .cortex/loop-digest.md).
+    Digest,
+    /// Issue the maintenance queue as the weekly run would, and print it.
+    /// It WRITES queue rows: run it against a copy of the store to preview.
+    Queue,
+    /// Skill drafts: reject noise, publish credible ones as trials, retire
+    /// trials nobody used in 60 days (plan L5). Runs in consolidation too.
+    Skills {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Challenge-cue tuning from labelled prompts (plan L4). Default: run the
+    /// miner on every labelled miss. `--fires` lists what fires, for labelling.
+    Cues {
+        /// Start from the lists as they were before the 2026-09-30 refinement.
+        #[arg(long)]
+        before: bool,
+        #[arg(long)]
+        fires: bool,
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        #[arg(long)]
+        labels: Option<PathBuf>,
+    },
+    /// The ledger: recent automated changes.
+    Changes {
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+    /// Register what judges a class of change, or check it is unchanged.
+    Evaluator {
+        #[command(subcommand)]
+        cmd: EvaluatorCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EvaluatorCmd {
+    /// Record the hash of these files or directories under a name.
+    Register { name: String, paths: Vec<PathBuf> },
+    /// Is it unchanged since it was registered?
+    Check { name: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum AnnotateCmd {
     List,
     Add {
@@ -785,6 +956,8 @@ fn main() -> Result<()> {
         Command::Pattern(cmd)      => run_pattern(cmd, &db_path, format),
         Command::AntiPattern(cmd)  => run_anti_pattern(cmd, &db_path, format),
         Command::Annotate(cmd)     => run_annotate(cmd, &db_path, format),
+        Command::Walls(cmd)        => run_walls(cmd, &db_path),
+        Command::Knowledge(cmd)    => run_knowledge(cmd, &db_path),
         Command::Manifest { repo } => run_manifest(&repo),
         Command::Refresh { repo }  => run_refresh(&repo, &db_path),
         Command::KnowledgeDrift    => {
@@ -846,8 +1019,45 @@ fn main() -> Result<()> {
         Command::HooksInit { root, shared, force, vscode } => {
             if vscode { run_hooks_init_vscode(root, &db_path) } else { run_hooks_init(root, shared, force) }
         }
+        Command::Instructions { root, check, force, adopt, name } => {
+            run_instructions(root, name, instructions::Opts { check, force, adopt }, format)
+        }
         Command::Hook { event } => run_hook(&db_path, event.as_deref()),
+        Command::ReloadServers { dry_run } => reload::run(dry_run),
     }
+}
+
+/// `cortex instructions`: the cortex_suite section of each instruction file
+/// added or brought up to date (src/instructions.rs). Exits 1 under --check
+/// when anything would change or waits on a decision, so CI can gate on it.
+fn run_instructions(
+    root: Option<PathBuf>,
+    name: Option<String>,
+    opts: instructions::Opts,
+    format: OutputFormat,
+) -> Result<()> {
+    let root = root.unwrap_or_else(|| PathBuf::from("."));
+    let project = name.unwrap_or_else(|| {
+        root.canonicalize()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "this project".to_string())
+    });
+    let check = opts.check;
+    let outcomes = instructions::sync(&root, &project, &opts)?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&outcomes)?),
+        OutputFormat::Text => {
+            for o in &outcomes {
+                let backup = o.backup.as_deref().map(|b| format!(" (previous version: {b})")).unwrap_or_default();
+                println!("{}: {}{backup}", o.file, o.action);
+            }
+        }
+    }
+    if check && outcomes.iter().any(|o| o.changed || o.attention) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn resolve_default_db_path() -> PathBuf {
@@ -902,7 +1112,11 @@ fn run_scoreboard(db_path: &Path, window_days: u32, no_tokens: bool, format: Out
         // The workspace is the directory holding .cortex/.
         let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
         match scoreboard::transcripts_dir_for(repo_root) {
-            Some(dir) => match scoreboard::token_ledger(&dir, window_days) {
+            Some(dir) => match scoreboard::token_ledger(
+                &dir,
+                window_days,
+                &scoreboard::nav_rewrite_ids(&db_path.with_file_name("nav-rewrites.jsonl")),
+            ) {
                 Ok(ledger) => sb.tokens = Some(ledger),
                 Err(e) => eprintln!("[cortex] token bill unavailable: {e}"),
             },
@@ -1035,6 +1249,54 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         }]
     });
 
+    // Knowledge captured when it is written (docs/self-learning-loop-2026-09-30.md,
+    // L1). Stop ends every turn; PreCompact comes just before a compaction, the
+    // moment markers not yet committed used to be lost (98 of 123 losses).
+    let capture_hook = |event: &str| -> Value {
+        json!({
+            "hooks": [{
+                "type": "mcp_tool",
+                "server": "cortex",
+                "tool": "capture_markers",
+                "input": { "transcript_path": "${transcript_path}", "hook_event_name": event }
+            }]
+        })
+    };
+    let stop_hook = capture_hook("Stop");
+    let precompact_hook = capture_hook("PreCompact");
+    // After a compaction, the state its summary blurs - files in play, the
+    // error still open, what went green - read back from the transcript
+    // (src/restore.rs). SessionStart's mcp_tool hooks are skipped at launch,
+    // before servers connect, but `compact` comes mid-session.
+    let restore_hook = json!({
+        "matcher": "compact",
+        "hooks": [{
+            "type": "mcp_tool",
+            "server": "cortex",
+            "tool": "restore_after_compact",
+            "input": { "transcript_path": "${transcript_path}", "hook_event_name": "SessionStart" }
+        }]
+    });
+    // Bash reads answered by quartz-ctx (quartz-ctx/src/rewrite.rs): a grep or
+    // `sed -n` of files it fully understands becomes the same search or read,
+    // grouped by the item each line sits in, at the same size (replayed on
+    // 1,200 real commands: recall 99.98% and 100%). A command hook, because it
+    // must hand back the whole tool input; `None` where no quartz-ctx is served.
+    // `|| true` because exit 2 from a PreToolUse hook BLOCKS the call, and clap
+    // exits 2 on an unknown subcommand: a quartz-ctx built before `nav` existed
+    // would stop every Bash call. Any failure must mean "run it as written".
+    let nav_hook = quartz_ctx_command(root).map(|qx| {
+        json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": format!("{qx} nav hook || true"), "timeout": 10 }]
+        })
+    });
+    for event in ["Stop", "PreCompact", "SessionStart", "PreToolUse"] {
+        hooks_obj
+            .entry(event.to_string())
+            .or_insert_with(|| Value::Array(vec![]));
+    }
+
     let names_tool = |entry: &Value, tool: &str| -> bool {
         entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
             hooks.iter().any(|h| {
@@ -1047,6 +1309,13 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     let is_guard = |e: &Value| names_tool(e, "edit_guard");
 
     let is_challenge = |e: &Value| names_tool(e, "note_challenge");
+    let is_capture = |e: &Value| names_tool(e, "capture_markers");
+    let is_restore = |e: &Value| names_tool(e, "restore_after_compact");
+    let is_nav = |e: &Value| {
+        e.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
+            hooks.iter().any(|h| h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains(" nav hook")))
+        })
+    };
 
     // A hook is up to date only if it is present AND byte-identical to what we
     // would write. Anything else is refreshed — including a hook from an older
@@ -1061,7 +1330,11 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     let up_to_date = post_now.iter().find(|e| is_compact(e)).is_some_and(|e| *e == compact_hook)
         && post_now.iter().find(|e| is_guard(e)).is_some_and(|e| *e == guard_hook)
         && failure_now.iter().find(|e| is_compact(e)).is_some_and(|e| *e == failure_hook)
-        && prompt_now.iter().find(|e| is_challenge(e)).is_some_and(|e| *e == challenge_hook);
+        && prompt_now.iter().find(|e| is_challenge(e)).is_some_and(|e| *e == challenge_hook)
+        && array_of(hooks_obj, "Stop").iter().find(|e| is_capture(e)).is_some_and(|e| *e == stop_hook)
+        && array_of(hooks_obj, "PreCompact").iter().find(|e| is_capture(e)).is_some_and(|e| *e == precompact_hook)
+        && array_of(hooks_obj, "SessionStart").iter().find(|e| is_restore(e)).is_some_and(|e| *e == restore_hook)
+        && nav_hook.as_ref().is_none_or(|h| array_of(hooks_obj, "PreToolUse").iter().find(|e| is_nav(e)) == Some(h));
     if !force && up_to_date {
         return Ok(HookOutcome::AlreadyPresent);
     }
@@ -1093,10 +1366,48 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     prompt_arr.retain(|e| !is_challenge(e));
     prompt_arr.push(challenge_hook);
 
+    for (event, hook) in [("Stop", stop_hook), ("PreCompact", precompact_hook)] {
+        let arr = hooks_obj
+            .get_mut(event)
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| anyhow::anyhow!("`hooks.{event}` in {filename} is not an array"))?;
+        arr.retain(|e| !is_capture(e));
+        arr.push(hook);
+    }
+    let start_arr = hooks_obj
+        .get_mut("SessionStart")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("`hooks.SessionStart` in {filename} is not an array"))?;
+    start_arr.retain(|e| !is_restore(e));
+    start_arr.push(restore_hook);
+    if let Some(nav_hook) = nav_hook {
+        let pre_arr = hooks_obj
+            .get_mut("PreToolUse")
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| anyhow::anyhow!("`hooks.PreToolUse` in {filename} is not an array"))?;
+        pre_arr.retain(|e| !is_nav(e));
+        pre_arr.push(nav_hook);
+    }
+
     let rendered = serde_json::to_string_pretty(&Value::Object(root_obj))?;
     std::fs::write(&settings_path, rendered)
         .with_context(|| format!("failed to write {}", settings_path.display()))?;
     Ok(HookOutcome::Written)
+}
+
+/// How a hook runs the workspace's quartz-ctx: the command `.mcp.json` serves
+/// it with, anchored at the project directory when relative. `None` when no
+/// quartz-ctx is configured or its binary is not there.
+fn quartz_ctx_command(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join(".mcp.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let cmd = v["mcpServers"]["quartz-ctx"]["command"].as_str()?;
+    let path = Path::new(cmd);
+    if path.is_absolute() {
+        path.is_file().then(|| quartz_ctx::rewrite::shell_quote(cmd))
+    } else {
+        root.join(path).is_file().then(|| format!("\"${{CLAUDE_PROJECT_DIR}}\"/{}", quartz_ctx::rewrite::shell_quote(cmd)))
+    }
 }
 
 fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()> {
@@ -1117,6 +1428,16 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
              correction cannot be quietly dropped by the party that received it. Records a \
              QUESTION, never a finding: nothing reaches memory until someone checks who was \
              right, and even then it arrives as a proposal.\n\
+             \x20 capture_markers on Stop and PreCompact — captures the CORTEX-* markers written \
+             in the transcript since the last capture and commits them through the closeout \
+             gates, so knowledge no longer waits for a closeout a compaction can outrun.\n\
+             \x20 restore_after_compact on SessionStart(compact) — after a compaction, reads back \
+             from the transcript what the summary blurs (latest requests, files edited, what went \
+             green, errors still open, verbatim) in at most ~1.5k tokens.\n\
+             \x20 quartz-ctx nav hook on PreToolUse(Bash), when .mcp.json serves quartz-ctx — a \
+             grep or `sed -n` of files it fully understands runs as the same search or read, \
+             grouped by the function each line sits in, at the same size. Anything else runs as \
+             written; QX_RAW=1 in a command, or QX_HOOK=off in the environment, opts out.\n\
              Restart Claude Code (or reload the session) for them to take effect.\n\
              Note: these are Claude Code hooks. VS Code Copilot cannot observe tool output or \
              edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
@@ -1169,7 +1490,8 @@ fn vscode_hooks_config(root: &Path, db_path: &Path) -> Result<Value> {
     Ok(json!({ "hooks": {
         "PreToolUse": entry("PreToolUse"),
         "PostToolUse": entry("PostToolUse"),
-        "UserPromptSubmit": entry("UserPromptSubmit")
+        "UserPromptSubmit": entry("UserPromptSubmit"),
+        "Stop": entry("Stop")
     }}))
 }
 
@@ -1234,7 +1556,15 @@ fn auto_install_hook_on_serve(repo: &Path) {
     // 2: added note_challenge on UserPromptSubmit
     // 3: added the Bash observer on PostToolUseFailure (failed commands never
     //    reach PostToolUse), and hook tools now answer in additionalContext JSON
-    const HOOK_SET_VERSION: u32 = 3;
+    // 4: added capture_markers on Stop and PreCompact (knowledge captured when
+    //    it is written, not when a closeout remembers it)
+    // 5: added restore_after_compact on SessionStart(compact) (state a
+    //    compaction's summary blurs, read back from the transcript)
+    // 6: added quartz-ctx's nav hook on PreToolUse(Bash) (greps and sed reads
+    //    answered from the source)
+    // 7: the nav hook ends `|| true`, so a quartz-ctx without `nav` cannot
+    //    block Bash
+    const HOOK_SET_VERSION: u32 = 7;
     let cortex_dir = repo.join(".cortex");
     let sentinel = cortex_dir.join(format!(".claude-hooks-installed.v{HOOK_SET_VERSION}"));
     if sentinel.exists() {
@@ -2945,6 +3275,389 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
     }
 }
 
+/// The workspace holding `.cortex/`, from the store's path.
+fn workspace_of(db_path: &Path) -> PathBuf {
+    let db = db_path.canonicalize().unwrap_or_else(|_| db_path.to_path_buf());
+    db.parent().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// One automatically committed entry, as the audit shows it.
+fn describe_entry(store: &Store, change: &loop_ledger::Change) -> String {
+    let text = match loop_ledger::parse_entry_ref(&change.target) {
+        Some(("anti_patterns", id)) => store
+            .conn()
+            .query_row(
+                "SELECT description || char(10) || '  wrong: ' || wrong || char(10) || '  correct: ' || correct
+                 FROM anti_patterns WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok(),
+        Some(("patterns", id)) => store
+            .conn()
+            .query_row(
+                "SELECT name || ' -- ' || intent || char(10) || '  ' || substr(body, 1, 500) FROM patterns WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok(),
+        _ => None,
+    };
+    format!(
+        "#{} [{}] {}\n  {}",
+        change.id,
+        change.class,
+        change.target,
+        text.unwrap_or_else(|| change.after.clone())
+    )
+}
+
+fn run_knowledge(cmd: KnowledgeCmd, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let root = workspace_of(db_path);
+    let prefs = root.join(".cortex").join("prefs.toml");
+    let prefs = prefs.exists().then_some(prefs.as_path());
+    let transcripts = |dir: Option<PathBuf>| -> Result<PathBuf> {
+        dir.or_else(|| scoreboard::transcripts_dir_for(&root))
+            .ok_or_else(|| anyhow::anyhow!("no transcripts directory for {}; pass --dir", root.display()))
+    };
+    match cmd {
+        KnowledgeCmd::Status => {
+            let on = loop_ledger::auto_commit_enabled(&store);
+            println!(
+                "Automatic commit: {}",
+                if on { "ON  (markers commit through the gates; a sample is audited)" }
+                else { "OFF (markers are captured and staged until a closeout with inline_approve)" }
+            );
+            let (audited, bad) = loop_ledger::audit_stats(&store);
+            println!(
+                "Audit: {audited} audited; {bad} wrong or useless in the last {} (off above {}); {} live entries unaudited",
+                loop_ledger::AUDIT_WINDOW,
+                loop_ledger::AUDIT_MAX_BAD,
+                loop_ledger::unaudited(&store)
+            );
+            let counts = loop_ledger::counts(&store);
+            if counts.is_empty() {
+                println!("Ledger: no automated changes yet");
+            } else {
+                let line: Vec<String> = counts.iter().map(|(c, st, n)| format!("{c}/{st} {n}")).collect();
+                println!("Ledger: {}", line.join(", "));
+            }
+            let beat: Option<(i64, i64, i64)> = store
+                .conn()
+                .query_row(
+                    "SELECT fired, matched, last_fired FROM hook_heartbeat WHERE hook = 'capture_markers'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            match beat {
+                Some((fired, matched, last)) => println!(
+                    "Capture hook: ran {fired} times, found markers {matched} times, last {:.1}h ago",
+                    (chrono::Utc::now().timestamp() - last) as f64 / 3600.0
+                ),
+                None => println!("Capture hook: has never run (`cortex hooks-init`, then restart Claude Code)"),
+            }
+            if let Some(err) = store.get_meta("loop.capture_error")?.filter(|e| !e.is_empty()) {
+                println!("Last capture error: {err}");
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Audit { change, verdict, note, list } => {
+            if let (Some(id), Some(v)) = (change, verdict.as_deref()) {
+                let v = loop_ledger::AuditVerdict::parse(v)
+                    .ok_or_else(|| anyhow::anyhow!("verdict must be right, wrong or useless"))?;
+                println!("{}", loop_ledger::record_audit(&store, id, v, &note)?);
+                return Ok(());
+            }
+            let sample = loop_ledger::audit_sample(&store, loop_ledger::AUDIT_SAMPLE)?;
+            if sample.is_empty() {
+                println!("Nothing to audit: every automatically committed entry has a verdict.");
+                return Ok(());
+            }
+            if list {
+                for c in &sample {
+                    println!("{}\n", describe_entry(&store, c));
+                }
+                println!("Answer with: cortex knowledge audit <id> right|wrong|useless");
+                return Ok(());
+            }
+            println!(
+                "{} entries committed without a person reading them. For each: r(ight), w(rong), u(seless), s(kip).\n",
+                sample.len()
+            );
+            let stdin = std::io::stdin();
+            for c in &sample {
+                println!("{}", describe_entry(&store, c));
+                print!("  > ");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                if stdin.read_line(&mut line)? == 0 {
+                    break;
+                }
+                match loop_ledger::AuditVerdict::parse(&line) {
+                    Some(v) => println!("  {}\n", loop_ledger::record_audit(&store, c.id, v, "")?),
+                    None => println!("  skipped\n"),
+                }
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Undo { entry, class, reason } => {
+            if let Some(class) = class {
+                let (done, skipped) = loop_ledger::retract_class(&store, &class, &reason)?;
+                println!("retracted {} `{class}` entr(ies); `cortex knowledge restore <ap:id>` undoes any one", done.len());
+                for s in &skipped {
+                    println!("  not retracted: {s}");
+                }
+                return Ok(());
+            }
+            let entry = entry.ok_or_else(|| anyhow::anyhow!("name an entry (ap:<id>) or pass --class"))?;
+            let (table, id) = loop_ledger::parse_entry_ref(&entry)
+                .ok_or_else(|| anyhow::anyhow!("expected ap:<id> or pattern:<id>, got `{entry}`"))?;
+            let change = loop_ledger::retract(&store, table, id, &reason, "")?;
+            println!("{table}:{id} retracted (ledger #{change}); `cortex knowledge restore {entry}` undoes this.");
+            Ok(())
+        }
+        KnowledgeCmd::Restore { entry } => {
+            let (table, id) = loop_ledger::parse_entry_ref(&entry)
+                .ok_or_else(|| anyhow::anyhow!("expected ap:<id> or pattern:<id>, got `{entry}`"))?;
+            println!("{}", loop_ledger::restore(&store, table, id)?);
+            Ok(())
+        }
+        KnowledgeCmd::AutoCommit { state } => {
+            match state.as_deref().map(str::to_lowercase).as_deref() {
+                None => println!("Automatic commit is {}", if loop_ledger::auto_commit_enabled(&store) { "on" } else { "off" }),
+                Some("on") => {
+                    loop_ledger::set_auto_commit(&store, true, "switched on by hand")?;
+                    println!("Automatic commit is on.");
+                }
+                Some("off") => {
+                    loop_ledger::set_auto_commit(&store, false, "switched off by hand")?;
+                    println!("Automatic commit is off: markers are captured and staged until approved.");
+                }
+                Some(other) => anyhow::bail!("expected on or off, got `{other}`"),
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Capture { transcript } => {
+            let c = capture::capture(&store, &transcript, prefs)?;
+            let s = c.summary();
+            println!("{}", if s.is_empty() { format!("no new markers ({} bytes read)", c.bytes_read) } else { s });
+            Ok(())
+        }
+        KnowledgeCmd::Backfill { dir, write } => {
+            let dir = transcripts(dir)?;
+            let (cands, total) = capture::backfill_candidates(&store, &dir, prefs)?;
+            let mut by_kind: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for c in &cands {
+                *by_kind.entry(c.marker.marker_type()).or_default() += 1;
+            }
+            println!(
+                "{total} markers written in {}; {} not in the store: {by_kind:?}",
+                dir.display(),
+                cands.len()
+            );
+            if !write {
+                for c in cands.iter().take(30) {
+                    println!("  {}: {}", c.marker.marker_type(), c.marker.display_name());
+                }
+                if cands.len() > 30 {
+                    println!("  ... and {} more", cands.len() - 30);
+                }
+                println!("Dry run. `--write` commits them, tagged backfill, after a backup.");
+                return Ok(());
+            }
+            let backups = root.join(".cortex").join("backups");
+            std::fs::create_dir_all(&backups)?;
+            let backup = backups.join(format!(
+                "memory-pre-backfill-{}.db",
+                chrono::Utc::now().format("%Y%m%dT%H%M%S")
+            ));
+            store.conn().execute("VACUUM INTO ?1", rusqlite::params![backup.to_string_lossy()])?;
+            println!("Backup: {}", backup.display());
+            let out = capture::backfill_write(&store, &cands, prefs);
+            println!("{}", out.summary());
+            Ok(())
+        }
+        KnowledgeCmd::Coverage { dir, days } => {
+            let dir = transcripts(dir)?;
+            let since = chrono::Utc::now().timestamp() - days as i64 * 86_400;
+            let cov = capture::coverage(&store, &dir, since, prefs)?;
+            let pct = if cov.written > 0 { 100.0 * cov.stored as f64 / cov.written as f64 } else { 100.0 };
+            println!(
+                "Last {days} days, {} transcript(s): {} markers written, {} in the store ({pct:.0}%)",
+                cov.transcripts, cov.written, cov.stored
+            );
+            for m in cov.missing.iter().take(20) {
+                println!("  missing  {m}");
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Pairs { seed, backtest } => {
+            if backtest {
+                let bt = reconcile::backtest(&store, Some(("anti_patterns", 37, 38)))?;
+                println!(
+                    "{} writes replayed: {} would merge (same name or cosine >= {}), {} would open a pair ({}..{}), {}%",
+                    bt.writes,
+                    bt.flagged_duplicate,
+                    knowledge_sim::DUPLICATE_COSINE,
+                    bt.flagged_related,
+                    knowledge_sim::RELATED_COSINE,
+                    knowledge_sim::DUPLICATE_COSINE,
+                    100 * (bt.flagged_duplicate + bt.flagged_related) / bt.writes.max(1)
+                );
+                let caught = bt.supersedes.iter().filter(|s| s.3 != "missed").count();
+                println!("Real supersedes in history: {} of {} caught when the newer entry was written:", caught, bt.supersedes.len());
+                for (kind, old, new, how, cos) in &bt.supersedes {
+                    println!("  {kind}:{old} -> {new}  {how:<7} cosine {cos:.2}");
+                }
+                match bt.pair_found {
+                    Some(c) => println!("ap:37 / ap:38 (the GIF contradiction): paired, cosine {c:.2}"),
+                    None => println!("ap:37 / ap:38 (the GIF contradiction): NOT surfaced"),
+                }
+                return Ok(());
+            }
+            if seed {
+                println!("{} pair(s) opened for look-alike entries never reconciled", reconcile::seed_pairs(&store)?);
+            }
+            let (open, resolved, disputes) = reconcile::counts(&store);
+            println!("Pairs: {open} open, {resolved} resolved. Open disputes: {disputes}.");
+            Ok(())
+        }
+        KnowledgeCmd::Cues { before, fires, corpus, labels } => {
+            let corpus_path = corpus.unwrap_or_else(|| root.join(".cortex/corpora/prompts.jsonl"));
+            let labels_path = labels.unwrap_or_else(|| root.join(".cortex/corpora/challenge_labels.json"));
+            let corpus = cue_miner::load_corpus(&corpus_path)?;
+            let labels = if labels_path.exists() { cue_miner::load_labels(&labels_path)? } else { Default::default() };
+            let base = if before { cue_miner::CueSet::before_refinement() } else { cue_miner::CueSet::shipped() };
+            if fires {
+                let (shipped, old) = (cue_miner::CueSet::shipped(), cue_miner::CueSet::before_refinement());
+                for (i, (ts, text)) in corpus.prompts.iter().enumerate() {
+                    let (a, b) = (shipped.classify(text), old.classify(text));
+                    if a == cue_miner::Fire::None && b == cue_miner::Fire::None {
+                        continue;
+                    }
+                    let label = labels.get(&i).map(|l| format!("{l:?}")).unwrap_or_else(|| "UNLABELLED".into());
+                    let one: String = text.chars().take(160).collect::<String>().replace('\n', " ");
+                    println!("{i:>5} {ts} shipped={a:?} before={b:?} [{label}] {one}");
+                }
+                return Ok(());
+            }
+            println!("{} prompts, {} labelled; {:?} on the labelled ones", corpus.prompts.len(), labels.len(), cue_miner::score(&corpus, &labels, &base));
+            for m in cue_miner::misses(&corpus, &labels, &base) {
+                let (ts, text) = &corpus.prompts[m];
+                println!("\nmiss {m} ({ts}): {}", text.chars().take(140).collect::<String>().replace('\n', " "));
+                let verdicts = cue_miner::mine(&corpus, &labels, &base, m);
+                let mut by: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+                for v in &verdicts {
+                    *by.entry(format!("{:?}", v.standing)).or_default() += 1;
+                }
+                println!("  {} candidates fix it: {by:?}", verdicts.len());
+                for v in verdicts.iter().filter(|v| v.accepted).take(5) {
+                    println!("  PROMOTABLE {:<44} fixes {:?}", v.candidate.describe(), v.eval.fixed);
+                }
+                // The general ones (one or two words) are the ones that could fire again.
+                for v in verdicts.iter().filter(|v| v.candidate.text.trim().split(' ').count() <= 2).take(8) {
+                    let detail = match v.standing {
+                        cue_miner::Standing::Breaks => format!("breaks {:?}", v.eval.broke),
+                        cue_miner::Standing::WaitsOnLabels => format!("waits on {} unlabelled prompt(s)", v.eval.unlabelled.len()),
+                        _ => format!("fixes {:?}", v.eval.fixed),
+                    };
+                    println!("  {:<15} {:<44} {detail}", format!("{:?}", v.standing), v.candidate.describe());
+                }
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Skills { dry_run } => {
+            let prefs = prefs::load(&root.join(".cortex/prefs.toml")).unwrap_or_default();
+            let skills_dir = root.join(&prefs.skills.skills_dir);
+            let t = skill_triage::run(&store, &root, &skills_dir, scoreboard::transcripts_dir_for(&root).as_deref(), dry_run)?;
+            let s = t.summary();
+            println!("{}", if s.is_empty() { "No drafts to triage and no trials due.".to_string() } else { s });
+            if dry_run {
+                println!("(dry run: nothing changed)");
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Queue => {
+            println!("{}", maintenance::queue(&store, &root)?);
+            Ok(())
+        }
+        KnowledgeCmd::Digest => {
+            println!("{}", maintenance::digest(&store, &root, scoreboard::transcripts_dir_for(&root))?);
+            Ok(())
+        }
+        KnowledgeCmd::Changes { limit } => {
+            for c in loop_ledger::recent(&store, limit)? {
+                let when = chrono::DateTime::from_timestamp(c.created_at, 0)
+                    .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                let change = if c.before.is_empty() { c.after.clone() } else { format!("{} -> {}", c.before, c.after) };
+                println!(
+                    "#{:<5} {when} {:<9} {:<11} {:<24} {} {}",
+                    c.id,
+                    c.class,
+                    c.status,
+                    c.target,
+                    change.chars().take(60).collect::<String>(),
+                    if c.evidence.is_empty() { String::new() } else { format!("({})", c.evidence.chars().take(60).collect::<String>()) }
+                );
+            }
+            Ok(())
+        }
+        KnowledgeCmd::Evaluator { cmd } => {
+            match cmd {
+                EvaluatorCmd::Register { name, paths } => {
+                    let hash = loop_ledger::register_evaluator(&store, &name, &paths)?;
+                    println!("evaluator `{name}` registered at {}", &hash[..12]);
+                }
+                EvaluatorCmd::Check { name } => match loop_ledger::evaluator_stamp(&store, &name) {
+                    Ok(stamp) => println!("{stamp}: unchanged since registration"),
+                    Err(e) => println!("{e}"),
+                },
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_walls(cmd: WallsCmd, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    match cmd {
+        WallsCmd::List => {
+            let all = walls::all(&store)?;
+            if all.is_empty() {
+                println!("no walls recorded");
+            }
+            for w in &all {
+                println!("{}", walls::render_line(w));
+            }
+            let rate = walls::base_rate_line(&store);
+            if !rate.is_empty() {
+                println!("{rate}");
+            }
+        }
+        WallsCmd::Show { id } => match walls::get(&store, id)? {
+            Some(w) => print!("{}", walls::render_full(&w)),
+            None => anyhow::bail!("no wall #{id}"),
+        },
+        WallsCmd::Import { file } => {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("cannot read {}", file.display()))?;
+            let (recorded, skipped, errors) = walls::import(&store, &text)?;
+            println!("recorded {recorded}, already on record {skipped}");
+            for e in &errors {
+                println!("  refused: {e}");
+            }
+            if !errors.is_empty() {
+                anyhow::bail!("{} wall(s) refused", errors.len());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
     if format == OutputFormat::Text {
@@ -3016,7 +3729,11 @@ fn run_retired(store: &Store, table: &str) -> Result<()> {
     println!("[cortex] {} retired {table}:", rows.len());
     for (id, by, label) in rows {
         let one_line: String = label.chars().take(88).collect();
-        println!("  #{id:<5} superseded by #{by:<5} {one_line}");
+        if by == 0 {
+            println!("  #{id:<5} retracted          {one_line}");
+        } else {
+            println!("  #{id:<5} superseded by #{by:<5} {one_line}");
+        }
     }
     Ok(())
 }
@@ -4374,6 +5091,69 @@ mod tests {
         assert_eq!(v["model"], "keep-me");
 
         assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::AlreadyPresent);
+    }
+
+    /// The Bash rewrite hook goes on PreToolUse, runs the quartz-ctx the MCP
+    /// config serves, from the project directory, and is left out where no
+    /// quartz-ctx binary exists.
+    #[test]
+    fn the_nav_hook_runs_the_served_quartz_ctx_and_only_where_it_exists() {
+        let d = crate::test_support::TempDir::new("nav_hook").expect("temp dir");
+        let settings = d.path().join(".claude").join("settings.local.json");
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v["hooks"]["PreToolUse"].as_array().is_none_or(|a| a.is_empty()), "no quartz-ctx, no hook: {v}");
+
+        std::fs::create_dir_all(d.path().join("bin")).unwrap();
+        std::fs::write(d.path().join("bin/quartz-ctx"), "").unwrap();
+        std::fs::write(
+            d.path().join(".mcp.json"),
+            r#"{"mcpServers":{"quartz-ctx":{"command":"bin/quartz-ctx","args":["serve"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let pre = &v["hooks"]["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "Bash");
+        assert_eq!(pre["hooks"][0]["command"], "\"${CLAUDE_PROJECT_DIR}\"/bin/quartz-ctx nav hook || true");
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::AlreadyPresent);
+
+        // Hook set 6 wrote it without `|| true`: replaced, not kept beside it.
+        let mut old = v.clone();
+        old["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = json!("\"${CLAUDE_PROJECT_DIR}\"/bin/quartz-ctx nav hook");
+        std::fs::write(&settings, serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let pre_all = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_all.len(), 1, "{v}");
+        assert_eq!(pre_all[0]["hooks"][0]["command"], "\"${CLAUDE_PROJECT_DIR}\"/bin/quartz-ctx nav hook || true");
+    }
+
+    /// Exit 2 from a PreToolUse hook blocks the tool call, and clap exits 2 on
+    /// an unknown subcommand. Run as the host runs it, the installed command
+    /// lets Bash through even when the quartz-ctx it finds predates `nav`.
+    #[cfg(unix)]
+    #[test]
+    fn a_quartz_ctx_without_nav_cannot_block_bash() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::test_support::TempDir::new("nav_hook_old").expect("temp dir");
+        std::fs::create_dir_all(d.path().join("bin")).unwrap();
+        let bin = d.path().join("bin/quartz-ctx");
+        std::fs::write(&bin, "#!/bin/sh\necho \"error: unrecognized subcommand 'nav'\" >&2\nexit 2\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(d.path().join(".mcp.json"), r#"{"mcpServers":{"quartz-ctx":{"command":"bin/quartz-ctx"}}}"#).unwrap();
+        ensure_compact_hook(d.path(), true, false).unwrap();
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(d.path().join(".claude/settings.local.json")).unwrap()).unwrap();
+        let cmd = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+        let run = |c: &str| {
+            std::process::Command::new("sh").arg("-c").arg(c).env("CLAUDE_PROJECT_DIR", d.path()).output().unwrap()
+        };
+        let bare = run(cmd.trim_end_matches(" || true"));
+        assert_eq!(bare.status.code(), Some(2), "the hazard: without `|| true` the host would block the call");
+        let out = run(&cmd);
+        assert_eq!(out.status.code(), Some(0), "{cmd}");
+        assert!(out.stdout.is_empty(), "no decision, so the command runs as written");
     }
 
     /// VS Code shows a PostToolUse reply a request late, so the edit guard needs

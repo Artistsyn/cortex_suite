@@ -1,7 +1,7 @@
 pub mod tools;
 
 use std::path::PathBuf;
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -65,6 +65,20 @@ const UNCACHEABLE: &[&str] = &[
     // was recorded or settled when it was not.
     "note_challenge",
     "resolve_challenge",
+    // Reads a growing transcript and writes to the store.
+    "capture_markers",
+    "restore_after_compact",
+    // Both change what is served.
+    "resolve_pair",
+    // The maintenance run's queue, answers and digest change every call.
+    "loop_queue",
+    "loop_judge",
+    "loop_digest",
+    "settle_dispute",
+    // The walls ledger changes under them.
+    "get_walls",
+    "record_wall",
+    "update_wall",
     // A replayed set_checkpoint would claim a save that never happened, and a
     // replayed get_checkpoint would hand back a superseded one.
     "set_checkpoint",
@@ -78,9 +92,11 @@ pub fn serve(
     repo_root: PathBuf,
     prefs_summary: String,
 ) -> Result<()> {
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    // Moves this connection onto a rebuilt binary, and tells the client when
+    // its tool list may be out of date (see quartz_ctx::mcp_session).
+    let mut session = quartz_ctx::mcp_session::Session::open("cortex");
     let engine_name = engine_name.to_string();
     let sessions = SessionRegistry::new();
 
@@ -127,10 +143,16 @@ pub fn serve(
     );
 
     let mut units_generation = crate::indexer::generation(store.conn());
-    crate::indexer::mark_session_start();
+    // The session began when the client connected, which a rebuilt binary
+    // that took the connection over learns from the build before it.
+    let started = session
+        .carried("session_start")
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    crate::indexer::mark_session_start(started);
+    session.carry("session_start", crate::indexer::session_start().to_rfc3339());
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    while let Some(line) = session.next_line(&mut out)? {
         if line.trim().is_empty() { continue; }
 
         let req: Value = match serde_json::from_str(&line) {
@@ -143,6 +165,13 @@ pub fn serve(
         let id = req["id"].clone();
         let method = req["method"].as_str().unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(Value::Null);
+        session.saw(method);
+
+        // quartz_ctx parses with proc-macro2 span-locations: every parse appends
+        // its source to a thread-local span map that is never freed and wraps at
+        // 4 GiB, so a long session of re-indexing grows it without bound. Nothing
+        // holds a Span between requests (parsers keep line numbers only).
+        proc_macro2::extra::invalidate_current_thread_spans();
 
         let result = match method {
             "initialize"  => Ok(initialize_result(&engine_name)),
@@ -325,7 +354,8 @@ pub fn serve(
 fn initialize_result(engine_name: &str) -> Value {
     json!({
         "protocolVersion": "2024-11-05",
-        "capabilities": { "tools": {} },
+        // listChanged: a rebuilt binary announces its tools (quartz_ctx::mcp_session).
+        "capabilities": { "tools": { "listChanged": true } },
         "serverInfo": {
             "name": "cortex",
             "version": env!("CARGO_PKG_VERSION"),
@@ -335,7 +365,7 @@ fn initialize_result(engine_name: &str) -> Value {
 }
 
 fn tools_list() -> Value {
-    json!({
+    let mut list = json!({
         "tools": [
             {
                 "name": "semantic_search",
@@ -681,9 +711,13 @@ fn tools_list() -> Value {
             },
             {
                 "name": "closeout_session",
-                "description": "Complete session closeout. Set inline_approve=true ONLY when the user has \
-                                typed 'KNOWLEDGE COMMITTED' — this immediately commits all session markers to \
-                                the Cortex DB without deferred review. Stages markers when inline_approve=false (default).",
+                "description": "Complete session closeout: logs the outcome and commits any markers passed \
+                                in markers_text. On Claude Code markers are also captured from the transcript \
+                                as they are written, so markers_text is optional there. Markers commit \
+                                automatically through the gates while automatic commit is on (the default; \
+                                audited by sample). If a sample audit switched it off, markers are staged, and \
+                                inline_approve=true, only when the user has typed 'KNOWLEDGE COMMITTED', \
+                                commits them.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -771,15 +805,19 @@ fn tools_list() -> Value {
             {
                 "name": "note_challenge",
                 "description": "Note that a user message disputed something you claimed. Installed \
-                                automatically as a UserPromptSubmit hook; you do not call this \
-                                yourself. Returns an EMPTY string for the overwhelming majority of \
-                                messages — silence is the expected outcome. When it does fire it \
-                                records an OPEN question, never a finding: nothing reaches memory \
-                                until you check who was right and call resolve_challenge.",
+                                automatically as a UserPromptSubmit hook, which returns an EMPTY string \
+                                for almost every message. Call it YOURSELF, with source=\"agent\", when \
+                                the user disputed something and no challenge reminder arrived: that \
+                                records the hook's miss, which is what its cues are tuned from, and \
+                                gives you the settling procedure. Records an OPEN question, never a \
+                                finding: nothing reaches memory until you check who was right and call \
+                                resolve_challenge.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "prompt": { "type": "string", "description": "The user's message." }
+                        "prompt": { "type": "string", "description": "The user's message." },
+                        "source": { "type": "string", "enum": ["hook", "agent"], "description": "agent: you noticed a dispute the hook did not flag. Omitted by the hook." },
+                        "limit":  { "type": "boolean", "description": "With source=agent: the user disputed a LIMIT you stated (what can or cannot be done). Returns the wall audit." }
                     }
                 }
             },
@@ -799,11 +837,13 @@ fn tools_list() -> Value {
                         "id":      { "type": "integer", "description": "Challenge id, from note_challenge or get_session_health." },
                         "verdict": {
                             "type": "string",
-                            "enum": ["user_right", "agent_right", "mixed", "unresolved"],
-                            "description": "How it came out once checked."
+                            "enum": ["user_right", "agent_right", "mixed", "unresolved", "not_a_challenge"],
+                            "description": "How it came out once checked. not_a_challenge: the message did not dispute anything (the hook fired wrongly); stores nothing, and labels the false fire."
                         },
                         "subject":  { "type": "string", "description": "The claim itself, in one sentence — what is true, stated so it is usable next time." },
-                        "evidence": { "type": "string", "description": "What you actually checked: a command you ran and its result, a file:line you read, an observed behaviour. Required for user_right and agent_right; a verdict without it is refused." }
+                        "evidence": { "type": "string", "description": "What you actually checked: a command you ran and its result, a file:line you read, an observed behaviour. Required for user_right and agent_right; a verdict without it is refused." },
+                        "wall_id":  { "type": "integer", "description": "The wall (from record_wall or update_wall) this challenge was about. Required when the challenge disputed a limit and the verdict is not unresolved." },
+                        "entry":    { "type": "string", "description": "With user_right: the stored entry the challenge proved wrong (ap:<id> or pattern:<id>). It is then served as disputed until a fact settles it." }
                     },
                     "required": ["id", "verdict", "subject", "evidence"]
                 }
@@ -848,17 +888,246 @@ fn tools_list() -> Value {
             {
                 "name": "expand_memory",
                 "description": "Return one pattern's full body, uses and tags by id (ids come from \
-                                list_memory_handles).",
+                                list_memory_handles), or one anti-pattern's wrong/correct text \
+                                with kind=\"anti_pattern\" (ids from get_anti_patterns).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "integer", "description": "Pattern id." }
+                        "id": { "type": "integer", "description": "Pattern or anti-pattern id." },
+                        "kind": { "type": "string", "enum": ["pattern", "anti_pattern"], "description": "Default pattern." }
                     },
                     "required": ["id"]
                 }
             }
         ]
-    })
+    });
+    if let Some(tools) = list["tools"].as_array_mut() {
+        tools.extend(wall_tools());
+        tools.extend(loop_tools());
+        // Claude Code treats an MCP tool without `readOnlyHint` as a writer:
+        // plan mode refuses it ("Cannot call ... while in plan mode") and its
+        // calls never run in parallel.
+        for tool in tools.iter_mut() {
+            if tool["name"].as_str().is_some_and(|n| READ_ONLY_TOOLS.contains(&n)) {
+                tool["annotations"] = json!({ "readOnlyHint": true });
+            }
+        }
+    }
+    list
+}
+
+/// Tools that change nothing a person or another session would see. Retrieval
+/// telemetry is the server's own bookkeeping and does not count as a change.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "semantic_search", "get_item", "get_syntax", "get_usage_examples", "get_helper",
+    "get_context", "get_delta", "query_graph", "explain_dependency_path",
+    "get_preferences", "simulate_change", "recall", "list_patterns",
+    "get_anti_patterns", "list_all", "get_session_health", "edit_guard",
+    "get_checkpoint", "list_memory_handles", "expand_memory", "loop_queue",
+    "loop_digest", "restore_after_compact", "get_walls",
+];
+
+/// The self-learning loop's tools (docs/self-learning-loop-2026-09-30.md).
+fn loop_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "loop_queue",
+            "description": "The weekly maintenance run's work: pairs of knowledge entries that read alike, \
+                            each shown as OLDER and NEWER, to judge as duplicate, refinement, conflict or \
+                            compatible. Used by the scheduled cortex-weekly-maintenance task.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "loop_judge",
+            "description": "Submit every answer for the items loop_queue issued, in one call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "answers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "item":    { "type": "integer" },
+                                "verdict": { "type": "string", "enum": ["duplicate", "refinement", "conflict", "compatible"] }
+                            },
+                            "required": ["item", "verdict"]
+                        }
+                    },
+                    "proposals": {
+                        "type": "array",
+                        "description": "For MISS items: up to 5 cues each.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "item": { "type": "integer" },
+                                "cues": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "list": { "type": "string", "enum": ["dispute", "limit", "emphasis", "phrase"] },
+                                            "text": { "type": "string" }
+                                        },
+                                        "required": ["list", "text"]
+                                    }
+                                }
+                            },
+                            "required": ["item", "cues"]
+                        }
+                    }
+                },
+                "required": ["answers"]
+            }
+        }),
+        json!({
+            "name": "loop_digest",
+            "description": "The self-learning loop's week in one page: automatic commits, the audit waiting \
+                            for the user, look-alikes and disputes, capture health, and what the \
+                            maintenance runs cost. Writes .cortex/loop-digest.md.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "resolve_pair",
+            "description": "Say what two knowledge entries that read alike are to each other. Offered when a \
+                            new entry lands close to an older one, and on entries served with a 'never \
+                            reconciled' line. duplicate / refinement retire the older one (reversible); \
+                            compatible closes the pair; conflict serves both as disputed until you pass \
+                            winner and a fact (a measurement, or a vendor-doc or paper with its date).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind":    { "type": "string", "enum": ["anti_patterns", "patterns"] },
+                    "new_id":  { "type": "integer" },
+                    "old_id":  { "type": "integer" },
+                    "verdict": { "type": "string", "enum": ["duplicate", "refinement", "conflict", "compatible"] },
+                    "winner":  { "type": "integer", "description": "conflict only: the entry that is right." },
+                    "fact":    { "type": "string", "description": "conflict only: `measured: <what> @ <where> @ <date>`, or vendor-doc / paper with a date." }
+                },
+                "required": ["kind", "new_id", "old_id", "verdict"]
+            }
+        }),
+        json!({
+            "name": "settle_dispute",
+            "description": "Settle the disputes on a knowledge entry (raised when a challenge proved it wrong, \
+                            a wall it cites moved, or its failure came back after its fix was delivered). \
+                            Needs a fact: holds keeps it; wrong takes it out of service (reversible).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind":    { "type": "string", "enum": ["anti_patterns", "patterns"] },
+                    "id":      { "type": "integer" },
+                    "verdict": { "type": "string", "enum": ["holds", "wrong"] },
+                    "fact":    { "type": "string", "description": "`measured: <what> @ <where> @ <date>`, or vendor-doc / paper with a date." }
+                },
+                "required": ["kind", "id", "verdict", "fact"]
+            }
+        }),
+        json!({
+        "name": "restore_after_compact",
+        "description": "After a compaction, read back from the transcript what its summary blurs: the \
+                        latest requests, files edited, commands that went green, errors still open \
+                        (verbatim) and the last stated next step, within ~1.5k tokens; also stored as a \
+                        checkpoint. Installed as the SessionStart hook with the `compact` matcher.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "transcript_path": { "type": "string", "description": "The session transcript (.jsonl under ~/.claude/projects/)." },
+                "hook_event_name": { "type": "string", "description": "Set by the hook; answers with hook JSON." }
+            },
+            "required": ["transcript_path"]
+        }
+    }),
+        json!({
+        "name": "capture_markers",
+        "description": "Capture the CORTEX-* knowledge markers written in a Claude Code transcript \
+                        since its last capture, and commit them through the same gates as closeout. \
+                        Installed as the Stop and PreCompact hooks, which get an empty answer; you \
+                        only call it to check capture on a transcript by hand.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "transcript_path": { "type": "string", "description": "The session transcript (.jsonl under ~/.claude/projects/)." },
+                "hook_event_name": { "type": "string", "description": "Set by the hooks; makes the answer empty and sweeps ended sessions' unread tails." }
+            },
+            "required": ["transcript_path"]
+        }
+    }),
+    ]
+}
+
+/// The walls ledger's tools, appended to tools/list. Kept out of the main
+/// literal, which is already at json!'s recursion limit.
+fn wall_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "get_walls",
+            "description": "Limits on record for a topic: each wall's status (open / holds / moved), \
+                            whose limit it is (physics, hardware, platform, library default, \
+                            library version, our design, existing implementations, authority, \
+                            budget), and its open edge -- what is untested and the cheapest test \
+                            that would decide it -- plus how often limits here moved when \
+                            checked. Call it before accepting or declaring a limit. id=N returns \
+                            one wall in full.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hint":   { "type": "string", "description": "The limit or topic, e.g. 'ray tracing on Quest 3' or 'wgpu multiview MSAA'." },
+                    "id":     { "type": "integer", "description": "Return this wall in full instead." },
+                    "detail": { "type": "string", "enum": ["summary", "full"], "description": "full: every wall, one line each." }
+                },
+                "required": ["hint"]
+            }
+        }),
+        json!({
+            "name": "record_wall",
+            "description": "Record a limit you accepted, declared, disputed or tested, with whose \
+                            limit it is and the evidence. Evidence that is only inferred, only an \
+                            authority, or only someone else's implementation leaves the wall \
+                            open, and an open wall must name its cheapest decisive test. Sources \
+                            must be dated.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "claim":         { "type": "string", "description": "The limit as a measurable claim: what, on what, at what budget." },
+                    "provenance":    { "type": "string", "enum": ["physics", "hardware", "platform", "library-default", "library-version", "our-design", "implementation", "authority", "budget"], "description": "Whose limit it is. The last six are movable: a work item with a cost." },
+                    "evidence":      { "type": "array", "description": "At least one item: {kind, text, source?, date?} with kind measured | vendor-doc | paper | implementation | authority | inferred, or the string 'kind: text @ source @ date'. vendor-doc and paper need a date.", "items": {} },
+                    "status":        { "type": "string", "enum": ["open", "holds", "moved", "retired"], "description": "Default open. holds/moved need a measurement or a dated source." },
+                    "topic":         { "type": "array", "items": { "type": "string" }, "description": "Tags retrieval matches on, e.g. ['quest', 'raytracing']." },
+                    "untested":      { "type": "string", "description": "What has not been checked." },
+                    "cheapest_test": { "type": "string", "description": "The cheapest check that would decide it, with a time estimate. Required while open." },
+                    "revisit_when":  { "type": "string", "description": "What would reopen it: a version, an OS update, an event." },
+                    "revisit_after": { "type": "string", "description": "YYYY-MM-DD; listed for review from then on." },
+                    "challenge_id":  { "type": "integer", "description": "The challenge that disputed it, if any." },
+                    "links":         { "type": "string", "description": "Memory files, anti-pattern ids, docs." }
+                },
+                "required": ["claim", "provenance", "evidence"]
+            }
+        }),
+        json!({
+            "name": "update_wall",
+            "description": "Change a wall: add evidence, reclassify it, or change its verdict. A \
+                            verdict changes only with a new fact -- a measured item, or a \
+                            vendor-doc or paper with its date -- in either direction; \
+                            reconsidering is not a fact. Evidence is appended, never replaced.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id":            { "type": "integer", "description": "Wall id." },
+                    "status":        { "type": "string", "enum": ["open", "holds", "moved", "retired"] },
+                    "evidence":      { "type": "array", "description": "New evidence items, same forms as record_wall.", "items": {} },
+                    "provenance":    { "type": "string", "enum": ["physics", "hardware", "platform", "library-default", "library-version", "our-design", "implementation", "authority", "budget"] },
+                    "topic":         { "type": "array", "items": { "type": "string" } },
+                    "untested":      { "type": "string" },
+                    "cheapest_test": { "type": "string" },
+                    "revisit_when":  { "type": "string" },
+                    "revisit_after": { "type": "string", "description": "YYYY-MM-DD, or empty to clear." },
+                    "links":         { "type": "string" }
+                },
+                "required": ["id"]
+            }
+        }),
+    ]
 }
 
 #[cfg(test)]
@@ -870,6 +1139,22 @@ mod tests {
         tools
             .iter()
             .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+    }
+
+    #[test]
+    fn read_only_tools_say_so_and_writers_do_not() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+        for name in super::READ_ONLY_TOOLS {
+            let tool = find_tool(tools, name)
+                .unwrap_or_else(|| panic!("READ_ONLY_TOOLS names {name}, which tools/list lacks"));
+            assert_eq!(tool["annotations"]["readOnlyHint"], true, "{name}");
+        }
+        for name in ["closeout_session", "capture_markers", "set_checkpoint", "record_wall",
+                     "suggest_pattern", "compact_output"] {
+            let tool = find_tool(tools, name).expect(name);
+            assert!(tool.get("annotations").is_none(), "{name} writes; it must not claim to read only");
+        }
     }
 
     #[test]

@@ -213,12 +213,13 @@ $mcpVscode = @"
 WriteIfAbsent (Join-Path $Workspace '.vscode\mcp.json') $mcpVscode '.vscode/mcp.json (VS Code)'
 
 foreach ($doc in @(
-    @{ src = 'templates\CLAUDE.md';               dst = 'CLAUDE.md';                            label = 'CLAUDE.md' },
-    @{ src = 'templates\copilot-instructions.md'; dst = '.github\copilot-instructions.md';      label = 'copilot-instructions.md' },
     # Both launchers regardless of platform: a mixed team shares one workspace,
     # so the macOS developer needs cortex.sh from the same checkout.
     @{ src = 'templates\cortex.ps1';             dst = '.cortex\cortex.ps1';                   label = 'cortex.ps1' },
-    @{ src = 'templates\cortex.sh';              dst = '.cortex\cortex.sh';                    label = 'cortex.sh' }
+    @{ src = 'templates\cortex.sh';              dst = '.cortex\cortex.sh';                    label = 'cortex.sh' },
+    # The frontier skill, at the path each host reads.
+    @{ src = 'templates\skills\frontier\SKILL.md';   dst = '.claude\skills\frontier\SKILL.md';   label = 'frontier skill (Claude Code)' },
+    @{ src = 'templates\skills\frontier.prompt.md';  dst = '.github\prompts\frontier.prompt.md';  label = 'frontier prompt (Copilot)' }
 )) {
     $dstPath = Join-Path $Workspace $doc.dst
     New-Item -ItemType Directory -Force -Path (Split-Path $dstPath -Parent) | Out-Null
@@ -228,6 +229,19 @@ foreach ($doc in @(
         Copy-Item (Join-Path $SuiteRoot $doc.src) $dstPath -Force
         Say "wrote $($doc.label)"
     }
+}
+
+# The agent instructions. Only the cortex_suite section of each file is ours: a
+# missing file is written from the template, an existing one gains the section
+# or has it brought up to date, and nothing else in it changes. This used to
+# copy the templates only where no file existed - so anyone with instructions
+# of their own got none of ours - and to overwrite the whole file under -Force.
+# Updating later is the same command: .\.cortex\cortex.ps1 instructions
+$instrArgs = @('instructions', '--root', $Workspace, '--name', (Split-Path $Workspace -Leaf))
+if ($Force) { $instrArgs += '--force' }
+Invoke-Native { & $CortexExe @instrArgs } | ForEach-Object { Say $_ }
+if ($LASTEXITCODE -ne 0) {
+    Die "cortex could not update the instruction files (built before 'instructions' existed? re-run without -SkipBuild)"
 }
 
 # ── First index ──────────────────────────────────────────────────────────────

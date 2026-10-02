@@ -43,6 +43,8 @@ pub struct PipelineResult {
     pub drift_based_proposals:  usize,
     pub meta_proposals_staged:  usize,
     pub last_run_updated:       bool,
+    /// What skill triage did this run (L5): rejections, trials, retirements.
+    pub skill_triage:           String,
 }
 
 impl PipelineResult {
@@ -122,6 +124,16 @@ pub fn run(
                 eprintln!("[consolidator] warn: could not draft skill {}: {e}", candidate.name);
             }
         }
+    }
+
+    // ── Stage 3b: Triage skill drafts and review trials (L5) ─────────────────
+    // Noise is rejected, credible drafts become trials, unused trials retire.
+    // Everything it cannot place stays in the review queue for a person.
+    let skills_dir = repo_root.join(&prefs.skills.skills_dir);
+    let transcripts = crate::scoreboard::transcripts_dir_for(repo_root);
+    match crate::skill_triage::run(store, repo_root, &skills_dir, transcripts.as_deref(), false) {
+        Ok(t) => result.skill_triage = t.summary(),
+        Err(e) => eprintln!("[consolidator] warn: skill triage failed: {e}"),
     }
 
     // ── Stage 4: Gap-driven proposals (Phase 2: gated) ───────────────────────
@@ -404,6 +416,14 @@ fn propose_survival_gated(
     proposals_dir: &Path,
     rejected_log: &Path,
 ) -> Result<usize> {
+    // Fenced off (docs/self-learning-loop-2026-09-30.md, L2). Survival counts
+    // failed builds in any session that happened to retrieve a pattern: a
+    // correlation, not evidence against it, so it no longer raises removal
+    // proposals. It stays on display; an entry is disputed only by events
+    // (reconcile.rs), and retired only on a fact.
+    let _ = (store, proposals_dir, rejected_log);
+    return Ok(0);
+    #[allow(unreachable_code)]
     let mut stmt = store.conn().prepare(
         "SELECT id, name, intent, body, use_count, reverted_count, survival_rate
          FROM patterns
