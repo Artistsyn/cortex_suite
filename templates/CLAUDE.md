@@ -52,7 +52,8 @@ it is never stale.
 - `get_api_context(hint)` — **start here for any coding task**; one budgeted
   packet of the relevant types, variants and signatures
 - `get_item(name)` — full definition, including methods from every `impl` file
-- `get_variants(enum)` — exact variants with field types
+- `get_variants(name)` — exact variants with field types (the parameter is
+  `name`, as for `get_item`)
 - `search_items` / `list_items` / `find_related_types`
 - `get_trait_implementations` / `get_builder_methods` / `get_return_type_usage`
 - `trace_across_languages` — where one language calls another (HTTP routes joined
@@ -365,7 +366,7 @@ commands on both.
 | `fired` | which mechanisms have actually run, and which are silently idle |
 | `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
 | `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note); `--vscode` installs the same for VS Code Copilot |
-| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
 | `-- <args>` | pass anything straight through to the binary |
 
 `fired` answers the one question nothing else asks: *has this ever actually

@@ -116,12 +116,19 @@ Setup installs a launcher into `.cortex/` for both platforms — `cortex.sh` and
 ```bash
 ./.cortex/cortex.sh reindex      # full rebuild of every configured source (first run)
 ./.cortex/cortex.sh refresh      # re-index only what changed (the servers do this themselves)
-./.cortex/cortex.sh check-mcp    # confirm both MCP configs agree and use relative paths
+./.cortex/cortex.sh check-mcp    # confirm both MCP configs agree and every command resolves
 ./.cortex/cortex.sh deploy       # rebuild without stopping the running server
 ```
 
 Don't want to list crates by hand? `quartz-ctx serve --discover .` finds every
 crate under a directory — workspace members and standalone crates alike.
+
+**Updating?** `git pull` here, then run setup again on the same workspace. It
+rebuilds both servers and updates the cortex_suite section of your instruction
+files. It then points your agent at
+[SETUP_HANDOFF.md §0](SETUP_HANDOFF.md#0-updating-a-workspace-that-already-has-cortex_suite)
+for the rest: running servers, hooks, launchers, and older cortex guidance still
+kept in your own files.
 
 **→ Read [SETUP_HANDOFF.md](SETUP_HANDOFF.md) before you start.** It documents
 the pitfalls that cost us real debugging time — stale binaries, cache replay,

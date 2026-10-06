@@ -105,8 +105,9 @@ test with `record_wall` / `update_wall`: a verdict changes only with a new fact
   search.
 - If a bare name is ambiguous across crates, alternatives are listed — pass
   `scope=` or the full unit id to pin one.
-- `get_variants(enum)` before using any enum. Prefer an existing variant over
-  inventing a parallel representation.
+- `get_variants(name)` before using any enum (the parameter is `name`, as for
+  `get_item`). Prefer an existing variant over inventing a parallel
+  representation.
 
 ## Recording what you learn
 
@@ -206,10 +207,12 @@ commands on both.
 | `refresh` | re-index only roots whose source changed; what the servers do before answering |
 | `knowledge-drift` | patterns/anti-patterns naming code that changed after they were written |
 | `deploy` | rebuild cortex without stopping the MCP server |
-| `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |
+| `check-mcp` | validate both MCP configs: every command resolves, no drift between hosts |
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
-| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone |
+| `fired` | which mechanisms have actually run, and which are silently idle |
+| `hooks-init --vscode` | install or upgrade cortex's VS Code hooks (`.github/hooks/cortex.json`); nothing refreshes them on its own |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
 | `-- <args>` | pass anything straight through to the binary |
 
 `deploy` exists because Windows blocks deleting a running executable. It renames

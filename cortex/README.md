@@ -225,26 +225,32 @@ Rejected proposals logged to `.cortex/rejected-proposals.jsonl` (auto-rotated at
 
 ---
 
-## Session Closeout (KNOWLEDGE COMMITTED)
+## Session closeout
 
 ```markdown
 [CORTEX-PATTERN: name="..." intent="..." trust="verified" uses="..." kind="procedure|constraint|policy|fact"]body[/CORTEX-PATTERN]
-[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
+[CORTEX-AP: description="..." tags="..."]wrong: ...
+correct: ...[/CORTEX-AP]
 [CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
 [CORTEX-ADR: title="..." tags="..."]Context: ... Decision: ...[/CORTEX-ADR]
 [CORTEX-PREFS-NOTE: tags="..."]note text[/CORTEX-PREFS-NOTE]
 [CORTEX-SKILL-CANDIDATE: name="..." trigger="..."]summary[/CORTEX-SKILL-CANDIDATE]
 ```
 
-When the user types **KNOWLEDGE COMMITTED**:
-```rust
-closeout_session(outcome_type: "build_pass", inline_approve: true)
-```
-All markers are committed immediately (Tier 1). Without it, markers are staged for later review (Tier 2).
+`correct:` starts its own line: the split is per line, and a body written with a
+literal `\n` is stored whole as `wrong`.
 
-`flush_knowledge_markers` fallback: if VS Code session store is unavailable, the tool
-scans recent `mcp_calls` args for embedded markers. "0 markers committed" is normal when
-the store is inaccessible — not a failure.
+Markers commit themselves. On Claude Code the Stop and PreCompact hooks capture
+them from the transcript as they are written; in VS Code, `closeout_session`
+reads them from the chat; from any other host, pass them to `closeout_session`
+as `markers_text`. When a task is verifiably done, call
+`closeout_session(outcome_type: "build_pass")`. A person audits a random sample
+(`cortex knowledge audit`) instead of approving each entry.
+
+If the audit has switched automatic commit off (`cortex knowledge status`),
+closeout stages the markers instead: the agent asks for **KNOWLEDGE COMMITTED**,
+and on that reply calls
+`closeout_session(outcome_type: "build_pass", inline_approve: true)`.
 
 ---
 
@@ -259,10 +265,12 @@ naming = "snake_case functions and variables, PascalCase types and enums"
 [project]
 name = "YourProject"
 language = "Rust"
+# Facts about THIS project for agents, one string each; get_preferences and
+# get_context serve them, tiered by the agent's hint. The working protocol
+# (pre-code check, closeout, markers) lives in the cortex_suite section of
+# CLAUDE.md: restated here, the two copies drift apart.
 notes = [
-    "MANDATORY PRE-CODE CHECK: before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
-    "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying",
-    "session-end: after any coding session, type KNOWLEDGE COMMITTED to trigger closeout",
+    "Canvas::run(action) is the safe dispatch path; never call draw() directly",
 ]
 
 [enforcement]
@@ -278,7 +286,7 @@ skill_candidate_min_occurrences = 3
 graph_snapshot_days = 30
 
 [skills]
-skills_dir = "agent_customization/skills"
+skills_dir = ".claude/skills"   # where Claude Code loads skills; Copilot's copy goes to .github/prompts
 auto_update_skills = true
 
 [memory]
@@ -632,7 +640,9 @@ the previous file under `.cortex/backups/`.
 
 ### Recommended initial prefs.toml
 
-Create `.cortex/prefs.toml` in your project root (or run `cortex init` via the launcher):
+cortex writes `.cortex/prefs.toml` from its template the first time it creates
+the store (`.\.cortex\cortex.ps1 init` writes one beside a store older than
+that). To write it yourself:
 
 ```toml
 [style]
@@ -643,10 +653,12 @@ naming = "snake_case functions and variables, PascalCase types and enums"
 [project]
 name = "YourProject"
 language = "Rust"
+# Facts about THIS project for agents, one string each; get_preferences and
+# get_context serve them, tiered by the agent's hint. The working protocol
+# (pre-code check, closeout, markers) lives in the cortex_suite section of
+# CLAUDE.md: restated here, the two copies drift apart.
 notes = [
-    "MANDATORY PRE-CODE CHECK (no PROTOCOL required): before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
-    "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying. After two failed attempts STOP and call recall or semantic_search before a third.",
-    "session-end mandatory: after any coding session run post-session then annotate new bugs as anti-patterns and working implementations as patterns",
+    "Canvas::run(action) is the safe dispatch path; never call draw() directly",
 ]
 ```
 

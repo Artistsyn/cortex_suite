@@ -17,6 +17,173 @@ or any MCP-capable host. Rust gets the strong path (`syn`, fully resolved); the
 rest are parsed with tree-sitter and linked across files by name — a real
 resolution step, but not type inference. Read the per-item confidence tag; see §7.
 
+**Updating a workspace that already has it?** Pull, re-run setup, then work
+through §0.
+
+---
+
+## 0. Updating a workspace that already has cortex_suite
+
+New workspace? Skip to §1.
+
+An update is `git pull` in the suite, then setup again on the same workspace:
+`./scripts/setup.sh <workspace>`, or `.\scripts\setup.ps1 -Workspace <workspace>`
+on Windows. Setup rebuilds both binaries and runs `instructions`, which brings
+the cortex_suite section of `CLAUDE.md` and `.github/copilot-instructions.md` up
+to date. It also removes copies of cortex's tool descriptions that an older
+first run seeded into the store, after a backup under `.cortex/backups/`. It
+leaves everything else in the workspace as it was, and ends with an UPDATE block
+naming any launcher or skill that differs from this suite's copy.
+
+What setup cannot decide is below. **If you are the agent running the update,
+work through it in order and finish with the report in 0.8.** To hand it to an
+agent, say: *"Work through SETUP_HANDOFF.md §0 for this workspace."*
+
+Don't use setup's `--force` / `-Force` for an update: it overwrites the
+launchers, skills, MCP configs and `.cortex/index-sources.json` wholesale. Below,
+`<suite>` is the cortex_suite checkout, and `./.cortex/cortex.sh` is
+`.\.cortex\cortex.ps1` on Windows.
+
+### 0.1 Rebuild, and check the binaries
+
+Setup builds both. Without setup:
+
+```bash
+./.cortex/cortex.sh deploy                          # cortex
+cd <suite>/quartz-ctx && cargo build --release      # quartz-ctx; on Windows stop its servers first (2.1)
+```
+
+A failed build leaves the previous binary in place, and an exit code describes
+the build, not the binary. Check that both binaries are newer than the pull:
+`<suite>/cortex/target/debug/cortex` and
+`<suite>/quartz-ctx/target/release/quartz-ctx`, with `.exe` on Windows. Rebuild
+cortex before the steps below, because the templates `instructions` writes are
+compiled into it.
+
+### 0.2 Move the running servers onto the new build
+
+- **macOS and Linux:** a cortex or quartz-ctx server waiting for a request
+  moves onto the new build by itself within seconds, on the same connection,
+  and tells its host the tool list changed. A server older than that cannot
+  move. A few seconds after the build, list any:
+
+  ```bash
+  ./.cortex/cortex.sh reload-servers --dry-run
+  ```
+
+  If it lists any, run it again without `--dry-run`. That stops the idle ones
+  running under Claude Code, and Claude Code starts each again on its next call,
+  from the new binary. Their sessions keep their old tool list until they get a
+  fresh connection: `/mcp` in a terminal session, a restart in the desktop app.
+  Servers under other hosts are listed and left alone; restart those from the
+  host.
+- **Windows:** setup stopped the servers so the build could replace the
+  binaries. Reconnect them from each host: "MCP: Restart Server" in VS Code;
+  `/mcp` in a Claude Code terminal session, or restart the desktop app.
+
+### 0.3 The files setup leaves alone
+
+| File | What to do |
+|---|---|
+| `.cortex/cortex.sh`, `.cortex/cortex.ps1` | When the UPDATE block names one, diff it against `<suite>/templates/`. Take the suite's copy, carrying over anything the workspace added to its own (a command, a local path). When you cannot tell which side a difference came from, ask the user. |
+| `.claude/skills/frontier/SKILL.md`, `.github/prompts/frontier.prompt.md` | The same, against `<suite>/templates/skills/`. |
+| `.mcp.json`, `.vscode/mcp.json` | Keep them. `check-mcp` (0.7) says whether they still work. |
+| `.cortex/index-sources.json` | Never replace it: it is this workspace's list of roots. |
+| `.cortex/prefs.toml` | Keep it. Its notes are checked in 0.6. |
+
+### 0.4 Hooks
+
+- **Claude Code:** cortex installs its hooks into `.claude/settings.local.json`
+  the first time it serves a hook set it has not installed before, so a new set
+  arrives with the first session after the update. With `CORTEX_NO_AUTO_HOOKS`
+  set it does not; run `./.cortex/cortex.sh hooks-init` instead. If the
+  workspace keeps cortex's hooks in the shared `.claude/settings.json`, refresh
+  that copy with `hooks-init --shared`; the automatic install writes only the
+  personal file.
+- **VS Code Copilot:** nothing refreshes `.github/hooks/cortex.json` by itself.
+  If the file exists, run `./.cortex/cortex.sh hooks-init --vscode`. If it does
+  not, ask the user whether the team uses Copilot, and run it if they do.
+
+### 0.5 The cortex_suite section
+
+```bash
+./.cortex/cortex.sh instructions --check
+```
+
+It reports each file's state:
+
+| State | Meaning | What to do |
+|---|---|---|
+| `current` | the section matches this cortex | nothing |
+| `missing`, `none`, `outdated` | no file; no section; an older section nobody edited | `instructions` writes it (setup already did) |
+| `edited` | the section was changed by hand | move the workspace's own lines out of the section into the rest of the file, then `instructions --force` (it keeps a backup) |
+| `legacy` | a copy of an older template from before the markers | ask the user. `instructions --adopt` replaces the copied cortex_suite sections with the managed one and keeps a backup; move the workspace's own rules out of those sections first. Or the user keeps the file by hand, and 0.6 lists what in it is out of date |
+| `broken` | the markers cannot be read | fix them by hand: one begin marker, one end marker |
+
+### 0.6 Older cortex guidance
+
+`instructions` ends by listing every line of older cortex guidance that agents
+still read outside the managed section, each with what is true now (`now:`). It
+looks in:
+
+- `CLAUDE.md`, `CLAUDE.local.md`, `.claude/CLAUDE.md` and `AGENTS.md`;
+- `.github/copilot-instructions.md` and `.github/instructions/*.instructions.md`;
+- `.github/prompts/*.prompt.md` and `.claude/skills/*/SKILL.md`;
+- the notes in `.cortex/prefs.toml`;
+- the user-level `~/.claude/CLAUDE.md`;
+- the store's annotations.
+
+The usual finding is a second copy of the protocol: an old rule about the pre-code
+check, closeout, `KNOWLEDGE COMMITTED`, `markers_text` or a removed tool. The
+managed section is the one copy that `instructions` keeps current. Each finding
+is either text cortex wrote, which you fix, or text a person wrote, which you
+ask about first.
+
+- **Text from cortex_suite:** an old template, a seeded note, or a skill cortex
+  drafted. Delete it where the managed section already covers it; otherwise
+  rewrite it to the `now:` line.
+- **Rules a person wrote:** show the user the line and the `now:` line, and ask
+  before changing it. Always ask for `~/.claude/CLAUDE.md`, which belongs to the
+  user and applies to every project they open.
+- **`.cortex/prefs.toml` notes:** `get_preferences` and `get_context` serve these
+  to agents. Delete notes that restate the working protocol; keep facts about the
+  project. `[skills] skills_dir` should be `.claude/skills`, where Claude Code
+  loads skills. Anything else leaves an approved skill on disk where no session
+  reads it.
+- **Store annotations:** there is no edit command. Save the text first
+  (`./.cortex/cortex.sh annotate list > .cortex/backups/annotations-before-update.txt`),
+  then run the printed `fix:` command. If the rest of the annotation still
+  holds, add a corrected one with
+  `annotate add --topic "..." --body "..." --tags ...`.
+- **A team with Windows members:** where the workspace's own rules give shell
+  commands only for bash (`./.cortex/cortex.sh`, `QX_RAW=1`), add the PowerShell
+  form beside them: `.\.cortex\cortex.ps1` and `$env:QX_RAW=1;`.
+
+The list holds only the changes cortex knows it made. It cannot know what a
+person's own rules assume. Read the rest of each instruction file once against
+the managed section, and treat a tool name you cannot find in the servers' tool
+lists as removed.
+
+### 0.7 Verify
+
+```bash
+./.cortex/cortex.sh check-mcp                 # every command resolves; the two configs agree
+./.cortex/cortex.sh instructions --check      # each file current (or a legacy one kept by choice), no older guidance
+```
+
+Then call `get_api_context(hint: "...")` once and see your own types come back.
+Run a build or test, and `./.cortex/cortex.sh fired` should show the shell hook
+live.
+
+### 0.8 Report
+
+Tell the user:
+
+- what you changed, with each backup path;
+- what you left for them: rules of theirs you asked about, a `legacy` file, a
+  launcher you could not merge;
+- anything that failed, with its output.
+
 ---
 
 ## 1. Quickstart
@@ -160,10 +327,12 @@ code.
 Windows blocks *deleting* a running executable but permits *renaming* it — the
 trick self-updaters use. `cortex.ps1 deploy` renames the live binary to
 `cortex.exe.old-<timestamp>`, builds fresh into the freed name, and restores the
-old one if the build fails. The running server keeps its old image until it
-restarts naturally. On macOS and Linux replacing a running binary is already
-safe, so `cortex.sh deploy` is just a build; the command exists on both so the
-instructions do not fork.
+old one if the build fails. The running server keeps its old image until the
+host starts it again, so reconnect it from the host. On macOS and Linux
+replacing a running binary is already safe, so `cortex.sh deploy` is just a
+build, and a cortex or quartz-ctx server waiting for a request moves onto the
+new build by itself (§0.2). The command exists on both so the instructions do
+not fork.
 
 **If you are doing it by hand instead — the older sequence:**
 
@@ -173,8 +342,7 @@ cargo build                                  # cortex
 cargo build --release                        # quartz-ctx
 ```
 ```bash
-pkill -x cortex; pkill -x quartz-ctx
-cargo build && cargo build --release
+cargo build && cargo build --release         # macOS/Linux: nothing to stop; servers move onto the build (§0.2)
 ```
 
 Then **reindex**.
@@ -194,7 +362,8 @@ Older builds cached tool responses keyed on an index version, and that key once
 described only the *data* — so changing how a tool *rendered* data left every
 cached answer "valid" and the rebuilt binary replayed the old output. If you are
 following an older copy of these notes, there is no longer a
-`DELETE FROM response_cache` step and no table to delete from.
+`DELETE FROM response_cache` step. The table may still be in your store, but
+nothing reads or writes it, so there is nothing to clear.
 
 The cache was removed rather than fixed again. It was correct and it invalidated
 properly, but it could not save a token by construction: a cache hit returns
@@ -228,7 +397,7 @@ process that dies immediately.
 
 > Run `cortex.sh check-mcp` (or `cortex.ps1 check-mcp`) to catch this
 > automatically — it compares the commands in both files and fails on drift or
-> on an absolute path.
+> on a command that does not resolve. An absolute path is fine when it exists.
 
 Claude Code reads `.mcp.json`. VS Code reads `.vscode/mcp.json`. They have
 *different shapes* — `mcpServers` vs `servers`, and VS Code needs
@@ -475,8 +644,11 @@ patterns", detail: "full")`.
 2. get_anti_patterns(hint: same)                          # known traps
 3. list_patterns(hint: same)                              # vetted approaches
 4. ... write code ...
-5. when stuck: recall(topic) BEFORE trying a second approach
+5. two attempts failed: recall(topic) or semantic_search before a third
 ```
+
+A build or test failure that matches a recorded trap does not wait for step 5:
+the hook puts the trap in front of the agent (next section).
 
 ### What arrives on its own
 
@@ -735,14 +907,22 @@ reported, and `--adopt` converts it. Both keep the old file under
 `.cortex/backups/`. Closeout lists a section with a newer version available
 under AWAITING YOUR REVIEW.
 
+The section is one copy, and the rules people copied out of older templates are
+the other. `instructions` ends by listing every line of older cortex guidance
+that agents still read outside the section — in your other instruction files,
+skills, `.cortex/prefs.toml` notes, the user-level `~/.claude/CLAUDE.md` and the
+store's annotations — each with what is true now. Fixing them is part of an
+update (§0.6).
+
 For the rules you write yourself, what matters:
 
 **Do:**
 - State the **routing rule** in one place: structure → quartz-ctx, judgment →
   cortex.
 - Make the pre-code check explicit and unconditional — check anti-patterns
-  *before* writing a factory/tick/spawn/physics function, not after it fails.
-- Say **when to re-check mid-task**: after the first failed approach, before the
+  *before* writing any non-trivial function (anything that constructs, ticks,
+  spawns or touches shared state), not after it fails.
+- Say **when to re-check mid-task**: after two failed attempts, before the
   third. The most valuable lookup is the one you skip because you are confident.
 - Keep it short. A long manual is skimmed.
 
@@ -755,7 +935,7 @@ For the rules you write yourself, what matters:
 - Don't write live counts into prose.
 
 After changing any tool surface, grep your instruction files for the removed
-names.
+names. For the tools cortex itself has removed, `instructions --check` does it.
 
 ---
 
@@ -767,7 +947,7 @@ names.
 | ``manifest path `cortex/Cargo.toml` does not exist`` | launcher assumed the crates sit at the workspace root | update the launchers, or set `CORTEX_SUITE`; see 2.12 |
 | quartz-ctx dead, but `check-mcp` passes | a source root that does not exist on this machine | rebuild quartz-ctx; see 2.13 |
 | Workspace name is empty on Windows | `cortex.ps1` read an unassigned `$REPO_ROOT` | update `cortex.ps1`, or set `CORTEX_NAME` |
-| Tool behaves as before a fix | stale binary or cached response | 2.1 then 2.2 |
+| Tool behaves as before a fix | the build failed and left the old binary, or the server has not moved onto the new one | 2.1, then §0.2 |
 | `Access is denied (os error 5)` | server holds the binary | stop processes first (2.1) |
 | Editor sees different data than Claude Code | config drift | 2.4 |
 | Type returns 0 methods | index predates the cross-file impl fix | rebuild and reindex |
@@ -775,7 +955,7 @@ names.
 | Index has units from deleted sources | indexing never prunes | `cortex prune-index --keep <root> ... --apply` |
 | Empty index for an app | `pub`-only extraction | `include_private: true` (2.11) |
 | 0 items on a non-Rust project | the root points at the wrong level, or `include_private` is off | point at the app directory; `include_private: true` (see §7) |
-| `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | `./.cortex/cortex.sh reload-servers` (or reconnect cortex in `/mcp`); see 2.14 |
+| `fired` shows "pushes delivered to agents: NEVER" | this session's cortex server predates hook JSON, or no trap has matched yet | `./.cortex/cortex.sh reload-servers` (a terminal session can reconnect it with `/mcp`; the desktop app needs a restart); see 2.14 |
 | A rebuilt server's new tool never appears in a running session | the session never subscribed that connection to `tools/list_changed`: it predates the server declaring it, or Claude Code restarted the server by itself | in a terminal session, reconnect it with `/mcp`; in the desktop app, which cannot reconnect a local server, restart the app; `reload-servers` moves older servers onto the current code but leaves tool lists as they were |
 | Failed builds missing from the scoreboard | hook set older than v3 (no `PostToolUseFailure` entry) | `./.cortex/cortex.sh hooks-init`; see 2.15 |
 | `hook_non_blocking_error: MCP server 'cortex' not connected` | the server was down (usually mid-deploy) | none needed; hooks are non-blocking and resume when it reconnects |

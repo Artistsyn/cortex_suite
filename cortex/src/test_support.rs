@@ -47,10 +47,10 @@ impl TempStore {
     /// A fresh, EMPTY store.
     ///
     /// Empty is the part that takes doing. `Store::open` runs `first_run_init`
-    /// when it creates the file, which seeds four anti-patterns, a pattern and
-    /// fourteen annotations, writes a prefs.toml beside the database, and prints
-    /// a banner -- so a test that counted rows would be silently off by the size
-    /// of the seed, and every test would print the banner.
+    /// when it creates the file, which seeds four anti-patterns, writes a
+    /// prefs.toml beside the database, and prints a banner -- so a test that
+    /// counted rows would be silently off by the size of the seed, and every
+    /// test would print the banner.
     ///
     /// Creating the file first makes it not-new, so only the schema migration
     /// runs. That is a quiet dependency on how `Store::open` decides newness, so

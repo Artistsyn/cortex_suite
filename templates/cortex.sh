@@ -368,7 +368,7 @@ cortex launcher (bash) - workspace: $NAME
   reindex       regenerate api-graphs and re-index every source in the manifest
   refresh       re-index only roots whose source changed (what the server does per call)
   knowledge-drift  patterns/anti-patterns naming code that changed since written
-  check-mcp     validate both MCP configs (relative paths, no drift)
+  check-mcp     validate both MCP configs (every command resolves, no drift)
   status        store summary            doctor        pipeline health
   recall <t>    look something up        health-report self-learning state
   scoreboard    outcomes, repeat failures, delivery, token bill (--no-tokens to skip the bill)

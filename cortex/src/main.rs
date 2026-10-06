@@ -422,13 +422,18 @@ enum Command {
     /// Add or update the cortex_suite section of CLAUDE.md and
     /// .github/copilot-instructions.md. Only the text between the section's
     /// markers is ours: the rest of each file is left as it is, and a missing
-    /// file is written from the template.
+    /// file is written from the template. Copies of cortex's tool descriptions
+    /// that an older first run seeded into the store are removed, after a
+    /// backup under .cortex/backups/. Then list every line of older cortex
+    /// guidance that agents still read outside that section (instruction files,
+    /// skills, prefs.toml notes, the user-level CLAUDE.md, the store's
+    /// annotations), with what is true now.
     Instructions {
         /// Workspace root (default: current dir).
         #[arg(long)]
         root: Option<PathBuf>,
         /// Report what would change and write nothing; exits 1 if anything would
-        /// change or waits on a decision.
+        /// change, waits on a decision, or older cortex guidance was found.
         #[arg(long)]
         check: bool,
         /// Also replace a section that was edited by hand (the old file is kept
@@ -1020,7 +1025,7 @@ fn main() -> Result<()> {
             if vscode { run_hooks_init_vscode(root, &db_path) } else { run_hooks_init(root, shared, force) }
         }
         Command::Instructions { root, check, force, adopt, name } => {
-            run_instructions(root, name, instructions::Opts { check, force, adopt }, format)
+            run_instructions(root, name, instructions::Opts { check, force, adopt }, cli.db.clone(), format)
         }
         Command::Hook { event } => run_hook(&db_path, event.as_deref()),
         Command::ReloadServers { dry_run } => reload::run(dry_run),
@@ -1034,6 +1039,7 @@ fn run_instructions(
     root: Option<PathBuf>,
     name: Option<String>,
     opts: instructions::Opts,
+    db: Option<PathBuf>,
     format: OutputFormat,
 ) -> Result<()> {
     let root = root.unwrap_or_else(|| PathBuf::from("."));
@@ -1045,16 +1051,73 @@ fn run_instructions(
     });
     let check = opts.check;
     let outcomes = instructions::sync(&root, &project, &opts)?;
+    // An older rule survives wherever a person kept it, and the section cannot
+    // reach it, so it is named here for whoever runs the update to fix.
+    let user_claude = dirs::home_dir().map(|h| h.join(".claude").join("CLAUDE.md"));
+    let mut stale = instructions::stale_guidance(&root, user_claude.as_deref());
+    // The store of the workspace being updated, not of wherever this runs.
+    let db = db.unwrap_or_else(|| root.join(".cortex").join("memory.db"));
+    let (tidy, store_error) = match instructions::tidy_store(&root, &db, check) {
+        Ok((tidy, notes)) => {
+            stale.extend(notes);
+            (tidy, None)
+        }
+        Err(e) => (instructions::StoreTidy::default(), Some(format!("{e:#}"))),
+    };
     match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&outcomes)?),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "files": outcomes,
+                "store": tidy,
+                "store_error": store_error,
+                "older_guidance": stale,
+            }))?
+        ),
         OutputFormat::Text => {
             for o in &outcomes {
                 let backup = o.backup.as_deref().map(|b| format!(" (previous version: {b})")).unwrap_or_default();
                 println!("{}: {}{backup}", o.file, o.action);
             }
+            if !tidy.seeded_copies.is_empty() {
+                let n = tidy.seeded_copies.len();
+                let tools: Vec<&str> =
+                    tidy.seeded_copies.iter().map(|t| t.strip_prefix("MCP: ").unwrap_or(t)).collect();
+                let what = format!(
+                    "{n} cop{} of cortex's tool descriptions that an older first run seeded into the store ({}). \
+                     Each tool describes itself to every client, and the copies had fallen behind.",
+                    if n == 1 { "y" } else { "ies" },
+                    tools.join(", "),
+                );
+                match &tidy.backup {
+                    Some(b) => println!("{}: removed {what} Previous store: {b}", db.display()),
+                    None => println!("{}: would remove {what}", db.display()),
+                }
+            }
+            if let Some(e) = &store_error {
+                println!("{}: could not be read: {e}", db.display());
+            }
+            if !stale.is_empty() {
+                println!(
+                    "older cortex guidance that agents still read, outside the managed section: {} line(s). \
+                     Fix each to say what is true now (SETUP_HANDOFF.md section 0):",
+                    stale.len()
+                );
+                for s in &stale {
+                    println!("  {}: {}", s.place, s.text);
+                    println!("    now: {}", s.now);
+                    if let Some(fix) = &s.fix {
+                        println!("    fix: {fix}");
+                    }
+                }
+            }
         }
     }
-    if check && outcomes.iter().any(|o| o.changed || o.attention) {
+    let waiting = outcomes.iter().any(|o| o.changed || o.attention)
+        || !stale.is_empty()
+        || store_error.is_some()
+        || (tidy.backup.is_none() && !tidy.seeded_copies.is_empty());
+    if check && waiting {
         std::process::exit(1);
     }
     Ok(())

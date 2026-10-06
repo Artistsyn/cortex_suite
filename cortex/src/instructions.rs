@@ -488,6 +488,369 @@ pub fn review_items(root: &Path) -> String {
     out
 }
 
+/// A rule an older cortex_suite gave agents that is no longer true.
+///
+/// `instructions` replaces only its own section, so an older rule survives
+/// wherever a person kept it: their own text beside the section, a copy made
+/// before the markers, a skill, the notes in `.cortex/prefs.toml` (which
+/// `get_preferences` serves to every agent), or the user-level CLAUDE.md.
+/// Nothing here rewrites what a person wrote. It names each line and what is
+/// true now, and whoever runs the update fixes it (SETUP_HANDOFF.md section 0).
+struct Superseded {
+    /// Fragments of the old wording, lowercase, that appear in this order on
+    /// one line. They pin the old CLAIM, not its subject: the current templates
+    /// discuss most of these subjects, and a test keeps every rule off them.
+    old: &'static [&'static str],
+    /// A line the rule must catch, so a typo cannot leave it matching nothing.
+    example: &'static str,
+    /// What is true now.
+    now: &'static str,
+}
+
+const MARKERS_NOW: &str = "markers commit themselves: Claude Code's Stop and PreCompact hooks capture them \
+     from the transcript, so `markers_text` is optional there (`cortex knowledge status` says whether the \
+     hooks have run), and closeout in VS Code reads them from the chat";
+const CLOSEOUT_NOW: &str = "end a verified task with the TASK COMPLETE block and call \
+     closeout_session(outcome_type=\"build_pass\"); ask for KNOWLEDGE COMMITTED only when closeout reports \
+     staged mode, which means the audit switched automatic commit off";
+const HINT_NOW: &str =
+    "get_anti_patterns, list_patterns and get_preferences refuse a call without a `hint` naming what you are about to write";
+const PRECODE_NOW: &str = "the pre-code check covers any non-trivial function (anything that constructs, \
+     ticks, spawns or touches shared state): get_api_context, get_anti_patterns and list_patterns, each with a \
+     hint naming what you are about to write";
+const COMPACT_NOW: &str = "compact_output is the build/test observer cortex's hooks call; agents do not call \
+     it, and nothing shortens command output (no hook can replace a shell result)";
+const GRAPH_NOW: &str = "graphify is served through `cortex graphify-serve`, which rebuilds graph.json and \
+     reloads it when the source moves; there is nothing to rebuild by hand";
+
+const SUPERSEDED: &[Superseded] = &[
+    Superseded {
+        old: &["omitting", "markers_text", "commits nothing"],
+        example: "so omitting `markers_text` commits nothing and reports success.",
+        now: MARKERS_NOW,
+    },
+    Superseded {
+        old: &["markers_text", "is required"],
+        example: "**`markers_text` is required on Claude Code.**",
+        now: MARKERS_NOW,
+    },
+    Superseded { old: &["store to scrape"], example: "There is no host chat-store to scrape; omit it", now: MARKERS_NOW },
+    Superseded { old: &["markers alone do not save"], example: "Markers alone do not save anything.", now: MARKERS_NOW },
+    Superseded {
+        old: &["anything else to skip"],
+        example: "Reply KNOWLEDGE COMMITTED to commit, anything else to skip.",
+        now: CLOSEOUT_NOW,
+    },
+    Superseded {
+        old: &["wrong:", "\\ncorrect:"],
+        example: "[CORTEX-AP: description=\"...\"]wrong: ...\\ncorrect: ...[/CORTEX-AP]",
+        now: "`correct:` must begin its own line: written after a literal \\n, the whole body is stored as `wrong` \
+              and the fix as a placeholder",
+    },
+    Superseded {
+        old: &["knowledge committed", "markers_text"],
+        example: "On KNOWLEDGE COMMITTED, call closeout_session with inline_approve=true and markers_text set",
+        now: MARKERS_NOW,
+    },
+    Superseded {
+        old: &["type knowledge committed"],
+        example: "session-end: after any coding session, type KNOWLEDGE COMMITTED to trigger closeout",
+        now: CLOSEOUT_NOW,
+    },
+    Superseded { old: &["to commit: reply knowledge committed"], example: "To commit: reply KNOWLEDGE COMMITTED", now: CLOSEOUT_NOW },
+    Superseded { old: &["session end", "knowledge committed"], example: "## Session end — KNOWLEDGE COMMITTED", now: CLOSEOUT_NOW },
+    Superseded {
+        old: &["run post-session"],
+        example: "session-end mandatory: after any coding session run post-session then annotate new bugs",
+        now: CLOSEOUT_NOW,
+    },
+    Superseded { old: &["cortex.ps1 post-session"], example: "Session-End: cortex.ps1 post-session", now: CLOSEOUT_NOW },
+    Superseded {
+        old: &["flush_knowledge_markers"],
+        example: "call flush_knowledge_markers(text=...) to stage markers",
+        now: "don't route agents to flush_knowledge_markers: on Claude Code its quoted attributes arrive mangled; \
+              markers commit through the capture hooks or closeout_session",
+    },
+    Superseded { old: &["get_anti_patterns()"], example: "1. `get_anti_patterns()` — known traps", now: HINT_NOW },
+    Superseded { old: &["list_patterns()"], example: "call list_patterns() at session start", now: HINT_NOW },
+    Superseded { old: &["get_preferences()"], example: "Follow `get_preferences()` for naming", now: HINT_NOW },
+    Superseded { old: &["hint is optional"], example: "The hint is optional but recommended.", now: HINT_NOW },
+    Superseded {
+        old: &["baseline retrieval"],
+        example: "baseline retrieval: get_delta → get_preferences → get_anti_patterns",
+        now: HINT_NOW,
+    },
+    Superseded {
+        old: &["get_anti_patterns + get_preferences + list_patterns"],
+        example: "MANDATORY PRE-CODE CHECK: call get_anti_patterns + get_preferences + list_patterns",
+        now: PRECODE_NOW,
+    },
+    Superseded {
+        old: &["factory/tick"],
+        example: "Before writing ANY factory/tick/spawn/physics/pool function:",
+        now: PRECODE_NOW,
+    },
+    Superseded { old: &["factory, tick"], example: "factory, tick/update, spawn, pool: check first", now: PRECODE_NOW },
+    Superseded {
+        old: &["get_variants(enum"],
+        example: "- `get_variants(enum)` — exact variants with field types",
+        now: "get_variants takes `name`, as get_item does; passing `enum` fails with missing `name`",
+    },
+    Superseded {
+        old: &["delete from response_cache"],
+        example: "DELETE FROM response_cache;",
+        now: "nothing caches responses any more; there is nothing to clear after a rebuild",
+    },
+    Superseded {
+        old: &["clear the response cache"],
+        example: "Then clear the response cache.",
+        now: "nothing caches responses any more; there is nothing to clear after a rebuild",
+    },
+    Superseded {
+        old: &["may predate your edits"],
+        example: "[stale index] answers may predate your edits.",
+        now: "every call checks the disk first; `[stale index]` appears only when a refresh failed, naming the \
+              root and the error, and reindex is never needed for correct answers",
+    },
+    Superseded {
+        old: &["real front end agreed"],
+        example: "`resolved` means a real front end agreed the types",
+        now: "no language's types are inferred: `resolved` (Rust) means the language requires declared types, so \
+              a signature is complete as written",
+    },
+    Superseded {
+        old: &["grep stays right for free text"],
+        example: "grep stays right for free text, logs and config",
+        now: "search_code and get_source(file, lines) read logs and config too; grep stays right only for \
+              filtering a command's output",
+    },
+    Superseded {
+        old: &["reconnect it once from"],
+        example: "after a rebuild, reconnect it once from `/mcp`",
+        now: "a server waiting for a request moves onto a rebuild by itself (macOS, Linux); only a terminal \
+              session can reconnect with /mcp, and the desktop app needs a restart",
+    },
+    Superseded {
+        old: &["graph is a snapshot"],
+        example: "The graph is a snapshot: rebuild it after significant changes.",
+        now: GRAPH_NOW,
+    },
+    Superseded { old: &["stale graph answers"], example: "A stale graph answers confidently and wrongly.", now: GRAPH_NOW },
+    Superseded {
+        old: &["agent_customization/skills"],
+        example: "skills_dir = \"agent_customization/skills\"",
+        now: "approved skills publish to .claude/skills (Claude Code) and .github/prompts (Copilot); set \
+              skills_dir = \".claude/skills\" under [skills] in .cortex/prefs.toml",
+    },
+    Superseded {
+        old: &["snippet from cortex/readme"],
+        example: "5. Copy the copilot-instructions.md snippet from cortex/README.md",
+        now: "`cortex instructions` adds and updates the cortex_suite section; there is no snippet to copy",
+    },
+    Superseded {
+        old: &["compact_output", "losslessly"],
+        example: "compact_output (MCP) losslessly strips only provably-redundant command output",
+        now: COMPACT_NOW,
+    },
+    Superseded {
+        old: &["call the compact_output"],
+        example: "it cannot auto-compact; call the compact_output MCP tool directly instead",
+        now: COMPACT_NOW,
+    },
+    Superseded {
+        old: &["check-mcp", "relative paths"],
+        example: "| `check-mcp` | validate both MCP configs: relative paths, no drift between hosts |",
+        now: "check-mcp checks that each command resolves (an absolute path is fine when it exists) and that \
+              the two MCP configs agree",
+    },
+    Superseded {
+        old: &["existing root first"],
+        example: "Keep an existing root first in index-sources.json.",
+        now: "the order of index-sources.json means nothing: a missing root is skipped wherever it sits, and \
+              the server starts anyway",
+    },
+];
+
+/// Tools an older cortex served, or an older plan named, that no server has
+/// now. A rule naming one fails at the call, after the agent chose it.
+const REMOVED_TOOLS: &[&str] = &[
+    "recurrent_think",
+    "get_code_examples",
+    "check_anti_patterns",
+    "validate_physics_config",
+    "check_lifetime_constraints",
+    "suggest_action_for_intent",
+    "get_tick_loop_order",
+    "explain_behavior",
+    "get_usage_patterns",
+    "get_engine_constants",
+];
+const REMOVED_NOW: &str = "no server has this tool any more; route to the tools the cortex_suite section names";
+
+/// The old wording's fragments, in order, on this lowercased line.
+fn says(line: &str, old: &[&str]) -> bool {
+    let mut rest = line;
+    old.iter().all(|f| match rest.find(f) {
+        Some(i) => {
+            rest = &rest[i + f.len()..];
+            true
+        }
+        None => false,
+    })
+}
+
+/// What is true now, when this lowercased line repeats an older rule.
+fn older_rule(lower: &str) -> Option<&'static str> {
+    SUPERSEDED
+        .iter()
+        .find(|r| says(lower, r.old))
+        .map(|r| r.now)
+        .or_else(|| REMOVED_TOOLS.iter().any(|t| lower.contains(t)).then_some(REMOVED_NOW))
+}
+
+/// One line of older cortex guidance, and what is true now.
+#[derive(Debug, Serialize)]
+pub struct Stale {
+    /// `file:line`, or `store annotation <id> (<topic>)`.
+    pub place: String,
+    pub text: String,
+    pub now: &'static str,
+    /// The command that removes it, where an edit cannot reach it.
+    pub fix: Option<String>,
+}
+
+/// The text with its whitespace collapsed, cut at 140 characters.
+fn excerpt(text: &str) -> String {
+    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match text.char_indices().nth(140) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
+    }
+}
+
+/// The files agents read instructions from, as (label, path), existing ones
+/// only: the workspace's instruction files, skills and prompt files, the notes
+/// in `.cortex/prefs.toml`, and `user_claude` (the user-level CLAUDE.md).
+fn guidance_files(root: &Path, user_claude: Option<&Path>) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = [
+        "CLAUDE.md",
+        "CLAUDE.local.md",
+        ".claude/CLAUDE.md",
+        ".github/copilot-instructions.md",
+        "AGENTS.md",
+        ".cortex/prefs.toml",
+    ]
+    .iter()
+    .map(|rel| (rel.to_string(), root.join(rel)))
+    .collect();
+    let listed = |dir: &str, keep: &dyn Fn(&Path) -> Option<PathBuf>| -> Vec<(String, PathBuf)> {
+        let Ok(entries) = std::fs::read_dir(root.join(dir)) else { return Vec::new() };
+        let mut found: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| keep(&e.path()))
+            .filter_map(|p| Some((p.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/"), p)))
+            .collect();
+        found.sort();
+        found
+    };
+    let ending = |suffix: &'static str| move |p: &Path| p.to_string_lossy().ends_with(suffix).then(|| p.to_path_buf());
+    out.extend(listed(".github/instructions", &ending(".instructions.md")));
+    out.extend(listed(".github/prompts", &ending(".prompt.md")));
+    out.extend(listed(".claude/skills", &|p: &Path| Some(p.join("SKILL.md"))));
+    if let Some(p) = user_claude {
+        out.push((p.display().to_string(), p.to_path_buf()));
+    }
+    out.retain(|(_, p)| p.is_file());
+    out
+}
+
+/// Every line of older cortex guidance in the files agents read, outside the
+/// cortex_suite section (that one is current, or `instructions` reports it).
+pub fn stale_guidance(root: &Path, user_claude: Option<&Path>) -> Vec<Stale> {
+    let mut out = Vec::new();
+    for (label, path) in guidance_files(root, user_claude) {
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let (_, _, text) = decode(&raw);
+        let ours = find(&text).ok().flatten().map(|f| f.start..f.end);
+        let mut pos = 0;
+        for (n, line) in text.split_inclusive('\n').enumerate() {
+            let inside = ours.as_ref().is_some_and(|r| r.contains(&pos));
+            pos += line.len();
+            if inside {
+                continue;
+            }
+            if let Some(now) = older_rule(&line.to_lowercase()) {
+                out.push(Stale { place: format!("{label}:{}", n + 1), text: excerpt(line), now, fix: None });
+            }
+        }
+    }
+    out
+}
+
+/// The store's side of an update.
+#[derive(Debug, Default, Serialize)]
+pub struct StoreTidy {
+    /// Copies of cortex's tool descriptions an older first run seeded, by
+    /// topic: removed, or under `--check` to be removed.
+    pub seeded_copies: Vec<String>,
+    /// Where the store was copied before they were removed.
+    pub backup: Option<String>,
+}
+
+/// A copy of one of cortex's tool descriptions as a first run used to seed
+/// it: topic `MCP: <tool>`, body `Params: ...`. Each tool describes itself to
+/// every client in tools/list, and that changes with the code; the copy stayed
+/// as written and recall and get_context served it beside the tool. By
+/// 2026-10 five of FlowMake's thirteen contradicted their tool, three with
+/// `Params: none` for a required hint, and one named a tool no server has.
+fn seeded_tool_copy(topic: &str, body: &str) -> bool {
+    topic.starts_with("MCP: ") && body.trim_start().starts_with("Params:")
+}
+
+/// Remove the seeded tool copies from the workspace's store after a backup
+/// (under `check`, only name them), and list the annotations a person wrote
+/// that repeat an older rule. A store that does not exist is not created.
+pub fn tidy_store(root: &Path, db: &Path, check: bool) -> Result<(StoreTidy, Vec<Stale>)> {
+    let mut tidy = StoreTidy::default();
+    let mut stale = Vec::new();
+    if !db.is_file() {
+        return Ok((tidy, stale));
+    }
+    let store = crate::memory::Store::open(db)?;
+    let mut seeded = Vec::new();
+    for a in store.all_annotations()? {
+        let Some(id) = a.id else { continue };
+        if seeded_tool_copy(&a.topic, &a.body) {
+            seeded.push((id, a.topic));
+            continue;
+        }
+        if let Some(now) = older_rule(&format!("{} {}", a.topic, a.body).to_lowercase()) {
+            let fix = Some(crate::cache::launcher_command(&format!("annotate remove {id}")));
+            let place = format!("store annotation {id} ({})", excerpt(&a.topic));
+            stale.push(Stale { place, text: excerpt(&a.body), now, fix });
+        }
+    }
+    seeded.sort();
+    if !check && !seeded.is_empty() {
+        let dir = root.join(".cortex").join("backups");
+        std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        let name = db.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let to = dir.join(format!("{name}.{}.sqlite3", chrono::Utc::now().format("%Y%m%dT%H%M%S%.6fZ")));
+        // VACUUM INTO reads through SQLite, so commits still in the -wal file
+        // are in the copy (see Store::backup_before_migration).
+        store
+            .conn()
+            .execute("VACUUM INTO ?1", rusqlite::params![to.to_string_lossy()])
+            .with_context(|| format!("failed to back up {} to {}", db.display(), to.display()))?;
+        for (id, _) in &seeded {
+            store.delete_annotation(*id)?;
+        }
+        tidy.backup = Some(to.display().to_string());
+    }
+    tidy.seeded_copies = seeded.into_iter().map(|(_, topic)| topic).collect();
+    Ok((tidy, stale))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,5 +1031,113 @@ mod tests {
         assert_eq!(state(Some(&text), doc), State::Current { restamp: true });
         let fixed = replace(&text, &render(body));
         assert_eq!(state(Some(&fixed), doc), State::Current { restamp: false });
+    }
+
+    /// A rule that matched current text would send every update after a line
+    /// that is right; one that missed its own example would never fire.
+    #[test]
+    fn every_older_rule_catches_its_example_and_nothing_shipped_today() {
+        for r in SUPERSEDED {
+            assert!(says(&r.example.to_lowercase(), r.old), "{:?} misses its own example", r.old);
+        }
+        for t in REMOVED_TOOLS {
+            assert_eq!(older_rule(&format!("then call `{t}(hint)`")), Some(REMOVED_NOW), "{t}");
+        }
+        let shipped = [
+            ("templates/CLAUDE.md", DOCS[0].template),
+            ("templates/copilot-instructions.md", DOCS[1].template),
+            ("templates/skills/frontier/SKILL.md", include_str!("../../templates/skills/frontier/SKILL.md")),
+            ("templates/skills/frontier.prompt.md", include_str!("../../templates/skills/frontier.prompt.md")),
+            ("the first-run prefs.toml", crate::memory::PREFS_TEMPLATE),
+        ];
+        for (name, text) in shipped {
+            for (n, line) in text.lines().enumerate() {
+                if let Some(now) = older_rule(&line.to_lowercase()) {
+                    panic!("{name}:{}: {line:?} reads as an older rule (now: {now})", n + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn older_guidance_is_named_wherever_agents_read_it_except_inside_the_section() {
+        let d = tmp("instr_stale");
+        let root = d.path();
+        // The user's own stale line is reported; the managed section's is not,
+        // since `instructions` owns that text and replaces it itself.
+        let section = render("## Ours\n\nso omitting `markers_text` commits nothing\n");
+        std::fs::write(root.join("CLAUDE.md"), format!("# Mine\n\nTo commit: reply KNOWLEDGE COMMITTED\n\n{section}"))
+            .unwrap();
+        std::fs::create_dir_all(root.join(".cortex")).unwrap();
+        std::fs::write(
+            root.join(".cortex/prefs.toml"),
+            "[project]\nnotes = [\n    \"call get_anti_patterns + get_preferences + list_patterns\",\n]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".claude/skills/lookup")).unwrap();
+        std::fs::write(root.join(".claude/skills/lookup/SKILL.md"), "# lookup\n\n**`markers_text` is required on Claude Code.**\n")
+            .unwrap();
+        std::fs::write(root.join("AGENTS.md"), "Nothing older here.\n").unwrap();
+        let user = root.join("user-CLAUDE.md");
+        std::fs::write(&user, "## Session end — KNOWLEDGE COMMITTED\n").unwrap();
+        let found: Vec<String> = stale_guidance(root, Some(&user)).into_iter().map(|s| s.place).collect();
+        assert_eq!(
+            found,
+            vec![
+                "CLAUDE.md:3".to_string(),
+                ".cortex/prefs.toml:3".to_string(),
+                ".claude/skills/lookup/SKILL.md:3".to_string(),
+                format!("{}:1", user.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn seeded_tool_copies_leave_the_store_after_a_backup_and_a_persons_older_note_is_named() {
+        use crate::model::Annotation;
+        let store = crate::test_support::TempStore::new("instr_tidy").unwrap();
+        let root = store.dir().to_path_buf();
+        let db = root.join("memory.db");
+        let add = |topic: &str, body: &str| {
+            store
+                .insert_annotation(&Annotation {
+                    id: None,
+                    topic: topic.to_string(),
+                    body: body.to_string(),
+                    tags: vec![],
+                    added_at: chrono::Utc::now(),
+                    hash: None,
+                })
+                .unwrap()
+        };
+        add("MCP: get_preferences", "Params: none. Returns active prefs.toml summary loaded at server startup.");
+        add("MCP: recurrent_think", "Params: task str required, hypothesis str.");
+        let mine = add("deploy", "Then clear the response cache.");
+        add("MCP: recall", "Mine: recall is cheaper than semantic_search for exact names.");
+        let topics = |s: &crate::memory::Store| {
+            let mut t: Vec<String> = s.all_annotations().unwrap().into_iter().map(|a| a.topic).collect();
+            t.sort();
+            t
+        };
+
+        let (tidy, stale) = tidy_store(&root, &db, true).unwrap();
+        assert_eq!(tidy.seeded_copies, ["MCP: get_preferences", "MCP: recurrent_think"]);
+        assert!(tidy.backup.is_none());
+        assert_eq!(topics(&store).len(), 4, "--check removed something");
+        let places: Vec<&str> = stale.iter().map(|s| s.place.as_str()).collect();
+        assert_eq!(places, [format!("store annotation {mine} (deploy)")]);
+        assert!(stale[0].fix.as_deref().is_some_and(|f| f.ends_with(&format!("annotate remove {mine}"))));
+
+        let (tidy, _) = tidy_store(&root, &db, false).unwrap();
+        let backup = PathBuf::from(tidy.backup.expect("removed without a backup"));
+        assert!(backup.starts_with(root.join(".cortex/backups")) && backup.is_file());
+        // The person's annotations stay, including one about an MCP tool that
+        // was not a seeded copy.
+        assert_eq!(topics(&store), ["MCP: recall", "deploy"]);
+        let copy = crate::memory::Store::open(&backup).unwrap();
+        assert_eq!(topics(&copy).len(), 4, "the backup is not the store as it was");
+
+        let none = tidy_store(&root, &root.join("absent.db"), false).unwrap();
+        assert!(none.0.seeded_copies.is_empty() && !root.join("absent.db").exists());
     }
 }
