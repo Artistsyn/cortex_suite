@@ -245,13 +245,27 @@ impl Session {
     /// sends an owed list_changed. While nothing has been read ahead, which is
     /// while waiting for the client, a rebuilt binary takes the connection over.
     pub fn next_line(&mut self, out: &mut impl Write) -> io::Result<Option<String>> {
+        self.next_line_with(out, || {})
+    }
+
+    /// `next_line`, calling `before_exec` once a rebuilt binary has answered
+    /// the handshake, just before this process becomes it. An exec runs no
+    /// destructors, so this is where a server lets go of what would outlive
+    /// it: a child process, whose pipes close with the exec, is otherwise left
+    /// a zombie that the build after it cannot reap. Should the exec fail,
+    /// this build serves on without whatever was let go.
+    pub fn next_line_with(
+        &mut self,
+        out: &mut impl Write,
+        mut before_exec: impl FnMut(),
+    ) -> io::Result<Option<String>> {
         if self.owed {
             writeln!(out, "{LIST_CHANGED}")?;
             out.flush()?;
             self.owed = false;
         }
         while self.reader.buffer().is_empty() {
-            self.hand_over_if_rebuilt(out)?;
+            self.hand_over_if_rebuilt(out, &mut before_exec)?;
             if input_ready(IDLE_CHECK) {
                 break;
             }
@@ -263,7 +277,7 @@ impl Session {
         Ok(Some(line))
     }
 
-    fn hand_over_if_rebuilt(&mut self, out: &mut impl Write) -> io::Result<()> {
+    fn hand_over_if_rebuilt(&mut self, out: &mut impl Write, before_exec: &mut impl FnMut()) -> io::Result<()> {
         let Some(bin) = self.binary.as_mut() else { return Ok(()) };
         let Some(now) = bin.replaced() else { return Ok(()) };
         bin.tried = Some(now);
@@ -279,6 +293,7 @@ impl Session {
             return Ok(());
         }
         out.flush()?;
+        before_exec();
         let err = hand_over(&bin.path, self.name, &self.carry);
         eprintln!("{}: could not start the rebuilt binary ({err}); this build keeps serving", self.name);
         Ok(())

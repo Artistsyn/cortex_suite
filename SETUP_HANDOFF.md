@@ -64,8 +64,9 @@ compiled into it.
 
 - **macOS and Linux:** a cortex or quartz-ctx server waiting for a request
   moves onto the new build by itself within seconds, on the same connection,
-  and tells its host the tool list changed. A server older than that cannot
-  move. A few seconds after the build, list any:
+  and tells its host the tool list changed; cortex's `graphify-serve` proxy
+  takes its graphify-rs child's handshake along. A server older than that
+  cannot move. A few seconds after the build, list any:
 
   ```bash
   ./.cortex/cortex.sh reload-servers --dry-run
