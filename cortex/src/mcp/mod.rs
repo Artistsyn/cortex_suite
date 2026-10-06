@@ -732,7 +732,7 @@ fn tools_list() -> Value {
                         },
                         "error_text":   { "type": "string", "description": "Optional error context if failure." },
                         "diff_symbols": { "type": "string", "description": "Optional comma-separated symbols changed." },
-                        "markers_text": { "type": "string", "description": "Text containing your [CORTEX-*] markers to commit/stage. Required on Claude Code / Continue / CLI (VS Code falls back to session-store scraping if omitted)." }
+                        "markers_text": { "type": "string", "description": "Text containing your [CORTEX-*] markers to commit/stage. Optional on Claude Code once its Stop and PreCompact hooks capture them from the transcript (`cortex knowledge status` says whether they have run); VS Code reads them from the chat. From any other host (Continue, a script) pass them here, or they are not committed." }
                     },
                     "required": ["outcome_type"]
                 }

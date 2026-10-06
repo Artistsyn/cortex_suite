@@ -41,15 +41,19 @@ it is never stale.
   context), the overflow counted per file. `get_source(file, lines="120-160")`
   reads by line number (sed -n, head, tail, cat) from any text file.
 - **A shell grep or `sed -n 'A,Bp'` is answered by quartz-ctx anyway.** The
-  PreToolUse Bash hook (`hooks-init`) rewrites a read-only one into
+  PreToolUse hook (`hooks-init`) rewrites a read-only one into
   `quartz-ctx nav`, which prints the same lines plus the item each match is in.
-  Anything it cannot reproduce runs untouched. `QX_RAW=1` in a command keeps
-  the raw tool; `QX_HOOK=off` in Claude Code's environment turns the hook off.
-  grep stays right for filtering a command's output.
+  In PowerShell it does the same for `Select-String` and for a `Get-Content`
+  line range (`| Select-Object -Skip N -First M`, `-TotalCount`, `-Tail`,
+  `(Get-Content f)[a..b]`). Anything it cannot reproduce runs untouched.
+  `QX_RAW=1` in a command (`$env:QX_RAW=1;` in PowerShell) keeps the raw tool;
+  `QX_HOOK=off` in Claude Code's environment turns the hook off. grep stays
+  right for filtering a command's output.
 - `get_api_context(hint)` — **start here for any coding task**; one budgeted
   packet of the relevant types, variants and signatures
 - `get_item(name)` — full definition, including methods from every `impl` file
-- `get_variants(enum)` — exact variants with field types
+- `get_variants(name)` — exact variants with field types (the parameter is
+  `name`, as for `get_item`)
 - `search_items` / `list_items` / `find_related_types`
 - `get_trait_implementations` / `get_builder_methods` / `get_return_type_usage`
 - `trace_across_languages` — where one language calls another (HTTP routes joined
@@ -362,7 +366,7 @@ commands on both.
 | `fired` | which mechanisms have actually run, and which are silently idle |
 | `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
 | `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note); `--vscode` installs the same for VS Code Copilot |
-| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
 | `-- <args>` | pass anything straight through to the binary |
 
 `fired` answers the one question nothing else asks: *has this ever actually

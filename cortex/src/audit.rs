@@ -38,15 +38,15 @@ pub struct Mechanism {
 
 /// Everything with a heartbeat worth watching, and how often to expect one.
 pub const MECHANISMS: &[Mechanism] = &[
-    // The Bash observer. It used to be labelled "token saving", and for months
-    // it computed compacted copies no agent ever received; it now records what
-    // it saw and claims nothing (see push.rs).
+    // The shell observer (Bash and PowerShell). It used to be labelled "token
+    // saving", and for months it computed compacted copies no agent ever
+    // received; it now records what it saw and claims nothing (see push.rs).
     Mechanism {
-        label: "Bash hook (observes commands)",
+        label: "shell hook (observes Bash and PowerShell commands)",
         table: "compression_savings",
         ts_col: "saved_at",
         expect_days: 2.0,
-        when_idle: "the Bash hook is not installed or not reaching the server",
+        when_idle: "the shell hook is not installed or not reaching the server",
         filter: "",
         optional: false,
     },

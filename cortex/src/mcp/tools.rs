@@ -3586,7 +3586,7 @@ fn tool_propose_skill(
     let prefs_path    = repo_root.join(".cortex").join("prefs.toml");
     let skills_dir    = crate::prefs::load(&prefs_path)
         .map(|p| p.skills.skills_dir)
-        .unwrap_or_else(|_| "agent_customization/skills".to_string());
+        .unwrap_or_else(|_| crate::prefs::SkillsPrefs::default().skills_dir);
 
     // Write the agent's OWN authored content — never the placeholder template.
     // (A prior version silently discarded `procedure`; see anti-patterns.)

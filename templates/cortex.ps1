@@ -20,7 +20,7 @@
 #   .\.cortex\cortex.ps1 git-review        # Check git diff for pattern relevance
 #   .\.cortex\cortex.ps1 index-self        # Re-index cortex/src itself (scope: cortex)
 #   .\.cortex\cortex.ps1 status            # Show DB stats
-#   .\.cortex\cortex.ps1 post-session      # AFTER EVERY SESSION: git-review + pending observations + annotation reminder
+#   .\.cortex\cortex.ps1 post-session      # Optional review by hand: git-review + pending observations + how to add an entry
 #   .\.cortex\cortex.ps1 quality-check     # Audit: 0-use patterns, survival flags, anti-pattern count
 #   .\.cortex\cortex.ps1 health-report      # One-line system health: patterns, gaps, orphans, proposals
 #   .\.cortex\cortex.ps1 consolidate-if-stale [-StalenessHours N]  # Run pipeline if > N hours stale (default: 8)
@@ -1329,11 +1329,11 @@ switch ($Command) {
         Invoke-OrExit -BaseArgs @("run", "--quiet", "--manifest-path", $CARGO, "--", "--db", $DB, "--format", "json", "status", "--full")
     }
     "init" {
-        # Re-seed workflow anti-patterns, MCP tool annotations, and prefs.toml template.
+        # Re-seed workflow anti-patterns and the prefs.toml template.
         # NOTE: As of the first-run init feature, all of this happens automatically when a new
-        # DB is created. Use 'init' to force-seed an existing DB that predates this feature,
-        # or to re-add annotations after a DB wipe. Anti-patterns always append;
-        # MCP annotations are skipped if they already exist (dedup by topic).
+        # DB is created. Use 'init' to force-seed an existing DB that predates this feature.
+        # Anti-patterns always append. Copies of the MCP tools' descriptions are no longer
+        # seeded: each tool describes itself to the client, and the copies fell behind.
         Write-Prefix '=== CORTEX INIT ==='
         Write-Prefix ''
 
@@ -1354,11 +1354,13 @@ comments = "/// doc comments on all public API; inline only for non-obvious logi
 [project]
 name = "MyProject"
 language = "Rust"
-notes = [
-    "MANDATORY PRE-CODE CHECK (no PROTOCOL required): before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
-    "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying. After two failed attempts STOP and call recall or semantic_search before a third.",
-    "session-end mandatory: after any coding session run post-session then annotate new bugs as anti-patterns and working implementations as patterns",
-]
+# Facts about THIS project that agents should follow, one string each, such as
+# "Canvas::run(action) is the safe dispatch path". get_preferences and
+# get_context serve them, tiered by the agent's hint. The working protocol
+# (pre-code check, closeout, markers) lives in the cortex_suite section of
+# CLAUDE.md and .github/copilot-instructions.md: restated here, the two copies
+# drift apart and agents are served both.
+notes = []
 '@
             Set-Content -Path $PrefsPath -Value $prefsContent -Encoding UTF8
             Write-Prefix "prefs.toml created at $PrefsPath — edit [project].name and add your API notes."
@@ -1401,9 +1403,6 @@ notes = [
         Write-Prefix "  [4/4] powershell-em-dash-cli added (exit $LASTEXITCODE)"
 
         Write-Prefix ''
-        Write-Prefix 'Seeding MCP tool annotations...'
-        & "$PSScriptRoot\seed_mcp_annotations.ps1"
-        Write-Prefix ''
         Write-Prefix '=== INIT COMPLETE ==='
         Write-Prefix ''
         Write-Prefix 'Next steps:'
@@ -1415,7 +1414,9 @@ notes = [
         Write-Prefix '     and .github/copilot-instructions.md; the rest of each file is left alone)'
     }
     "post-session" {
-        # Run after every coding session: git-review + pending observations + annotation reminder
+        # Optional review by hand: git-review + pending observations + how to add an entry.
+        # Not a session-end step: markers commit through the capture hooks and
+        # closeout_session.
         Write-Prefix '=== POST-SESSION CORTEX CHECKLIST ==='
         Write-Prefix ''
         Write-Prefix 'Step 1: git-review - scanning changed files for pattern relevance...'

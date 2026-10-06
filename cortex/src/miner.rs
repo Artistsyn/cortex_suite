@@ -103,7 +103,7 @@ pub const NON_SIGNAL_TOOLS: &[&str] = &[
     "note_challenge", "compact_output", "edit_guard",
     "get_delta", "get_preferences", "get_anti_patterns", "get_context", "list_patterns",
     "begin_protocol_session", "get_session_health", "flush_knowledge_markers", "closeout_session",
-    "Bash", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS", "TodoWrite",
+    "Bash", "PowerShell", "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS", "TodoWrite",
 ];
 
 /// A tool sequence with the non-signal tools removed, order kept.

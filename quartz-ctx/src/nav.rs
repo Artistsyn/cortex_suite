@@ -212,9 +212,10 @@ impl Nav {
     /// Files whose text contains `needle`, with their text.
     fn candidates(&mut self, roots: &[(PathBuf, String, bool)], needle: &str, file: Option<&str>) -> Vec<(SrcFile, Arc<String>)> {
         let mut out = Vec::new();
+        let want = file.map(slashed);
         for f in self.files(roots) {
-            if let Some(want) = file {
-                if !f.path.to_string_lossy().contains(want) {
+            if let Some(want) = &want {
+                if !slashed(&f.path).contains(want) {
                     continue;
                 }
             }
@@ -467,37 +468,77 @@ impl Nav {
     /// A file's items with line ranges, or a directory's files with their
     /// top-level items.
     pub fn outline(&mut self, roots: &[(PathBuf, String, bool)], path_query: &str) -> String {
-        let q = path_query.trim().trim_end_matches('/');
+        let q = path_query.trim().trim_end_matches(['/', '\\']);
         if q.is_empty() {
             return "Give a file or directory: `get_outline(path=\"src/canvas/core.rs\")`.".into();
         }
         let files = self.files(roots);
+        // A path that exists from the working directory wins, as it would for ls.
         let qa = absolute(Path::new(q));
-        let exact: Vec<&SrcFile> = files.iter().filter(|f| f.path == qa).collect();
-        let matching: Vec<&SrcFile> = if !exact.is_empty() {
-            exact
-        } else {
-            files.iter().filter(|f| f.path.to_string_lossy().ends_with(q) || f.path.to_string_lossy().contains(&format!("/{q}"))).collect()
-        };
-        let in_dir: Vec<&SrcFile> = files
+        if let Some(f) = files.iter().find(|f| f.path == qa) {
+            return self.outline_file(f);
+        }
+        if qa.is_dir() && files.iter().any(|f| f.path.starts_with(&qa)) {
+            return self.outline_dir(&files, &qa, q);
+        }
+        // Otherwise the end of a file's path, then of a directory's (the nearest
+        // above each file), and only then the start of a name (`canvas/core` for
+        // `canvas/core.rs`): tried first, that also takes in every file under a
+        // directory of the name, and a directory came back as a list of files.
+        let end = slashed(q);
+        let tail = format!("/{end}");
+        let named: Vec<&SrcFile> = files.iter().filter(|f| slashed(&f.path).ends_with(&tail)).collect();
+        if !named.is_empty() {
+            return self.outline_one_of(q, &named);
+        }
+        let under = format!("{tail}/");
+        let mut dirs: Vec<&Path> = files
             .iter()
-            .filter(|f| f.path.starts_with(&qa) || f.path.to_string_lossy().contains(&format!("/{q}/")))
+            .filter(|f| slashed(&f.path).contains(&under))
+            .filter_map(|f| f.path.ancestors().skip(1).find(|a| slashed(a).ends_with(&tail)))
             .collect();
-        if matching.len() == 1 {
-            let f = matching[0].clone();
-            return self.outline_file(&f);
-        }
-        if matching.len() > 1 {
-            let mut out = format!("`{q}` matches {} files; pass one of:\n", matching.len());
-            for f in matching.iter().take(30) {
-                out.push_str(&format!("  {}\n", f.path.display()));
+        dirs.sort();
+        dirs.dedup();
+        match dirs.as_slice() {
+            [] => {}
+            [dir] => return self.outline_dir(&files, dir, &dir.display().to_string()),
+            many => {
+                let mut out = format!("`{q}` names {} directories; pass more of the path:\n", many.len());
+                for d in many.iter().take(30) {
+                    out.push_str(&format!("  {}\n", d.display()));
+                }
+                return out.trim_end().to_string();
             }
-            return out.trim_end().to_string();
         }
-        if in_dir.is_empty() {
+        let loose: Vec<&SrcFile> = files
+            .iter()
+            .filter(|f| {
+                let s = slashed(&f.path);
+                s.ends_with(&end) || s.contains(&tail)
+            })
+            .collect();
+        if loose.is_empty() {
             return format!("No source file or directory matching `{q}` under the indexed roots.");
         }
-        let mut out = format!("{q}/ — {} source file(s)\n", in_dir.len());
+        self.outline_one_of(q, &loose)
+    }
+
+    /// One file's items, or the files `q` could mean.
+    fn outline_one_of(&mut self, q: &str, matching: &[&SrcFile]) -> String {
+        if let [f] = matching {
+            return self.outline_file(f);
+        }
+        let mut out = format!("`{q}` matches {} files; pass one of:\n", matching.len());
+        for f in matching.iter().take(30) {
+            out.push_str(&format!("  {}\n", f.path.display()));
+        }
+        out.trim_end().to_string()
+    }
+
+    /// The source files under `dir`, each with its top-level items.
+    fn outline_dir(&mut self, files: &[SrcFile], dir: &Path, label: &str) -> String {
+        let in_dir: Vec<&SrcFile> = files.iter().filter(|f| f.path.starts_with(dir)).collect();
+        let mut out = format!("{label}/ — {} source file(s)\n", in_dir.len());
         for f in in_dir.iter().take(80) {
             let Some(text) = self.read(&f.path) else { continue };
             let n = text.lines().count();
@@ -513,7 +554,7 @@ impl Nav {
             let more = tops.len().saturating_sub(shown.len());
             out.push_str(&format!(
                 "  {} ({n} lines): {}{}\n",
-                f.path.strip_prefix(&qa).unwrap_or(&f.path).display(),
+                f.path.strip_prefix(dir).unwrap_or(&f.path).display(),
                 shown.join(", "),
                 if more > 0 { format!(", +{more}") } else { String::new() }
             ));
@@ -612,7 +653,8 @@ impl Nav {
         }
 
         // One file asked for by name needs no path line: the caller knows it.
-        let single = o.paths.len() == 1 && hits.len() == 1 && absolute(Path::new(o.paths[0].trim())).is_file();
+        let single =
+            !o.expanded && o.paths.len() == 1 && hits.len() == 1 && absolute(Path::new(o.paths[0].trim())).is_file();
         let mut body = String::new();
         let mut shown = 0usize; // matching lines accounted for in the listing
         let mut printed = 0usize; // match and context lines, for `head`
@@ -755,11 +797,11 @@ impl Nav {
         let keep = |p: &Path| {
             glob.as_ref().is_none_or(|g| {
                 let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                g.is_match(&name) || g.is_match(&p.to_string_lossy())
+                g.is_match(&name) || g.is_match(&slashed(p))
             })
         };
         let wanted: Vec<&str> =
-            paths.iter().map(|p| p.trim().trim_end_matches('/')).filter(|q| !q.is_empty()).collect();
+            paths.iter().map(|p| p.trim().trim_end_matches(['/', '\\'])).filter(|q| !q.is_empty()).collect();
         if wanted.is_empty() {
             let files: Vec<SrcFile> = self.files(roots).into_iter().filter(|f| keep(&f.path)).collect();
             return Ok((files, "the indexed roots".into()));
@@ -774,12 +816,13 @@ impl Nav {
                 walk_text(&direct).into_iter().map(|p| SrcFile { origin: origin_of(roots, &p), path: p }).collect()
             } else {
                 // Otherwise the end of a path under the roots.
+                let end = slashed(q);
                 let all = under_roots.get_or_insert_with(|| self.files(roots));
                 let hits: Vec<SrcFile> = all
                     .iter()
                     .filter(|f| {
-                        let s = f.path.to_string_lossy();
-                        s.ends_with(&format!("/{q}")) || s.contains(&format!("/{q}/"))
+                        let s = slashed(&f.path);
+                        s.ends_with(&format!("/{end}")) || s.contains(&format!("/{end}/"))
                     })
                     .cloned()
                     .collect();
@@ -895,11 +938,12 @@ impl Nav {
         if direct.is_file() {
             return Ok(direct);
         }
+        let end = format!("/{}", slashed(q));
         let hits: Vec<PathBuf> = self
             .files(roots)
             .into_iter()
             .map(|f| f.path)
-            .filter(|p| p.to_string_lossy().ends_with(&format!("/{q}")))
+            .filter(|p| slashed(p).ends_with(&end))
             .collect();
         match hits.len() {
             0 => Err(format!("No file `{q}` in the working directory or under the indexed roots.")),
@@ -942,6 +986,9 @@ pub struct SearchOpts {
     /// Fold lines that differ only in their numbers, for summarising logs.
     /// Off unless asked: the numbers are often what the reader is after.
     pub collapse: Option<bool>,
+    /// `paths` came from expanding a wildcard, so even one file is named:
+    /// the caller named a pattern, not it.
+    pub expanded: bool,
 }
 
 impl Default for SearchOpts {
@@ -960,6 +1007,7 @@ impl Default for SearchOpts {
             output: SearchOutput::Lines,
             limit: DEFAULT_REF_LIMIT,
             collapse: None,
+            expanded: false,
         }
     }
 }
@@ -1053,12 +1101,12 @@ pub fn bre_to_ere(p: &str) -> String {
 
 /// Globs - `*.rs`, `*.{rs,wgsl}`, `src/**/*.rs`, several separated by commas -
 /// as one regex, matched against a file's name or, for a glob with a `/`, the
-/// end of its path.
+/// end of its path as `slashed` writes it. A `\` in a glob reads as `/`.
 fn glob_regex(globs: &str) -> Result<regex::Regex, String> {
     let mut parts: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut depth = 0usize;
-    for c in globs.chars() {
+    for c in globs.chars().map(|c| if c == '\\' { '/' } else { c }) {
         match c {
             '{' => {
                 depth += 1;
@@ -1119,6 +1167,44 @@ fn walk_text(path: &Path) -> Vec<PathBuf> {
             out.push(absolute(entry.path()));
         }
     }
+    out.sort();
+    out
+}
+
+/// The files a wildcard in a path's last part names (`src\*.rs`, `mod?.rs`),
+/// as PowerShell's `-Path` expands one, for shells that pass the pattern
+/// through instead of expanding it. Case-insensitive, files only, sorted;
+/// empty when the path is not a wildcard, exists as written, or matches
+/// nothing.
+pub fn expand_wildcard(path: &Path) -> Vec<String> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Vec::new() };
+    if !name.contains(['*', '?']) || path.exists() {
+        return Vec::new();
+    }
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    if dir.to_string_lossy().contains(['*', '?']) {
+        return Vec::new();
+    }
+    let pattern: String = name
+        .chars()
+        .map(|c| match c {
+            '*' => ".*".to_string(),
+            '?' => ".".to_string(),
+            c => regex::escape(&c.to_string()),
+        })
+        .collect();
+    let Ok(re) = regex::RegexBuilder::new(&format!("^{pattern}$")).case_insensitive(true).build() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| re.is_match(n)) && e.path().is_file())
+        .map(|e| e.path().display().to_string())
+        .collect();
     out.sort();
     out
 }
@@ -1986,6 +2072,15 @@ fn absolute(p: &Path) -> PathBuf {
     }
 }
 
+/// A path as text with `/` between its parts on every system: how both sides
+/// are compared wherever the end of a path or a glob is matched. A Windows
+/// walk gives `C:\w\src\lib.rs`, and a caller may write either separator. (A
+/// `\` inside a Unix file name reads as a separator too, which costs nothing
+/// real.)
+fn slashed(p: impl AsRef<Path>) -> String {
+    p.as_ref().to_string_lossy().replace('\\', "/")
+}
+
 /// `"120-160"` -> (120, 160); `"120"` -> (120, 120).
 pub fn parse_range(s: &str) -> Option<(usize, usize)> {
     let s = s.trim();
@@ -2274,8 +2369,11 @@ pub enum Action {
         let mut nav = Nav::new();
         nav.display_base = Some(d.path().to_path_buf());
         let one = d.path().join("src/lib.rs").display().to_string();
-        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![one], ..Default::default() });
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![one.clone()], ..Default::default() });
         assert_eq!(out, "  fn draw_rect 15-15\n15:fn draw_rect() {}");
+        // The one file a wildcard expanded to was not named by the caller.
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![one], expanded: true, ..Default::default() });
+        assert_eq!(out, "src/lib.rs\n  fn draw_rect 15-15\n15:fn draw_rect() {}");
         let dir = d.path().join("src").display().to_string();
         let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![dir], ..Default::default() });
         assert!(out.starts_with("src/lib.rs\n") && out.contains("src/other.rs\n"), "{out}");
@@ -2315,6 +2413,23 @@ pub enum Action {
     }
 
     #[test]
+    fn a_wildcard_in_the_last_part_names_that_directorys_files() {
+        let (d, _) = tmp_root(&[("w/src/a.rs", "x"), ("w/src/B.RS", "x"), ("w/src/c.txt", "x"), ("w/src/sub/d.rs", "x")]);
+        let base = d.path().join("w/src");
+        let names = |p: &str| -> Vec<String> {
+            expand_wildcard(&base.join(p))
+                .iter()
+                .map(|f| Path::new(f).file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names("*.rs"), vec!["B.RS", "a.rs"], "case-insensitive, files only, not recursive");
+        assert_eq!(names("?.txt"), vec!["c.txt"]);
+        assert!(names("*.zz").is_empty());
+        assert!(names("a.rs").is_empty(), "not a wildcard");
+        assert!(expand_wildcard(&d.path().join("w/*/d.rs")).is_empty(), "only the last part");
+    }
+
+    #[test]
     fn line_ranges_take_head_tail_and_lists() {
         assert_eq!(parse_ranges("-3", 10), Ok(vec![(8, 10)]));
         assert_eq!(parse_ranges("5-", 10), Ok(vec![(5, 10)]));
@@ -2333,6 +2448,84 @@ pub enum Action {
         assert!(g.is_match("x.toml") && g.is_match("Cargo.lock") && !g.is_match("x.rs"));
         let g = glob_regex("src/**/*.rs").unwrap();
         assert!(g.is_match("/w/crate/src/a/b.rs") && !g.is_match("/w/crate/tests/b.rs"));
+        // Written and walked the Windows way.
+        let g = glob_regex(r"src\**\*.rs").unwrap();
+        assert!(g.is_match(&slashed(r"C:\w\crate\src\a\b.rs")) && !g.is_match(&slashed(r"C:\w\crate\tests\b.rs")));
+    }
+
+    /// A Windows walk gives `C:\w\src\renderer\lights.rs`, and a caller names
+    /// the end of a path with either separator (the MCP tools turn `\` into `/`
+    /// before it gets here). A file whose name holds backslashes walks to the
+    /// same text on any system.
+    #[test]
+    fn the_end_of_a_path_matches_whichever_separator_either_side_uses() {
+        let (_d, roots) = tmp_root(&[(r"src\renderer\lights.rs", "pub fn shade() {}\n")]);
+        let mut nav = Nav::new();
+        // Every miss is listed, so one run shows each entry point that fails.
+        let mut missed = Vec::new();
+        let mut expect = |what: String, out: String, wanted: &str| {
+            if !out.contains(wanted) {
+                missed.push(format!("{what}: {out}"));
+            }
+        };
+        let line = "1:pub fn shade() {}";
+        for q in ["renderer/lights.rs", r"renderer\lights.rs"] {
+            let o = SearchOpts { paths: vec![q.into()], ..Default::default() };
+            expect(format!("search {q}"), search(&mut nav, &roots, "shade", o), line);
+            expect(format!("read {q}"), nav.read_lines(&roots, q, None, 400), "1\tpub fn shade() {}");
+            let out = nav.get_source(&roots, "shade", Some(q), None, DEFAULT_MAX_LINES);
+            expect(format!("get_source {q}"), out, "fn shade — ");
+            let out = nav.find_references(&roots, "shade", Some(q), false, DEFAULT_REF_LIMIT);
+            expect(format!("find_references {q}"), out, "(definition)");
+            expect(format!("outline {q}"), nav.outline(&roots, q), "pub fn shade()");
+        }
+        for q in ["renderer", "src/renderer", r"src\renderer\"] {
+            let o = SearchOpts { paths: vec![q.into()], ..Default::default() };
+            expect(format!("search in {q}"), search(&mut nav, &roots, "shade", o), line);
+        }
+        for g in ["renderer/*.rs", r"renderer\*.rs", "src/**/*.rs"] {
+            let o = SearchOpts { glob: Some(g.into()), ..Default::default() };
+            expect(format!("glob {g}"), search(&mut nav, &roots, "shade", o), line);
+        }
+        assert!(missed.is_empty(), "\n{}", missed.join("\n"));
+    }
+
+    /// A directory lists its source files with their top-level items however it
+    /// is named: from the working directory (the MCP tool passes a workspace
+    /// path as written), absolutely, or by the end of its path under the roots.
+    /// A name that several directories end with asks which, and a file is still
+    /// found by the end of its path or the start of its name.
+    #[test]
+    fn a_directory_lists_its_files_however_it_is_named() {
+        let (d, roots) = tmp_root(&[
+            ("pkg/src/lib.rs", CANVAS),
+            ("pkg/src/render/mod.rs", "pub fn draw() {}\n"),
+            ("pkg/src/render/json.rs", "pub fn emit() {}\n"),
+            ("other/src/main.rs", "fn main() {}\n"),
+        ]);
+        let base = d.path().display().to_string();
+        let here = vec![(std::env::current_dir().unwrap().join("src"), "t".to_string(), true)];
+        let mut nav = Nav::new();
+        // Every miss is listed, so one run shows each way of naming that fails.
+        let mut missed = Vec::new();
+        let mut expect = |q: &str, out: String, wanted: &str| {
+            if !out.contains(wanted) {
+                missed.push(format!("{q}: {out}"));
+            }
+        };
+        let out = nav.outline(&roots, "pkg/src");
+        expect("pkg/src", out.clone(), &format!("{base}/pkg/src/ — 3 source file(s)\n"));
+        expect("pkg/src", out.clone(), "\n  lib.rs (15 lines): Canvas, draw_rect");
+        expect("pkg/src", out, "\n  render/json.rs (1 lines): emit");
+        let render = format!("{base}/pkg/src/render/ — 2 source file(s)\n");
+        expect("src/render/", nav.outline(&roots, "src/render/"), &render);
+        expect("absolute", nav.outline(&roots, &format!("{base}/pkg/src/render")), &render);
+        let which = format!("`src` names 2 directories; pass more of the path:\n  {base}/other/src\n  {base}/pkg/src");
+        expect("src", nav.outline(&roots, "src"), &which);
+        expect("render/json.rs", nav.outline(&roots, "render/json.rs"), "pub fn emit()  1-1");
+        expect("pkg/src/lib", nav.outline(&roots, "pkg/src/lib"), "impl Canvas  3-13");
+        expect("src from here", nav.outline(&here, "src"), "\n  nav.rs (");
+        assert!(missed.is_empty(), "\n{}", missed.join("\n"));
     }
 
     #[test]

@@ -31,6 +31,16 @@ WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 say "workspace: $WORKSPACE"
 say "suite:     $SUITE_ROOT"
 
+# A workspace that already has a manifest or a store is being updated, not set
+# up. Setup leaves its launchers and skills as they are, so it ends by naming
+# the ones that differ from this suite's copies and handing the rest of the
+# update to SETUP_HANDOFF.md section 0, where an agent can finish it.
+UPDATING=0
+if [ -e "$WORKSPACE/.cortex/index-sources.json" ] || [ -e "$WORKSPACE/.cortex/memory.db" ]; then
+  UPDATING=1
+fi
+KEPT=""
+
 # Only the build needs a toolchain. --skip-build exists precisely for a machine
 # that has the binaries already (a shared checkout, a second workspace) and it
 # used to die here anyway, on a requirement it was not about to use.
@@ -40,20 +50,14 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 fi
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  # A running MCP server holds its binary open, so a rebuild silently keeps the
-  # old one on some filesystems. Stop them first.
-  #
-  # Only around a build. This killed every running server unconditionally,
-  # including under --skip-build, which builds nothing -- so adding a SECOND
-  # workspace to a machine tore down the live servers of the first, in a step
-  # that had no reason to touch them.
-  if pgrep -x cortex >/dev/null 2>&1 || pgrep -x quartz-ctx >/dev/null 2>&1; then
-    say "stopping running server process(es) so the rebuild is not blocked"
-    pkill -x cortex     2>/dev/null || true
-    pkill -x quartz-ctx 2>/dev/null || true
-    sleep 1
-  fi
-
+  # Running servers are left running. On macOS and Linux a build replaces a
+  # binary in use without disturbing the copy that is running, and a cortex or
+  # quartz-ctx server waiting for a request moves onto the new build by itself,
+  # on the same connection, and tells its host the tool list changed. Setup
+  # used to stop every server here first, which threw that away: the host
+  # started them again by itself, and a session keeps the tool list it had
+  # for a server started that way. A server too old to move itself is listed
+  # by `reload-servers --dry-run` (SETUP_HANDOFF.md section 0).
   say "building cortex (debug)..."
   ( cd "$SUITE_ROOT/cortex" && cargo build ) || die "cortex build failed"
   say "building quartz-ctx (release)..."
@@ -168,6 +172,7 @@ for pair in "templates/cortex.sh:.cortex/cortex.sh" "templates/cortex.ps1:.corte
   src="${pair%%:*}"; dst="${pair##*:}"
   if [ -e "$WORKSPACE/$dst" ] && [ "$FORCE" -eq 0 ]; then
     warn "$dst exists, leaving it alone"
+    cmp -s "$SUITE_ROOT/$src" "$WORKSPACE/$dst" || KEPT="$KEPT $dst"
   else
     mkdir -p "$(dirname "$WORKSPACE/$dst")"
     cp "$SUITE_ROOT/$src" "$WORKSPACE/$dst"
@@ -187,6 +192,27 @@ INSTR_FORCE=""
 "$CORTEX_EXE" instructions --root "$WORKSPACE" --name "$NAME" $INSTR_FORCE \
   | while IFS= read -r line; do say "$line"; done \
   || die "cortex could not update the instruction files (built before 'instructions' existed? re-run without --skip-build)"
+
+if [ "$UPDATING" -eq 1 ]; then
+  say ""
+  say "UPDATE: this workspace already had cortex_suite; setup brought the cortex_suite"
+  say "section of its instruction files up to date (reported above)."
+  if [ -n "$KEPT" ]; then
+    say "These differ from the copies this suite ships, and setup left them as they were:"
+    for f in $KEPT; do say "  $f"; done
+  fi
+  say ""
+  say "Finish the update with the checklist in section 0 of"
+  say "  $SUITE_ROOT/SETUP_HANDOFF.md"
+  say "It covers what setup does not: servers too old to move onto the new build,"
+  say "launchers and skills older than this suite's, VS Code's hooks, and older"
+  say "cortex guidance kept in instruction files, .cortex/prefs.toml and the store,"
+  say "then checks the result. If an agent is running this setup, it should work"
+  say "through that section now."
+  say ""
+  say "Setup complete."
+  exit 0
+fi
 
 say ""
 say "NEXT: edit .cortex/index-sources.json to list your projects, then run:"

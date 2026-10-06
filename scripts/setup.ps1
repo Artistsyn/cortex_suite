@@ -48,6 +48,14 @@ $Workspace = (Resolve-Path $Workspace).Path
 Say "workspace: $Workspace"
 Say "suite:     $SuiteRoot"
 
+# A workspace that already has a manifest or a store is being updated, not set
+# up. Setup leaves its launchers and skills as they are, so it ends by naming
+# the ones that differ from this suite's copies and handing the rest of the
+# update to SETUP_HANDOFF.md section 0, where an agent can finish it.
+$Updating = (Test-Path (Join-Path $Workspace '.cortex\index-sources.json')) -or
+            (Test-Path (Join-Path $Workspace '.cortex\memory.db'))
+$Kept = @()
+
 # Only the build needs a toolchain. -SkipBuild exists precisely for a machine
 # that already has the binaries, and it used to die here anyway on a
 # requirement it was not about to use.
@@ -225,6 +233,8 @@ foreach ($doc in @(
     New-Item -ItemType Directory -Force -Path (Split-Path $dstPath -Parent) | Out-Null
     if ((Test-Path $dstPath) -and -not $Force) {
         Warn "$($doc.label) exists, leaving it alone"
+        $shipped = Join-Path $SuiteRoot $doc.src
+        if ((Get-FileHash $shipped).Hash -ne (Get-FileHash $dstPath).Hash) { $Kept += $doc.dst }
     } else {
         Copy-Item (Join-Path $SuiteRoot $doc.src) $dstPath -Force
         Say "wrote $($doc.label)"
@@ -242,6 +252,32 @@ if ($Force) { $instrArgs += '--force' }
 Invoke-Native { & $CortexExe @instrArgs } | ForEach-Object { Say $_ }
 if ($LASTEXITCODE -ne 0) {
     Die "cortex could not update the instruction files (built before 'instructions' existed? re-run without -SkipBuild)"
+}
+
+if ($Updating) {
+    Say ""
+    Say "UPDATE: this workspace already had cortex_suite; setup brought the cortex_suite"
+    Say "section of its instruction files up to date (reported above)."
+    if ($Kept.Count -gt 0) {
+        Say "These differ from the copies this suite ships, and setup left them as they were:"
+        foreach ($f in $Kept) { Say "  $f" }
+    }
+    Say ""
+    Say "Finish the update with the checklist in section 0 of"
+    Say ("  " + (Join-Path $SuiteRoot 'SETUP_HANDOFF.md'))
+    if ($running) {
+        Say "Setup stopped the running servers so Windows would let the build replace"
+        Say "them: reconnect them from each host (VS Code: 'MCP: Restart Server'; Claude"
+        Say "Code: /mcp in a terminal session, or restart the desktop app)."
+        Say ""
+    }
+    Say "The checklist covers what setup does not: launchers and skills older than"
+    Say "this suite's, VS Code's hooks, and older cortex guidance kept in instruction"
+    Say "files, .cortex/prefs.toml and the store, then checks the result. If an agent"
+    Say "is running this setup, it should work through that section now."
+    Say ""
+    Say "Setup complete."
+    exit 0
 }
 
 # ── First index ──────────────────────────────────────────────────────────────

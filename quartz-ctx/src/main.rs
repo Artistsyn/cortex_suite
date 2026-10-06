@@ -125,6 +125,8 @@ enum NavCmd {
     /// Lines of a file by number, like get_source(file, lines): `120-160,300-`, `-40`.
     Read {
         file: String,
+        /// `-40` (the last 40) is a value here, not a flag.
+        #[arg(allow_hyphen_values = true)]
         lines: Option<String>,
         #[arg(long)]
         max_lines: Option<usize>,
@@ -182,11 +184,17 @@ enum NavCmd {
     /// A file's items or a directory's files, like get_outline.
     Outline { path: String },
     /// Claude Code PreToolUse hook: reads the event on stdin and, for a Bash
-    /// grep or `sed -n` it can answer at least as fully, returns the nav
-    /// command to run instead. Prints nothing otherwise. QX_HOOK=off disables it.
+    /// grep or `sed -n`, or a PowerShell Select-String or Get-Content line
+    /// read, that it can answer at least as fully, returns the nav command to
+    /// run instead. Prints nothing otherwise. QX_HOOK=off disables it.
     Hook,
     /// Show what the hook would run for a command, or `(as written)`.
-    Rewrite { command: String },
+    Rewrite {
+        command: String,
+        /// Read it as a PowerShell command, as the PowerShell tool's are.
+        #[arg(long)]
+        powershell: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -373,7 +381,8 @@ fn find_manifest(dir: &Path) -> Option<PathBuf> {
     dir.ancestors().map(|d| d.join(".cortex/index-sources.json")).find(|m| m.is_file())
 }
 
-/// The PreToolUse hook: a Bash read rewritten into a nav command, or nothing.
+/// The PreToolUse hook: a Bash or PowerShell read rewritten into a nav
+/// command in the same shell's syntax, or nothing.
 fn run_nav_hook() -> Result<()> {
     use std::io::Read;
     if std::env::var("QX_HOOK").is_ok_and(|v| v == "off") {
@@ -382,9 +391,11 @@ fn run_nav_hook() -> Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) else { return Ok(()) };
-    if event["tool_name"].as_str() != Some("Bash") {
-        return Ok(());
-    }
+    let powershell = match event["tool_name"].as_str() {
+        Some("Bash") => false,
+        Some("PowerShell") => true,
+        _ => return Ok(()),
+    };
     let Some(command) = event["tool_input"]["command"].as_str() else { return Ok(()) };
     let cwd = event["cwd"].as_str().map(PathBuf::from).or_else(|| std::env::current_dir().ok());
     let manifest = cwd
@@ -393,8 +404,12 @@ fn run_nav_hook() -> Result<()> {
         .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok().and_then(|d| find_manifest(Path::new(&d))));
     let exe = std::env::current_exe()?.display().to_string();
     let manifest_text = manifest.as_ref().map(|m| m.display().to_string());
-    let Some(rw) = quartz_ctx::rewrite::rewrite(command, &quartz_ctx::rewrite::shell_quote(&exe), manifest_text.as_deref())
-    else {
+    let rw = if powershell {
+        quartz_ctx::rewrite::rewrite_powershell(command, &exe, manifest_text.as_deref())
+    } else {
+        quartz_ctx::rewrite::rewrite(command, &quartz_ctx::rewrite::shell_quote(&exe), manifest_text.as_deref())
+    };
+    let Some(rw) = rw else {
         return Ok(());
     };
     let mut input = event["tool_input"].clone();
@@ -417,7 +432,7 @@ fn run_nav_hook() -> Result<()> {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
-            "permissionDecisionReason": "quartz-ctx answers this read-only grep/sed from the source, grouped by item",
+            "permissionDecisionReason": "quartz-ctx answers this read-only search or line read from the source, grouped by item",
             "updatedInput": input,
         }
     });
@@ -436,10 +451,15 @@ fn chrono_now() -> String {
 fn run_nav(args: NavArgs) -> Result<()> {
     match &args.cmd {
         NavCmd::Hook => return run_nav_hook(),
-        NavCmd::Rewrite { command } => {
+        NavCmd::Rewrite { command, powershell } => {
             let manifest = std::env::current_dir().ok().as_deref().and_then(find_manifest);
             let manifest_text = manifest.as_ref().map(|m| m.display().to_string());
-            match quartz_ctx::rewrite::rewrite(command, "quartz-ctx", manifest_text.as_deref()) {
+            let rw = if *powershell {
+                quartz_ctx::rewrite::rewrite_powershell(command, "quartz-ctx", manifest_text.as_deref())
+            } else {
+                quartz_ctx::rewrite::rewrite(command, "quartz-ctx", manifest_text.as_deref())
+            };
+            match rw {
                 Some(rw) => println!("{}", rw.command),
                 None => println!("(as written)"),
             }
@@ -484,7 +504,7 @@ fn run_nav(args: NavArgs) -> Result<()> {
             _ => Vec::new(),
         }
         .into_iter()
-        .filter(|p| !Path::new(&mine(p)).exists())
+        .filter(|p| !Path::new(&mine(p)).exists() && nav::expand_wildcard(&cwd.join(p)).is_empty())
         .collect();
         for p in &missing {
             eprintln!("{p}: No such file or directory");
@@ -516,8 +536,29 @@ fn run_nav(args: NavArgs) -> Result<()> {
             nav.read_lines(&roots, &mine(&file), lines.as_deref(), max_lines.unwrap_or(nav::DEFAULT_READ_LINES))
         }
         NavCmd::Search { pattern, paths, ignore_case, word, fixed, basic, context, after, before, head, glob, files, count, limit, collapse } => {
+            let mut expanded = false;
+            let paths: Vec<String> = paths
+                .iter()
+                .flat_map(|p| {
+                    let m = mine(p);
+                    if Path::new(&m).exists() {
+                        return vec![m];
+                    }
+                    // `src\*.rs` from a shell that passes wildcards through.
+                    let found = nav::expand_wildcard(&cwd.join(p));
+                    if !found.is_empty() {
+                        expanded = true;
+                        found
+                    } else if hook {
+                        Vec::new()
+                    } else {
+                        vec![m]
+                    }
+                })
+                .collect();
             let opts = nav::SearchOpts {
-                paths: paths.iter().map(|p| mine(p)).filter(|p| !hook || Path::new(p).exists()).collect(),
+                paths,
+                expanded,
                 glob,
                 ignore_case,
                 word,

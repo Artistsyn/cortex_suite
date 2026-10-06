@@ -116,12 +116,19 @@ Setup installs a launcher into `.cortex/` for both platforms — `cortex.sh` and
 ```bash
 ./.cortex/cortex.sh reindex      # full rebuild of every configured source (first run)
 ./.cortex/cortex.sh refresh      # re-index only what changed (the servers do this themselves)
-./.cortex/cortex.sh check-mcp    # confirm both MCP configs agree and use relative paths
+./.cortex/cortex.sh check-mcp    # confirm both MCP configs agree and every command resolves
 ./.cortex/cortex.sh deploy       # rebuild without stopping the running server
 ```
 
 Don't want to list crates by hand? `quartz-ctx serve --discover .` finds every
 crate under a directory — workspace members and standalone crates alike.
+
+**Updating?** `git pull` here, then run setup again on the same workspace. It
+rebuilds both servers and updates the cortex_suite section of your instruction
+files. It then points your agent at
+[SETUP_HANDOFF.md §0](SETUP_HANDOFF.md#0-updating-a-workspace-that-already-has-cortex_suite)
+for the rest: running servers, hooks, launchers, and older cortex guidance still
+kept in your own files.
 
 **→ Read [SETUP_HANDOFF.md](SETUP_HANDOFF.md) before you start.** It documents
 the pitfalls that cost us real debugging time — stale binaries, cache replay,
@@ -168,7 +175,7 @@ upgrades them by hand.
 | Hook | When | What the agent gets |
 |---|---|---|
 | `edit_guard` | after an Edit or Write | one short warning when the edit shares **distinctive** evidence with a recorded trap: a code identifier plus one more rare token, or three rare words. Ordinary English, library identifiers and prose files never count. At most one per file and four per session. |
-| Bash observer | after every command, **including failed ones** (`PostToolUseFailure`) | nothing, usually; every build/test verdict is recorded. When a failure matches a trap — the one linked to it by `anti-pattern add --resolves`, or one its error message names — the agent gets the trap and its fix. A specific failure seen in three sessions with nothing recorded gets a nudge with the exact command to record it. |
+| shell observer (Bash and PowerShell) | after every command, **including failed ones** (`PostToolUseFailure`) | nothing, usually; every build/test verdict is recorded. When a failure matches a trap — the one linked to it by `anti-pattern add --resolves`, or one its error message names — the agent gets the trap and its fix. A specific failure seen in three sessions with nothing recorded gets a nudge with the exact command to record it. |
 | `note_challenge` | on each user message | records a disputed claim as an open question, to be settled by checking |
 
 Two facts shaped all of this, and both were learned the hard way. Claude Code
@@ -178,6 +185,15 @@ there. And a command that exits non-zero never reaches `PostToolUse`, so an
 observer that listens only there sees nothing but the failures a pipe happened
 to hide. No hook can shrink a Bash result, so cortex does not claim to save
 tokens that way.
+
+**PowerShell is a shell like Bash.** Claude Code's shell tool is `PowerShell`
+on Windows without Git Bash, or anywhere with `CLAUDE_CODE_USE_POWERSHELL_TOOL=1`.
+The hooks match it as they match Bash. The observer reads its output, and the
+restore summary and scoreboard count its runs. quartz-ctx's PreToolUse hook
+answers `Select-String` searches and `Get-Content` line reads the way it answers
+grep and `sed -n`. On Windows that hook runs quartz-ctx directly, in exec form
+(Claude Code 2.1.139+), so it needs neither Git Bash nor a PowerShell start-up
+on every command.
 
 The matching was chosen by replaying real history: over 2,403 recorded edits,
 the guard now speaks on 32% of them instead of 91%, and a labelled sample of its

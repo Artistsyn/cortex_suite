@@ -68,19 +68,32 @@ fn is_build_command(cmd: &str) -> bool {
         || toks.iter().any(|t| SINGLE.contains(t) || t.ends_with("run.sh") || t.ends_with("bench.py"))
 }
 
-/// The command without a leading `cd somewhere &&`, which varies between runs
-/// of the same command.
-fn normalise_command(cmd: &str) -> String {
-    // The first line is the command; what follows a heredoc is its script,
-    // whose text (`cargo build` inside a Python string) is not a run of it.
-    let mut c = cmd.trim().lines().next().unwrap_or("").trim();
-    while let Some(rest) = c.strip_prefix("cd ") {
-        match rest.find("&&") {
-            Some(i) => c = rest[i + 2..].trim_start(),
+/// `cmd` after any leading `cd somewhere &&`, which varies between runs of the
+/// same command; also `cd somewhere;`, and PowerShell's `Set-Location`, `sl`
+/// and `Push-Location` (5.1 has no `&&`).
+pub(crate) fn after_cd(cmd: &str) -> &str {
+    let mut c = cmd.trim();
+    loop {
+        let lower = c.to_ascii_lowercase();
+        let Some(word) = ["cd ", "set-location ", "sl ", "pushd ", "push-location "].into_iter().find(|w| lower.starts_with(w))
+        else {
+            break;
+        };
+        let rest = &c[word.len()..];
+        match [rest.find("&&").map(|i| (i, 2)), rest.find(';').map(|i| (i, 1))].into_iter().flatten().min() {
+            Some((i, sep)) => c = rest[i + sep..].trim_start(),
             None => break,
         }
     }
-    c.split_whitespace().collect::<Vec<_>>().join(" ")
+    c
+}
+
+/// The command as it is compared between runs.
+fn normalise_command(cmd: &str) -> String {
+    // The first line is the command; what follows a heredoc is its script,
+    // whose text (`cargo build` inside a Python string) is not a run of it.
+    let first = cmd.trim().lines().next().unwrap_or("");
+    after_cd(first).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn text_of(content: &Value) -> String {
@@ -253,7 +266,7 @@ pub fn state_of(entries: &[Value]) -> State {
                             match (name, file) {
                                 ("Edit" | "Write" | "MultiEdit" | "NotebookEdit", Some(f)) => edits.push(f.to_string()),
                                 ("Read", Some(f)) => reads.push(f.to_string()),
-                                ("Bash", _) => {
+                                ("Bash" | "PowerShell", _) => {
                                     if let (Some(id), Some(cmd)) =
                                         (p.get("id").and_then(Value::as_str), input.get("command").and_then(Value::as_str))
                                     {
@@ -418,6 +431,20 @@ mod tests {
         assert_eq!(st.edited, vec![("/w/src/a.rs".to_string(), 1)]);
         assert_eq!(st.requests, vec!["make the probe bake handle pillars".to_string()]);
         assert_eq!(st.last_note, "Next I will fix the linker flags.");
+    }
+
+    /// A PowerShell session's runs count the same, `Set-Location x;` set aside
+    /// as `cd x &&` is.
+    #[test]
+    fn powershell_runs_decide_green_too() {
+        let st = state_of(&[
+            tool_use("1", "PowerShell", json!({"command": "Set-Location C:\\w; cargo test -p bake"})),
+            result("1", "error: could not compile", true),
+            tool_use("2", "PowerShell", json!({"command": "cd C:\\w; cargo test -p bake"})),
+            result("2", "test result: ok. 4 passed", false),
+        ]);
+        assert_eq!(st.green, vec!["cargo test -p bake".to_string()]);
+        assert!(st.failing.is_empty());
     }
 
     #[test]

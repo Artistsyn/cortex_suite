@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::model::*;
 
 // ── First-run prefs.toml template ─────────────────────────────────────────────
-const PREFS_TEMPLATE: &str = r#"[style]
+pub(crate) const PREFS_TEMPLATE: &str = r#"[style]
 line_length = 100
 indent = "4 spaces"
 naming = "snake_case functions and variables, PascalCase types and enums"
@@ -29,13 +29,13 @@ comments = "/// doc comments on all public API; inline only for non-obvious logi
 [project]
 name = "MyProject"
 language = "Rust"
-notes = [
-    "MANDATORY PRE-CODE CHECK (no PROTOCOL required): before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
-    "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying. After two failed attempts STOP and call recall or semantic_search before a third.",
-    "session-end mandatory: when task verified complete, present Task Complete Summary and ask user to type KNOWLEDGE COMMITTED to trigger closeout_session(inline_approve=true)",
-    "compact_output (MCP) losslessly strips only provably-redundant command output (build/download progress, per-test '... ok' lines == cargo -q, duplicate lines). Every error/warning/panic/failure is kept verbatim with its file:line, and the full original is tee'd to .cortex/tee/. It is post-processing of output you ALREADY ran — it is NOT a replacement for reading files or seeing diagnostics, and it never drops actionable content.",
-    "Claude Code: the compact_output PostToolUse(Bash) hook AUTO-INSTALLS on the first cortex serve of a Claude Code project (into .claude/settings.local.json — personal/git-ignored, install-once via a .cortex/.claude-hooks-installed sentinel; removing the hook is respected and not re-added). Set CORTEX_NO_AUTO_HOOKS=1 to disable, or run 'cortex hooks-init --shared' to commit it for teammates. VS Code Copilot has NO output-rewriting hook mechanism — it cannot auto-compact; call the compact_output MCP tool directly instead (it is exposed via .vscode/mcp.json).",
-]
+# Facts about THIS project that agents should follow, one string each, such as
+# "Canvas::run(action) is the safe dispatch path". get_preferences and
+# get_context serve them, tiered by the agent's hint. The working protocol
+# (pre-code check, closeout, markers) lives in the cortex_suite section of
+# CLAUDE.md and .github/copilot-instructions.md: restated here, the two copies
+# drift apart and agents are served both.
+notes = []
 
 [enforcement]
 # "protocol_session_only" (default) or "always"
@@ -51,7 +51,10 @@ skill_candidate_min_occurrences = 3
 graph_snapshot_days = 30
 
 [skills]
-skills_dir = "agent_customization/skills"
+# Where an approved skill is published for Claude Code, which loads
+# <repo>/.claude/skills/<name>/SKILL.md by itself; Copilot's copy goes to
+# .github/prompts. A directory no host reads leaves a skill approved and unseen.
+skills_dir = ".claude/skills"
 auto_update_skills = true
 
 [memory]
@@ -106,7 +109,7 @@ impl Store {
     }
 
     /// Called once when the DB file is created for the first time.
-    /// Seeds core workflow anti-patterns, MCP tool annotations, and writes a prefs.toml template.
+    /// Seeds core workflow anti-patterns and writes a prefs.toml template.
     fn first_run_init(&self, db_path: &Path) -> Result<()> {
         eprintln!("[cortex] First run — seeding workflow memory and creating prefs.toml");
 
@@ -153,88 +156,11 @@ impl Store {
         }
         eprintln!("[cortex]   seeded {} workflow anti-patterns", aps.len());
 
-        // ── MCP tool annotations ──────────────────────────────────────────────
-        // These teach Copilot the exact params and usage for each cortex MCP tool.
-        let annotations: &[(&str, &str, &[&str])] = &[
-            (
-                "MCP: semantic_search",
-                "Params: query str required, limit int default=5. TF-IDF semantic plus keyword search across all indexed units. Returns top N units by relevance with compressed summaries. Use for finding which module handles a concept, discovering implementors of a trait, or locating code patterns. limit=3 for quick lookup, limit=8+ for exhaustive. Session cache deduplicates repeated content.",
-                &["cortex", "mcp", "tools", "semantic_search"],
-            ),
-            (
-                "MCP: get_item",
-                "Params: name str required, case-sensitive exact match. Returns full compressed source for one indexed unit. Best for reading a specific struct/enum/trait when you know its exact name. Returns kind, module_path, and full compressed text. Fails with 'no item named X' on mismatch — use semantic_search first to find the exact name.",
-                &["cortex", "mcp", "tools", "get_item"],
-            ),
-            (
-                "MCP: get_context",
-                "Params: hint str required, token_budget int default=2000, delta_include str, delta_exclude str, delta_max_files int default=8, delta_max_patch_lines int default=40. Builds context packet: relevant units + patterns + anti-patterns + annotations + git delta. Best single call to start a task. Use delta_exclude to filter noise like 'assets'. Raise token_budget to 4000 for complex tasks.",
-                &["cortex", "mcp", "tools", "get_context"],
-            ),
-            (
-                "MCP: get_delta",
-                "Params: include str, exclude str, max_files int default=128, max_patch_lines int default=40, since str git-ref. Returns git diff as compressed entries: change type + path + summary + patch lines. Omit 'since' for working-tree HEAD diff. Use since='HEAD~5' for commit range. Use exclude='assets' to filter binary noise. Returns 'No git deltas found' if clean.",
-                &["cortex", "mcp", "tools", "get_delta"],
-            ),
-            (
-                "MCP: query_graph",
-                "Params: name str required exact unit ID, depth int default=1. BFS traversal from node. Returns edges as 'source -[relation]-> target'. Relation types: Pairs, Conflicts, Owns, Uses, Calls, Implements, DerivedFrom. depth=1 direct neighbors, depth=2 two-hop impact, depth=3+ full blast radius. Returns 'No graph node found for X' if missing. Use before refactoring widely-used types.",
-                &["cortex", "mcp", "tools", "query_graph"],
-            ),
-            (
-                "MCP: get_preferences",
-                "Params: none. Returns active prefs.toml summary loaded at server startup. Contains project-level coding rules, style constraints, import conventions. Read once per session. File location: .cortex/prefs.toml relative to repo root passed to 'cortex serve'. Returns 'No preferences configured' if missing.",
-                &["cortex", "mcp", "tools", "get_preferences"],
-            ),
-            (
-                "MCP: simulate_change",
-                "Params: item str required exact name, change str default='unspecified change', depth int default=1. Predicts impact of changing 'item'. Returns risk Low/Medium/High, affected modules, recommended actions. depth=1 direct deps, depth=2+ cascade. Use before modifying widely-used types. High risk = stop and confirm with user.",
-                &["cortex", "mcp", "tools", "simulate_change"],
-            ),
-            (
-                "MCP: recall",
-                "Params: topic str required. Consolidated lookup across ALL memory layers: indexed units, patterns, anti-patterns, annotations. Best single call for 'what do we know about X'. Increments pattern use_count on match which affects survival_rate. Returns 'Nothing found' if no match — add an annotation in that case.",
-                &["cortex", "mcp", "tools", "recall"],
-            ),
-            (
-                "MCP: list_patterns",
-                "Params: none. Returns all approved patterns with: name, intent, body, uses, survival_rate. Patterns with survival_rate<0.4 show a warning marker. Patterns with use_count=0 may be stale. Call at task start for a domain to see all relevant approved patterns at once rather than multiple recall calls. survival_rate = use_count / (use_count + reverted_count).",
-                &["cortex", "mcp", "tools", "list_patterns"],
-            ),
-            (
-                "MCP: get_anti_patterns",
-                "Params: none. Returns ALL anti-patterns as wrong/correct pairs. ALWAYS call before generating code in a new domain. Call this at session start alongside get_preferences and list_patterns for the mandatory pre-code check.",
-                &["cortex", "mcp", "tools", "get_anti_patterns"],
-            ),
-            (
-                "MCP: suggest_pattern",
-                "Params: name str, intent str, body str, uses array of str. Queues pattern as pending observation — does NOT auto-approve. Human must run 'cortex review' then 'cortex crystallize ID'. Use after verifying a pattern works in real code. Governance: suggest freely, approve deliberately.",
-                &["cortex", "mcp", "tools", "suggest_pattern"],
-            ),
-            (
-                "MCP: list_all",
-                "Params: kind str optional enum/struct/trait/fn/type/const. Lists all indexed units filtered by kind, grouped by kind. Good for discovery when you don't know a type name. kind='enum' shows all enums. kind='struct' shows all structs. Includes scoped units (e.g. synful::) when indexed.",
-                &["cortex", "mcp", "tools", "list_all"],
-            ),
-            (
-                "MCP: compact_output",
-                "Params: command str required, stdout str optional, stderr str optional. LOSSLESS command-output compaction: removes only provably-redundant lines (cargo build/download progress, per-test '... ok' lines == cargo -q, consecutive duplicate lines) and keeps EVERY error/warning/note/panic/failure verbatim with file:line. Full original tee'd to .cortex/tee/ whenever anything is dropped. Pass BOTH stdout and stderr — cargo/rustc write diagnostics to stderr. Does not execute anything (pure post-processing). Below ~800 chars it returns input untouched. Install as an automatic PostToolUse(Bash) hook via 'cortex hooks-init'.",
-                &["cortex", "mcp", "tools", "compression"],
-            ),
-        ];
-
-        for (topic, body, tags) in annotations {
-            let ann = Annotation {
-                id: None,
-                topic: (*topic).to_string(),
-                body: (*body).to_string(),
-                tags: tags.iter().map(|t| t.to_string()).collect(),
-                added_at: Utc::now(),
-                hash: None,
-            };
-            self.insert_annotation(&ann)?;
-        }
-        eprintln!("[cortex]   seeded {} MCP tool annotations", annotations.len());
+        // Copies of the tools' own descriptions were seeded here as annotations
+        // until 2026-10. Each tool describes itself to every client in tools/list
+        // and that changes with the code; the copy stayed as written and was
+        // served beside it, until five of thirteen contradicted their tool.
+        // `instructions` removes the copies an older first run left.
 
         // ── prefs.toml template ───────────────────────────────────────────────
         if let Some(dir) = db_path.parent() {
