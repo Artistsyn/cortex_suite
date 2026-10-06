@@ -13,6 +13,14 @@
 //! answer comes from the current tree. It also restarts the child when another
 //! process rebuilt the graph. Nothing runs between calls: no watcher, no timer,
 //! no idle CPU.
+//!
+//! The proxy is itself cortex, so a rebuilt cortex binary used to reach it
+//! only when something stopped it: `reload-servers` found every proxy still on
+//! the old build after `serve` had moved itself. It now reads the host through
+//! quartz_ctx::mcp_session like `serve` does, and becomes a rebuilt binary on
+//! the same pipes while it waits. The new build starts a child of its own, so
+//! the client's handshake is carried across and replayed to it, and the old
+//! child is stopped before the exec, which would otherwise leave it a zombie.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -54,6 +62,28 @@ impl Graphify {
         let stdin = child.stdin.take().context("no child stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("no child stdout")?);
         Ok(Self { child, stdin, stdout, loaded })
+    }
+
+    /// Spawn graphify-rs and replay the client's handshake to it, when the
+    /// client has made one, so the client can go on as if it set this child up.
+    fn start(bin: &str, graph: &Path, repo: &Path, init: Option<&str>, notice: Option<&str>) -> Result<Self> {
+        let mut fresh = Self::spawn(bin, graph, repo)?;
+        if let Some(init) = init {
+            let id = serde_json::from_str::<Value>(init)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+                .unwrap_or(Value::Null);
+            fresh.send(init)?;
+            fresh.response_for(&id, &mut std::io::sink())?;
+        }
+        if let Some(notice) = notice {
+            fresh.send(notice)?;
+        }
+        Ok(fresh)
+    }
+
+    fn alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     fn send(&mut self, line: &str) -> Result<()> {
@@ -160,16 +190,17 @@ fn attach_note(response: &str, note: &str) -> String {
 
 pub fn serve(repo: &Path, graph: &Path, bin: &str) -> Result<()> {
     let graph: PathBuf = if graph.is_absolute() { graph.to_path_buf() } else { repo.join(graph) };
-    let mut child = Graphify::spawn(bin, &graph, repo)?;
-    let mut init_request: Option<String> = None;
-    let mut init_notice: Option<String> = None;
-
-    let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
+    // A build that took this connection over from an older one inherits the
+    // client's handshake, which its own fresh child has not seen.
+    let mut session = quartz_ctx::mcp_session::Session::open("graphify-serve");
+    let mut init_request = session.carried("init_request");
+    let mut init_notice = session.carried("init_notice");
+    let mut child = Some(Graphify::start(bin, &graph, repo, init_request.as_deref(), init_notice.as_deref())?);
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    // The child is let go before an exec (dropping it stops and reaps it).
+    while let Some(line) = session.next_line_with(&mut out, || child = None)? {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -179,39 +210,36 @@ pub fn serve(repo: &Path, graph: &Path, bin: &str) -> Result<()> {
         let id = req.get("id").cloned();
 
         let mut note: Option<String> = None;
-        if method == "initialize" {
-            init_request = Some(trimmed.to_string());
-        } else if method == "notifications/initialized" {
-            init_notice = Some(trimmed.to_string());
-        } else if method == "tools/call" {
+        if method == "tools/call" {
             note = ensure_fresh(repo, &graph);
-            // Restart when the file moved under the child - our rebuild or
-            // another session's.
-            if graph_mtime(&graph) != child.loaded {
-                match Graphify::spawn(bin, &graph, repo) {
-                    Ok(mut fresh) => {
-                        let mut sink = std::io::sink();
-                        if let Some(init) = &init_request {
-                            let init_id = serde_json::from_str::<Value>(init)
-                                .ok()
-                                .and_then(|v| v.get("id").cloned())
-                                .unwrap_or(Value::Null);
-                            fresh.send(init)?;
-                            fresh.response_for(&init_id, &mut sink)?;
-                        }
-                        if let Some(n) = &init_notice {
-                            fresh.send(n)?;
-                        }
-                        eprintln!("graphify-serve: reloaded graph.json");
-                        child = fresh;
-                    }
-                    Err(e) => {
-                        note = Some(format!("[graph reload failed, answering from the previous snapshot: {e}]"));
-                    }
+        }
+        // Start a child again when there is none (an exec that failed after
+        // letting it go), when it has exited, or when graph.json moved under
+        // it - our rebuild or another session's. What it replays is the
+        // handshake from before this line.
+        let live = child.as_mut().is_some_and(Graphify::alive);
+        let moved = method == "tools/call" && child.as_ref().is_some_and(|c| graph_mtime(&graph) != c.loaded);
+        if !live || moved {
+            match Graphify::start(bin, &graph, repo, init_request.as_deref(), init_notice.as_deref()) {
+                Ok(fresh) => {
+                    eprintln!("graphify-serve: {}", if live { "reloaded graph.json" } else { "started graphify-rs again" });
+                    child = Some(fresh);
                 }
+                Err(e) if live => {
+                    note = Some(format!("[graph reload failed, answering from the previous snapshot: {e}]"));
+                }
+                Err(e) => return Err(e),
             }
         }
+        if method == "initialize" {
+            init_request = Some(trimmed.to_string());
+            session.carry("init_request", trimmed.to_string());
+        } else if method == "notifications/initialized" {
+            init_notice = Some(trimmed.to_string());
+            session.carry("init_notice", trimmed.to_string());
+        }
 
+        let child = child.as_mut().context("no graphify-rs child")?;
         child.send(trimmed)?;
         let Some(id) = id else { continue }; // a notification: no response
         let mut response = child.response_for(&id, &mut out)?;
