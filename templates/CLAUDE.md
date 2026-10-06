@@ -41,11 +41,14 @@ it is never stale.
   context), the overflow counted per file. `get_source(file, lines="120-160")`
   reads by line number (sed -n, head, tail, cat) from any text file.
 - **A shell grep or `sed -n 'A,Bp'` is answered by quartz-ctx anyway.** The
-  PreToolUse Bash hook (`hooks-init`) rewrites a read-only one into
+  PreToolUse hook (`hooks-init`) rewrites a read-only one into
   `quartz-ctx nav`, which prints the same lines plus the item each match is in.
-  Anything it cannot reproduce runs untouched. `QX_RAW=1` in a command keeps
-  the raw tool; `QX_HOOK=off` in Claude Code's environment turns the hook off.
-  grep stays right for filtering a command's output.
+  In PowerShell it does the same for `Select-String` and for a `Get-Content`
+  line range (`| Select-Object -Skip N -First M`, `-TotalCount`, `-Tail`,
+  `(Get-Content f)[a..b]`). Anything it cannot reproduce runs untouched.
+  `QX_RAW=1` in a command (`$env:QX_RAW=1;` in PowerShell) keeps the raw tool;
+  `QX_HOOK=off` in Claude Code's environment turns the hook off. grep stays
+  right for filtering a command's output.
 - `get_api_context(hint)` — **start here for any coding task**; one budgeted
   packet of the relevant types, variants and signatures
 - `get_item(name)` — full definition, including methods from every `impl` file

@@ -310,9 +310,10 @@ identifiers in code, comments and strings left out unless include_comments=true 
 - What a file or directory holds: get_outline(path) instead of reading it whole.
 - Starting a coding task: get_api_context(hint) for the relevant types, variants and \
 signatures in one packet.
-Where a hook answers a shell grep or sed -n read from these tools, it comes back in the \
-same format; QX_RAW=1 in the command keeps the raw tool. grep stays right for filtering a \
-command's output. Read a file before editing it, at the lines these tools report. If these \
+Where a hook answers a shell read from these tools (grep or sed -n; in PowerShell, \
+Select-String or a Get-Content line range), it comes back in the same format; QX_RAW=1 in \
+the command ($env:QX_RAW=1 in PowerShell) keeps the raw tool. grep stays right for \
+filtering a command's output. Read a file before editing it, at the lines these tools report. If these \
 tools are deferred, load them with one tool search.";
 
 fn initialize_result(engine_name: &str, params: &Value) -> Value {
@@ -880,6 +881,7 @@ fn tool_search_code(args: &Value, sources: &[(PathBuf, String, bool)], nav: &mut
         output,
         limit: arg_usize(args, "limit").unwrap_or(nav::DEFAULT_REF_LIMIT).clamp(1, 5000),
         collapse: args["collapse"].as_bool(),
+        expanded: false,
     };
     Ok(nav.search(&roots, pattern, &opts))
 }

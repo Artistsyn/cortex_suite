@@ -16,8 +16,10 @@
 //!
 //! Payloads, as captured from a real session on 2026-09-27 (upgrade plan,
 //! tranche 2 item 12):
-//!   terminal  Claude `Bash` {command} with tool_response {stdout, stderr}, or
-//!             `error` on PostToolUseFailure; VS Code `run_in_terminal`
+//!   terminal  Claude `Bash` or `PowerShell` {command} with tool_response
+//!             {stdout, stderr}, or `error` on PostToolUseFailure (the same
+//!             shape for both, read from Claude Code 2.1.288 on 2026-10-05);
+//!             VS Code `run_in_terminal`
 //!             {command} with tool_response as ONE string and no exit code.
 //!             A failure is read from the output text, never from a flag:
 //!             Copilot marks failed commands `success` too.
@@ -75,7 +77,7 @@ pub enum Work {
     Nothing,
 }
 
-const CLAUDE_TOOLS: &[&str] = &["Bash", "Edit", "Write", "MultiEdit", "NotebookEdit"];
+const CLAUDE_TOOLS: &[&str] = &["Bash", "PowerShell", "Edit", "Write", "MultiEdit", "NotebookEdit"];
 const VSCODE_TOOLS: &[&str] = &[
     "run_in_terminal",
     "replace_string_in_file",
@@ -204,8 +206,8 @@ pub fn work(event: &str, p: &Value) -> Work {
     let one = |file: String, added: String| Work::Edits(vec![(file, added)]);
     let edits = match str_at(p, "tool_name").as_str() {
         // Before it runs, a command has no output to judge.
-        "Bash" | "run_in_terminal" if event == "PreToolUse" => Work::Nothing,
-        "Bash" | "run_in_terminal" => {
+        "Bash" | "PowerShell" | "run_in_terminal" if event == "PreToolUse" => Work::Nothing,
+        "Bash" | "PowerShell" | "run_in_terminal" => {
             let (command, output) = (s("command"), terminal_output(p));
             return if command.is_empty() && output.is_empty() {
                 Work::Nothing
@@ -391,6 +393,14 @@ mod tests {
                             "error": "Exit code 101\nerror: could not compile"});
         assert_eq!(work("PostToolUseFailure", &failed),
                    Work::Terminal { command: "cargo build".into(), output: "Exit code 101\nerror: could not compile".into() });
+        // The PowerShell tool reports in the same shape.
+        let ps = json!({"session_id": "c2", "tool_name": "PowerShell",
+                        "tool_input": {"command": "cargo build 2>&1 | Select-Object -Last 20"},
+                        "error": "Exit code 1\nerror: could not compile"});
+        assert_eq!(session_key(&ps), "claude:c2");
+        assert_eq!(work("PostToolUseFailure", &ps),
+                   Work::Terminal { command: "cargo build 2>&1 | Select-Object -Last 20".into(),
+                                    output: "Exit code 1\nerror: could not compile".into() });
     }
 
     #[test]
@@ -524,6 +534,8 @@ mod tests {
         assert_eq!(work("PreToolUse", &edit), Work::Edits(vec![("d.rs".into(), "C2".into())]));
         let bash = json!({"tool_name": "Bash", "tool_input": {"command": "cargo build"}});
         assert_eq!(work("PreToolUse", &bash), Work::Nothing);
+        let ps = json!({"tool_name": "PowerShell", "tool_input": {"command": "cargo build"}});
+        assert_eq!(work("PreToolUse", &ps), Work::Nothing);
     }
 
     /// A store holding one trap, which `ZOOM_EDIT` matches.

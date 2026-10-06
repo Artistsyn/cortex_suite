@@ -222,6 +222,13 @@ reads. So a PreToolUse Bash hook rewrites read-only `grep` and `sed -n 'A,Bp'` i
 `quartz-ctx nav` through `updatedInput`, and everything else runs as typed. The hook is
 `quartz-ctx nav hook || true`, installed by `cortex hooks-init` as hook set 7.
 
+(2026-10-05, hook set 8.) The hook also matches the `PowerShell` tool and answers its
+`Select-String` searches and `Get-Content` line reads with a PowerShell command. All 17
+command shapes checked in pwsh 7.6 printed the same lines. It has not been replayed on
+real Windows sessions. On Windows the hook is the exec form, `{"command": <quartz-ctx>,
+"args": ["nav", "hook"]}`, because no `|| true` parses in both of the shells Claude Code
+uses for hooks there.
+
 The `|| true` matters. Exit 2 from a PreToolUse hook blocks the tool call, and clap exits
 2 on an unknown subcommand. Set 6 lacked it, so on any machine whose quartz-ctx predates
 `nav`, it would have blocked every Bash call. That would have hit, for example, a machine
@@ -273,7 +280,7 @@ re-read an unchanged range, too few to pay for the bookkeeping.
   - The grep showed all 22 distinct matches, each real. Raw grep printed 38 lines,
     because zsh's `**/*.rs` repeats the `*.rs` files.
 - `cortex scoreboard` counts these on its Navigation guard ("answered by quartz-ctx
-  through the Bash hook"), from the ids the hook writes to `.cortex/nav-rewrites.jsonl`.
+  through the nav hook"), from the ids the hook writes to `.cortex/nav-rewrites.jsonl`.
 - To opt out, put `QX_RAW=1` in a command to keep the raw tool, or set `QX_HOOK=off` in
   Claude Code's environment to turn the hook off.
 

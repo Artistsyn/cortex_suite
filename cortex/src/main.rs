@@ -1157,8 +1157,11 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     let filename = if local { "settings.local.json" } else { "settings.json" };
     let settings_path = claude_dir.join(filename);
 
+    // Claude Code's shell tool is `Bash`, or `PowerShell` (Windows without Git
+    // Bash, or CLAUDE_CODE_USE_POWERSHELL_TOOL=1). Both return {stdout, stderr}
+    // and route a non-zero exit to PostToolUseFailure.
     let compact_hook = json!({
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [{
             "type": "mcp_tool",
             "server": "cortex",
@@ -1178,7 +1181,7 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     // biased every observed pass rate upward. Found 2026-09-27: a command that
     // exited 1 left no row while its neighbours in the same minute did.
     let failure_hook = json!({
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [{
             "type": "mcp_tool",
             "server": "cortex",
@@ -1277,20 +1280,14 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
             "input": { "transcript_path": "${transcript_path}", "hook_event_name": "SessionStart" }
         }]
     });
-    // Bash reads answered by quartz-ctx (quartz-ctx/src/rewrite.rs): a grep or
-    // `sed -n` of files it fully understands becomes the same search or read,
-    // grouped by the item each line sits in, at the same size (replayed on
-    // 1,200 real commands: recall 99.98% and 100%). A command hook, because it
-    // must hand back the whole tool input; `None` where no quartz-ctx is served.
-    // `|| true` because exit 2 from a PreToolUse hook BLOCKS the call, and clap
-    // exits 2 on an unknown subcommand: a quartz-ctx built before `nav` existed
-    // would stop every Bash call. Any failure must mean "run it as written".
-    let nav_hook = quartz_ctx_command(root).map(|qx| {
-        json!({
-            "matcher": "Bash",
-            "hooks": [{ "type": "command", "command": format!("{qx} nav hook || true"), "timeout": 10 }]
-        })
-    });
+    // Shell reads answered by quartz-ctx (quartz-ctx/src/rewrite.rs): a grep or
+    // `sed -n` (Bash), or a Select-String or Get-Content line read
+    // (PowerShell), of files it fully understands becomes the same search or
+    // read, grouped by the item each line sits in, at the same size (replayed
+    // on 1,200 real Bash commands: recall 99.98% and 100%). A command hook,
+    // because it must hand back the whole tool input; `None` where no
+    // quartz-ctx is served.
+    let nav_hook = quartz_ctx_hook(root, cfg!(windows)).map(|hook| json!({ "matcher": "Bash|PowerShell", "hooks": [hook] }));
     for event in ["Stop", "PreCompact", "SessionStart", "PreToolUse"] {
         hooks_obj
             .entry(event.to_string())
@@ -1313,7 +1310,10 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     let is_restore = |e: &Value| names_tool(e, "restore_after_compact");
     let is_nav = |e: &Value| {
         e.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
-            hooks.iter().any(|h| h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains(" nav hook")))
+            hooks.iter().any(|h| {
+                h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains(" nav hook"))
+                    || h.get("args") == Some(&json!(["nav", "hook"]))
+            })
         })
     };
 
@@ -1395,18 +1395,77 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
     Ok(HookOutcome::Written)
 }
 
-/// How a hook runs the workspace's quartz-ctx: the command `.mcp.json` serves
-/// it with, anchored at the project directory when relative. `None` when no
-/// quartz-ctx is configured or its binary is not there.
-fn quartz_ctx_command(root: &Path) -> Option<String> {
+/// The PreToolUse hook that has quartz-ctx answer shell reads: `nav hook` on
+/// the binary `.mcp.json` serves quartz-ctx with, anchored at the project
+/// directory when relative. `None` when no quartz-ctx is configured or its
+/// binary is not there.
+///
+/// Exit 2 from a PreToolUse hook BLOCKS the call, and clap exits 2 on an
+/// unknown subcommand, so every failure must mean "run it as written". Under
+/// sh that is `|| true`: a quartz-ctx built before `nav` would otherwise stop
+/// every shell call. No such line parses in every shell a Windows host uses:
+/// Claude Code runs hooks in Git Bash when it finds one and in PowerShell when
+/// it does not (2.1.288, `P2()`), where `|| true` is a parse error in 5.1 and
+/// runs a command that does not exist in 7. So on Windows the hook is the exec
+/// form (Claude Code 2.1.139+): the binary and its arguments, no shell, which
+/// also starts fastest. Nothing there can catch an exit 2, so the binary must
+/// first show that it answers `nav`. A client older than the exec form runs
+/// `command` alone in its shell, where the backslashed path does not resolve:
+/// exit 127 or 1, never 2.
+fn quartz_ctx_hook(root: &Path, windows: bool) -> Option<Value> {
     let text = std::fs::read_to_string(root.join(".mcp.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let cmd = v["mcpServers"]["quartz-ctx"]["command"].as_str()?;
     let path = Path::new(cmd);
-    if path.is_absolute() {
-        path.is_file().then(|| quartz_ctx::rewrite::shell_quote(cmd))
+    let on_disk = if path.is_absolute() { path.to_path_buf() } else { root.join(path) };
+    // A Windows MCP config may leave off `.exe`, which the launcher adds.
+    let binary = if on_disk.is_file() {
+        on_disk
+    } else if windows && on_disk.extension().is_none() && on_disk.with_extension("exe").is_file() {
+        on_disk.with_extension("exe")
     } else {
-        root.join(path).is_file().then(|| format!("\"${{CLAUDE_PROJECT_DIR}}\"/{}", quartz_ctx::rewrite::shell_quote(cmd)))
+        return None;
+    };
+    if !windows {
+        let qx = if path.is_absolute() {
+            quartz_ctx::rewrite::shell_quote(cmd)
+        } else {
+            format!("\"${{CLAUDE_PROJECT_DIR}}\"/{}", quartz_ctx::rewrite::shell_quote(cmd))
+        };
+        return Some(json!({ "type": "command", "command": format!("{qx} nav hook || true"), "timeout": 10 }));
+    }
+    if !answers_nav(&binary) {
+        return None;
+    }
+    let backslashed = cmd.replace('/', "\\");
+    let exe = if path.is_absolute() { backslashed } else { format!("${{CLAUDE_PROJECT_DIR}}\\{backslashed}") };
+    Some(json!({ "type": "command", "command": exe, "args": ["nav", "hook"], "timeout": 10 }))
+}
+
+/// Whether `binary` runs `nav` within a few seconds: a quartz-ctx built before
+/// it exits 2, which a hook with no shell around it would pass on as a block.
+fn answers_nav(binary: &Path) -> bool {
+    use std::process::Stdio;
+    let Ok(mut child) = std::process::Command::new(binary)
+        .args(["nav", "rewrite", "grep -n x a.rs"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -1417,7 +1476,7 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
     match outcome {
         HookOutcome::Written => println!(
             "Wrote .claude/{filename} — cortex hooks installed:\n\
-             \x20 compact_output on PostToolUse(Bash) and PostToolUseFailure(Bash) — reads every \
+             \x20 compact_output on PostToolUse and PostToolUseFailure (Bash|PowerShell) — reads every \
              build/test verdict (stdout + stderr, or the failure's error), and when a failure \
              matches a recorded trap, tells the agent (hook additionalContext). It does not \
              shrink output: a hook cannot replace a Bash result.\n\
@@ -1434,10 +1493,12 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
              \x20 restore_after_compact on SessionStart(compact) — after a compaction, reads back \
              from the transcript what the summary blurs (latest requests, files edited, what went \
              green, errors still open, verbatim) in at most ~1.5k tokens.\n\
-             \x20 quartz-ctx nav hook on PreToolUse(Bash), when .mcp.json serves quartz-ctx — a \
-             grep or `sed -n` of files it fully understands runs as the same search or read, \
-             grouped by the function each line sits in, at the same size. Anything else runs as \
-             written; QX_RAW=1 in a command, or QX_HOOK=off in the environment, opts out.\n\
+             \x20 quartz-ctx nav hook on PreToolUse(Bash|PowerShell), when .mcp.json serves \
+             quartz-ctx — a grep or `sed -n` (Bash), or a Select-String or Get-Content line read \
+             (PowerShell), of files it fully understands runs as the same search or read, grouped \
+             by the function each line sits in, at the same size. Anything else runs as written; \
+             QX_RAW in a command, or QX_HOOK=off in the environment, opts out. On Windows it runs \
+             the binary directly, with no shell (Claude Code 2.1.139+).\n\
              Restart Claude Code (or reload the session) for them to take effect.\n\
              Note: these are Claude Code hooks. VS Code Copilot cannot observe tool output or \
              edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
@@ -1471,28 +1532,59 @@ fn run_hook(db_path: &Path, event: Option<&str>) -> Result<()> {
 /// written relative to it when they live inside it (portable), absolute when
 /// they do not. The store path is always explicit: a hook that let `--db`
 /// default could bind a second, empty store and split memory in two.
+///
+/// Each hook carries a command per shell. VS Code runs `command` under sh, and
+/// on Windows runs `windows` instead, under Windows PowerShell 5.1 (Copilot
+/// Chat 0.67: `powershell.exe -Command` whenever ComSpec is cmd.exe), which
+/// runs a quoted path only after `&`. A relative path is written the same
+/// from either system, so one file serves both.
 fn vscode_hooks_config(root: &Path, db_path: &Path) -> Result<Value> {
     let root = root.canonicalize().with_context(|| format!("no such root: {}", root.display()))?;
     let exe = std::env::current_exe()?.canonicalize()?;
     let db = if db_path.is_absolute() { db_path.to_path_buf() } else { std::env::current_dir()?.join(db_path) };
     let db = db.canonicalize().unwrap_or(db);
-    let shown = |p: &Path| -> String {
-        let s = p.strip_prefix(&root).map(|r| r.to_path_buf()).unwrap_or_else(|_| p.to_path_buf());
-        let s = s.to_string_lossy().into_owned();
+    Ok(vscode_hooks_for(&root, &exe, &db))
+}
+
+fn vscode_hooks_for(root: &Path, exe: &Path, db: &Path) -> Value {
+    // Inside the workspace: relative, with forward slashes and no `.exe`.
+    let rel = |p: &Path| p.strip_prefix(root).ok().map(|r| r.to_string_lossy().replace('\\', "/"));
+    let abs = |p: &Path| {
+        let s = p.to_string_lossy().into_owned();
+        s.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(s)
+    };
+    let sh = |p: &Path, program: bool| -> String {
+        let s = match rel(p) {
+            Some(r) if program => r.strip_suffix(".exe").map(str::to_string).unwrap_or(r),
+            Some(r) => r,
+            None => abs(p),
+        };
         if s.contains(' ') { format!("\"{s}\"") } else { s }
     };
-    let (exe, db) = (shown(&exe), shown(&db));
+    let ps = |p: &Path, program: bool| -> String {
+        let s = match rel(p) {
+            Some(r) if program => {
+                let exe = if Path::new(&r).extension().is_none() { format!("{r}.exe") } else { r };
+                format!(".\\{}", exe.replace('/', "\\"))
+            }
+            Some(r) => r.replace('/', "\\"),
+            None => abs(p),
+        };
+        quartz_ctx::rewrite::ps_quote(&s)
+    };
+    let (exe_sh, db_sh, exe_ps, db_ps) = (sh(exe, true), sh(db, false), ps(exe, true), ps(db, false));
     let entry = |event: &str| json!([{
         "type": "command",
-        "command": format!("{exe} --db {db} hook {event}"),
+        "command": format!("{exe_sh} --db {db_sh} hook {event}"),
+        "windows": format!("& {exe_ps} --db {db_ps} hook {event}"),
         "timeout": 10
     }]);
-    Ok(json!({ "hooks": {
+    json!({ "hooks": {
         "PreToolUse": entry("PreToolUse"),
         "PostToolUse": entry("PostToolUse"),
         "UserPromptSubmit": entry("UserPromptSubmit"),
         "Stop": entry("Stop")
-    }}))
+    }})
 }
 
 fn run_hooks_init_vscode(root: Option<PathBuf>, db_path: &Path) -> Result<()> {
@@ -1515,8 +1607,10 @@ fn run_hooks_init_vscode(root: Option<PathBuf>, db_path: &Path) -> Result<()> {
     // Verify the artifact, not the intent.
     let back: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     let command = back["hooks"]["PostToolUse"][0]["command"].as_str().unwrap_or("");
+    let windows = back["hooks"]["PostToolUse"][0]["windows"].as_str().unwrap_or("");
     println!(
         "Wrote {} — VS Code agent hooks for PreToolUse, PostToolUse and UserPromptSubmit run:\n  {command}\n\
+         and on Windows (Windows PowerShell):\n  {windows}\n\
          VS Code reads .github/hooks/*.json when chat.useHooks is on (the default) and the\n\
          workspace is trusted. The same pushes as Claude Code: a recorded trap when an edit\n\
          or a failing build matches one, and a note when a message disputes a claim.",
@@ -1564,7 +1658,9 @@ fn auto_install_hook_on_serve(repo: &Path) {
     //    answered from the source)
     // 7: the nav hook ends `|| true`, so a quartz-ctx without `nav` cannot
     //    block Bash
-    const HOOK_SET_VERSION: u32 = 7;
+    // 8: the shell hooks match PowerShell as well as Bash, and on Windows the
+    //    nav hook runs the binary with no shell (exec form)
+    const HOOK_SET_VERSION: u32 = 8;
     let cortex_dir = repo.join(".cortex");
     let sentinel = cortex_dir.join(format!(".claude-hooks-installed.v{HOOK_SET_VERSION}"));
     if sentinel.exists() {
@@ -5114,7 +5210,7 @@ mod tests {
         assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::Written);
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         let pre = &v["hooks"]["PreToolUse"][0];
-        assert_eq!(pre["matcher"], "Bash");
+        assert_eq!(pre["matcher"], "Bash|PowerShell");
         assert_eq!(pre["hooks"][0]["command"], "\"${CLAUDE_PROJECT_DIR}\"/bin/quartz-ctx nav hook || true");
         assert_eq!(ensure_compact_hook(d.path(), true, false).unwrap(), HookOutcome::AlreadyPresent);
 
@@ -5156,6 +5252,45 @@ mod tests {
         assert!(out.stdout.is_empty(), "no decision, so the command runs as written");
     }
 
+    /// On Windows the nav hook is the exec form: no shell, so it runs whether
+    /// the host has Git Bash or only PowerShell. It is written only for a
+    /// binary that answers `nav`, because nothing there would stop an exit 2;
+    /// and a client too old for the exec form, running `command` alone in its
+    /// shell, finds no program at the backslashed path: 127, not the 2 that
+    /// blocks.
+    #[cfg(unix)]
+    #[test]
+    fn on_windows_the_nav_hook_runs_the_binary_with_no_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::test_support::TempDir::new("nav_hook_windows").expect("temp dir");
+        std::fs::create_dir_all(d.path().join("bin")).unwrap();
+        let bin = d.path().join("bin/quartz-ctx");
+        let script = |body: &str| {
+            std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        std::fs::write(d.path().join(".mcp.json"), r#"{"mcpServers":{"quartz-ctx":{"command":"bin/quartz-ctx"}}}"#).unwrap();
+
+        script("echo '(as written)'");
+        let hook = quartz_ctx_hook(d.path(), true).expect("a binary that answers nav gets the hook");
+        assert_eq!(
+            hook,
+            json!({"type": "command", "command": "${CLAUDE_PROJECT_DIR}\\bin\\quartz-ctx", "args": ["nav", "hook"], "timeout": 10})
+        );
+
+        script("echo \"error: unrecognized subcommand 'nav'\" >&2\nexit 2");
+        assert_eq!(quartz_ctx_hook(d.path(), true), None, "its exit 2 would block every shell call");
+
+        // A client older than the exec form, with that binary in place.
+        let old_client = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(hook["command"].as_str().unwrap())
+            .env("CLAUDE_PROJECT_DIR", d.path())
+            .output()
+            .unwrap();
+        assert_eq!(old_client.status.code(), Some(127), "the backslashed path names no program");
+    }
+
     /// VS Code shows a PostToolUse reply a request late, so the edit guard needs
     /// PreToolUse registered too; the store path is explicit and root-relative.
     #[test]
@@ -5169,7 +5304,30 @@ mod tests {
             assert_eq!(hook["type"], "command", "{event}");
             let command = hook["command"].as_str().unwrap_or_default();
             assert!(command.ends_with(&format!(" --db memory.db hook {event}")), "{event}: {command}");
+            // Windows PowerShell runs a quoted path only after `&`.
+            let windows = hook["windows"].as_str().unwrap_or_default();
+            assert!(
+                windows.starts_with("& '") && windows.ends_with(&format!(" --db 'memory.db' hook {event}")),
+                "{event}: {windows}"
+            );
         }
+    }
+
+    /// Inside the workspace both commands are relative and written the same
+    /// from either system, so one hook file serves a Mac and a Windows machine.
+    #[test]
+    fn a_vscode_hook_file_inside_the_workspace_serves_both_systems() {
+        let cfg = vscode_hooks_for(
+            Path::new("/w"),
+            Path::new("/w/cortex_suite/cortex/target/debug/cortex"),
+            Path::new("/w/.cortex/memory.db"),
+        );
+        let hook = &cfg["hooks"]["PreToolUse"][0];
+        assert_eq!(hook["command"], "cortex_suite/cortex/target/debug/cortex --db .cortex/memory.db hook PreToolUse");
+        assert_eq!(
+            hook["windows"],
+            r"& '.\cortex_suite\cortex\target\debug\cortex.exe' --db '.cortex\memory.db' hook PreToolUse"
+        );
     }
 
     #[test]

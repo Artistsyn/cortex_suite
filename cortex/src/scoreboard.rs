@@ -46,7 +46,7 @@ pub struct WindowStats {
     /// Sessions that ran closeout (SELF-REPORTED coverage).
     pub sessions_closed: i64,
 
-    // OBSERVED outcomes: every build/test run the Bash hook classified.
+    // OBSERVED outcomes: every build/test run the shell hook classified.
     pub runs: i64,
     pub runs_passed: i64,
     pub run_pass_rate: f32,
@@ -128,7 +128,7 @@ pub struct TokenWindow {
     pub nav_calls: i64,
     pub grep_calls: i64,
     pub sed_reads: i64,
-    /// Bash calls quartz-ctx answered through the PreToolUse hook (their ids
+    /// Shell calls quartz-ctx answered through the PreToolUse hook (their ids
     /// are in .cortex/nav-rewrites.jsonl). The transcript keeps the command as
     /// written, so these are also inside the grep and sed counts.
     pub hook_answered: i64,
@@ -419,7 +419,7 @@ fn source_of(tool: &str) -> Source {
         Source::Cortex
     } else if tool.starts_with("mcp__quartz-ctx__") || tool.starts_with("mcp__graphify__") {
         Source::Structure
-    } else if tool == "Bash" {
+    } else if tool == "Bash" || tool == "PowerShell" {
         Source::Bash
     } else {
         Source::Other
@@ -451,21 +451,22 @@ fn price_of(model: &str) -> Option<(f64, f64, f64, f64, f64)> {
     }
 }
 
-/// What a Bash command does, for the navigation and waiting counts.
-fn bash_kind(command: &str) -> Option<&'static str> {
-    let mut c = command.trim();
-    while let Some(rest) = c.strip_prefix("cd ") {
-        match rest.find("&&") {
-            Some(i) => c = rest[i + 2..].trim_start(),
-            None => break,
-        }
-    }
-    let first = c.lines().next().unwrap_or("");
-    if first.starts_with("grep ") || first.starts_with("rg ") || first.starts_with("egrep ") {
+/// What a Bash or PowerShell command does, for the navigation and waiting
+/// counts: PowerShell searches with Select-String and reads lines with
+/// Get-Content and Select-Object or an index.
+fn shell_kind(command: &str) -> Option<&'static str> {
+    let first = crate::restore::after_cd(command).lines().next().unwrap_or("");
+    let lower = first.to_ascii_lowercase();
+    let starts = |words: &[&str]| words.iter().any(|w| lower.starts_with(w));
+    if starts(&["grep ", "rg ", "egrep ", "sls "]) || lower.contains("select-string") || lower.contains("| sls ") {
         Some("grep")
     } else if first.contains("sed -n") && first.chars().any(|ch| ch.is_ascii_digit()) && first.contains('p') {
         Some("sed")
-    } else if first.starts_with("sleep ") {
+    } else if starts(&["get-content ", "gc ", "type ", "cat ", "(get-content ", "(gc "])
+        && ["-first", "-skip", "-last", "-totalcount", "-head", "-tail", ")["].iter().any(|w| lower.contains(w))
+    {
+        Some("sed")
+    } else if starts(&["sleep ", "start-sleep "]) {
         Some("wait")
     } else {
         None
@@ -589,12 +590,12 @@ pub fn token_ledger(dir: &Path, window_days: u32, rewritten: &HashSet<String>) -
                                 tool_names.insert(id.to_string(), source_of(name));
                                 if name.starts_with("mcp__quartz-ctx__") {
                                     win.nav_calls += 1;
-                                } else if name == "Bash" {
+                                } else if name == "Bash" || name == "PowerShell" {
                                     if rewritten.contains(id) {
                                         win.hook_answered += 1;
                                     }
                                     let cmd = b.get("input").and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or("");
-                                    match bash_kind(cmd) {
+                                    match shell_kind(cmd) {
                                         Some("grep") => win.grep_calls += 1,
                                         Some("sed") => win.sed_reads += 1,
                                         Some("wait") => win.wait_calls += 1,
@@ -938,11 +939,11 @@ fn format_guards(c: &TokenWindow, p: &TokenWindow) -> String {
         per_turn(c), per_turn(p), c.compactions, p.compactions
     ));
     o.push_str(&format!(
-        "    Navigation: quartz-ctx calls {} (prev {}) vs Bash greps {} and sed range reads {} (prev {} and {}; baseline 15 vs 3,083 and 2,940)   waiting with sleep: {} (prev {})\n",
+        "    Navigation: quartz-ctx calls {} (prev {}) vs shell greps {} and line-range reads {} (prev {} and {}; baseline 15 vs 3,083 and 2,940)   waiting with sleep: {} (prev {})\n",
         c.nav_calls, p.nav_calls, c.grep_calls, c.sed_reads, p.grep_calls, p.sed_reads, c.wait_calls, p.wait_calls
     ));
     o.push_str(&format!(
-        "      of those shell reads, answered by quartz-ctx through the Bash hook: {} (prev {})\n",
+        "      of those shell reads, answered by quartz-ctx through the nav hook: {} (prev {})\n",
         c.hook_answered, p.hook_answered
     ));
     o.push_str(&format!(
@@ -1129,6 +1130,18 @@ mod tests {
         assert_eq!(c.cortex_hook_errors, 1);
         assert_eq!((c.grep_calls, c.hook_answered), (2, 1), "a rewritten grep is still a grep, and is counted as answered");
         assert!(nav_rewrite_ids(&dir.join("absent.jsonl")).is_empty());
+    }
+
+    #[test]
+    fn powershell_searches_and_line_reads_count_as_greps_and_sed_reads() {
+        assert_eq!(shell_kind("grep -rn foo src"), Some("grep"));
+        assert_eq!(shell_kind("Select-String -Path src\\*.rs -Pattern foo"), Some("grep"));
+        assert_eq!(shell_kind("Get-ChildItem -Recurse | Select-String foo"), Some("grep"));
+        assert_eq!(shell_kind("cd C:\\w; sls foo a.rs"), Some("grep"));
+        assert_eq!(shell_kind("Get-Content a.rs | Select-Object -Skip 10 -First 20"), Some("sed"));
+        assert_eq!(shell_kind("(Get-Content a.rs)[10..20]"), Some("sed"));
+        assert_eq!(shell_kind("Get-Content a.rs"), None, "a whole file is a cat");
+        assert_eq!(shell_kind("Start-Sleep -Seconds 30"), Some("wait"));
     }
 
     #[test]

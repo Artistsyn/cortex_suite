@@ -87,7 +87,7 @@ fact about your code.
    to remove; set `CORTEX_NO_AUTO_HOOKS=1` to stop it.
 5. **Verify:** ask the agent `get_api_context(hint: "...")`. If it returns your
    types, the servers are working. Then run a build or test once and check
-   `./.cortex/cortex.sh fired`: "Bash hook" and "test_signal" should read live.
+   `./.cortex/cortex.sh fired`: "shell hook" and "test_signal" should read live.
    "pushes delivered to agents" goes live the first time a recorded trap
    matches an edit or a failure.
 
@@ -508,6 +508,10 @@ default) and the workspace is trusted. Things worth knowing:
   output text), and the edit tools `replace_string_in_file`,
   `multi_replace_string_in_file`, `create_file`, `apply_patch` and
   `edit_notebook_file`.
+* On Windows, VS Code runs hook commands with Windows PowerShell 5.1, so each
+  entry carries a `windows` command (`& '.\…\cortex.exe' --db '…' hook <event>`)
+  beside the sh one. A path inside the workspace is written the same from
+  either system, so one file serves both.
 * It exits before opening the store for everything else: about 3 ms of its
   own, 6–30 ms as VS Code's hook log reports it. About 35 ms when it has work.
 * VS Code waits for PreToolUse hooks but not for PostToolUse ones. A

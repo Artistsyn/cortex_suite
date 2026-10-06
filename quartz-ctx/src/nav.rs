@@ -612,7 +612,8 @@ impl Nav {
         }
 
         // One file asked for by name needs no path line: the caller knows it.
-        let single = o.paths.len() == 1 && hits.len() == 1 && absolute(Path::new(o.paths[0].trim())).is_file();
+        let single =
+            !o.expanded && o.paths.len() == 1 && hits.len() == 1 && absolute(Path::new(o.paths[0].trim())).is_file();
         let mut body = String::new();
         let mut shown = 0usize; // matching lines accounted for in the listing
         let mut printed = 0usize; // match and context lines, for `head`
@@ -942,6 +943,9 @@ pub struct SearchOpts {
     /// Fold lines that differ only in their numbers, for summarising logs.
     /// Off unless asked: the numbers are often what the reader is after.
     pub collapse: Option<bool>,
+    /// `paths` came from expanding a wildcard, so even one file is named:
+    /// the caller named a pattern, not it.
+    pub expanded: bool,
 }
 
 impl Default for SearchOpts {
@@ -960,6 +964,7 @@ impl Default for SearchOpts {
             output: SearchOutput::Lines,
             limit: DEFAULT_REF_LIMIT,
             collapse: None,
+            expanded: false,
         }
     }
 }
@@ -1119,6 +1124,44 @@ fn walk_text(path: &Path) -> Vec<PathBuf> {
             out.push(absolute(entry.path()));
         }
     }
+    out.sort();
+    out
+}
+
+/// The files a wildcard in a path's last part names (`src\*.rs`, `mod?.rs`),
+/// as PowerShell's `-Path` expands one, for shells that pass the pattern
+/// through instead of expanding it. Case-insensitive, files only, sorted;
+/// empty when the path is not a wildcard, exists as written, or matches
+/// nothing.
+pub fn expand_wildcard(path: &Path) -> Vec<String> {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else { return Vec::new() };
+    if !name.contains(['*', '?']) || path.exists() {
+        return Vec::new();
+    }
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    if dir.to_string_lossy().contains(['*', '?']) {
+        return Vec::new();
+    }
+    let pattern: String = name
+        .chars()
+        .map(|c| match c {
+            '*' => ".*".to_string(),
+            '?' => ".".to_string(),
+            c => regex::escape(&c.to_string()),
+        })
+        .collect();
+    let Ok(re) = regex::RegexBuilder::new(&format!("^{pattern}$")).case_insensitive(true).build() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(|n| re.is_match(n)) && e.path().is_file())
+        .map(|e| e.path().display().to_string())
+        .collect();
     out.sort();
     out
 }
@@ -2274,8 +2317,11 @@ pub enum Action {
         let mut nav = Nav::new();
         nav.display_base = Some(d.path().to_path_buf());
         let one = d.path().join("src/lib.rs").display().to_string();
-        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![one], ..Default::default() });
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![one.clone()], ..Default::default() });
         assert_eq!(out, "  fn draw_rect 15-15\n15:fn draw_rect() {}");
+        // The one file a wildcard expanded to was not named by the caller.
+        let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![one], expanded: true, ..Default::default() });
+        assert_eq!(out, "src/lib.rs\n  fn draw_rect 15-15\n15:fn draw_rect() {}");
         let dir = d.path().join("src").display().to_string();
         let out = search(&mut nav, &roots, "draw_rect", SearchOpts { paths: vec![dir], ..Default::default() });
         assert!(out.starts_with("src/lib.rs\n") && out.contains("src/other.rs\n"), "{out}");
@@ -2312,6 +2358,23 @@ pub enum Action {
         // The whole of draw_rect: nothing to add, and the empty line 14 is kept.
         let out = nav.read_lines(&roots, &file, Some("14-15"), 2);
         assert_eq!(out, "\nfn draw_rect() {}\n");
+    }
+
+    #[test]
+    fn a_wildcard_in_the_last_part_names_that_directorys_files() {
+        let (d, _) = tmp_root(&[("w/src/a.rs", "x"), ("w/src/B.RS", "x"), ("w/src/c.txt", "x"), ("w/src/sub/d.rs", "x")]);
+        let base = d.path().join("w/src");
+        let names = |p: &str| -> Vec<String> {
+            expand_wildcard(&base.join(p))
+                .iter()
+                .map(|f| Path::new(f).file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(names("*.rs"), vec!["B.RS", "a.rs"], "case-insensitive, files only, not recursive");
+        assert_eq!(names("?.txt"), vec!["c.txt"]);
+        assert!(names("*.zz").is_empty());
+        assert!(names("a.rs").is_empty(), "not a wildcard");
+        assert!(expand_wildcard(&d.path().join("w/*/d.rs")).is_empty(), "only the last part");
     }
 
     #[test]
