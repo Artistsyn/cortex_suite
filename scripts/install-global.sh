@@ -85,6 +85,19 @@ else
     mkdir .cortex && printf '*\\n' > .cortex/.gitignore
   fi
 fi
+# cortex installs its Claude Code hooks in .claude/settings.local.json, a file
+# for this machine only: keep it out of git through the repository's own
+# exclude list, which changes nothing anyone else sees.
+if PREFIX="\$(git rev-parse --show-prefix 2>/dev/null)"; then
+  EXCLUDE="\$(git rev-parse --git-path info/exclude)"
+  PATTERN="/\${PREFIX}.claude/settings.local.json"
+  if ! grep -qxF "\$PATTERN" "\$EXCLUDE" 2>/dev/null; then
+    mkdir -p "\$(dirname "\$EXCLUDE")"
+    # A last line without its newline would swallow the pattern.
+    [ -s "\$EXCLUDE" ] && [ -n "\$(tail -c 1 "\$EXCLUDE")" ] && printf '\\n' >> "\$EXCLUDE"
+    printf '%s\\n' "\$PATTERN" >> "\$EXCLUDE"
+  fi
+fi
 exec "\$CX" --db "\$DB" serve --repo . --name "\$NAME"
 EOF
 cat > "$BIN_DIR/quartz-ctx-mcp" <<EOF
