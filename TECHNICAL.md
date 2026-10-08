@@ -153,7 +153,9 @@ every project instead:
   that already has `.cortex/memory.db`) keeps using its own. cortex still writes
   a small marker in `.cortex/` and its hooks in `.claude/settings.local.json`;
   when the launcher creates `.cortex/` it adds a `.gitignore` that hides the
-  folder from git. quartz-ctx reads
+  folder from git, and in a git repository it lists the hooks file in
+  `.git/info/exclude`, so neither shows up for a commit and the repository
+  itself is unchanged. quartz-ctx reads
   `.cortex/index-sources.json` when the project has one, otherwise discovers a
   Rust project's crates (`--discover . --include-private`), otherwise indexes
   the folder itself (`--source . --include-private`). Started in the home
