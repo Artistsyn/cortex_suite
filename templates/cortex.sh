@@ -119,6 +119,34 @@ run_bin() {
     fi
 }
 
+# Debug objects no build points at any more, deleted after a deploy.
+#
+# On macOS a debug build keeps its debug info in object files beside the binary
+# (deps/*.rcgu.o, split-debuginfo=unpacked), and the binary names each one by
+# path. Every rebuild writes a fresh set under new names and cargo deletes none
+# of the old: cortex/target reached 65,000 of them, 15 GB, by 2026-10-08.
+# Kept: every object named by the deployed binary or by the two newest cortex
+# executables in deps (the build and its test twin). Older executables are
+# earlier toolchains or profiles and go with their objects.
+prune_stale_objects() {
+    deps="$(dirname "$BINARY")/deps"
+    [ "$(uname -s)" = "Darwin" ] && [ -d "$deps" ] && command -v nm >/dev/null 2>&1 || return 0
+    tmp="$(mktemp -d)" || return 0
+    ls -t "$deps" | grep -E '^cortex-[0-9a-f]{16}$' > "$tmp/exes"
+    { nm -ap "$BINARY"; head -2 "$tmp/exes" | while IFS= read -r e; do nm -ap "$deps/$e"; done; } 2>/dev/null \
+        | grep ' OSO ' | sed 's#.*/##' | grep '\.rcgu\.o$' | sort -u > "$tmp/keep"
+    # A binary naming no objects means nm read nothing useful: delete nothing.
+    if [ -s "$tmp/keep" ]; then
+        before="$(du -sk "$deps" | cut -f1)"
+        ls "$deps" | grep '\.rcgu\.o$' | sort > "$tmp/all"
+        tail -n +3 "$tmp/exes" | while IFS= read -r e; do rm -f "$deps/$e" "$deps/$e.d"; done
+        (cd "$deps" && comm -23 "$tmp/all" "$tmp/keep" | xargs rm -f)
+        after="$(du -sk "$deps" | cut -f1)"
+        [ "$before" -gt "$after" ] && say "pruned $(( (before - after) / 1024 )) MB of stale debug objects"
+    fi
+    rm -rf "$tmp"
+}
+
 CMD="${1:-help}"
 shift || true
 
@@ -141,6 +169,7 @@ deploy)
     say "building..."
     cargo build --manifest-path "$CARGO" || die "build failed"
     [ -x "$BINARY" ] || die "build reported success but $BINARY is missing"
+    prune_stale_objects
     say "deployed: $BINARY"
     say "the running server keeps its old image until it restarts."
     ;;
