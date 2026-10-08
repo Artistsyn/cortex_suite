@@ -5,7 +5,6 @@ Gives your AI coding assistant a memory and a map of your code.
 - **Remembers** what worked and what broke, so mistakes aren't repeated.
 - **Looks up your real code** instead of guessing names and types.
 - **Stays current**: change a file and it already knows.
-- **Keeps your commits yours**: removes "Co-authored-by: Claude / Copilot" credits.
 
 Works with Claude Code, VS Code Copilot and Codex, in 10 languages. Everything
 stays on your computer.
@@ -112,10 +111,6 @@ The steps, for macOS and Linux:
    - VS Code Copilot: reload the window, run "MCP: List Servers" from the
      Command Palette, start both, and turn their tools on in agent mode.
    - Codex CLI: start a new codex session; the servers load from config.toml.
-8. Optional, per project that's a git repo:
-   `~/cortex_suite/cortex/target/debug/cortex ai-credit install --repo <project>`
-   keeps "Co-authored-by: Claude/Copilot" credits out of new commits.
-
 For Windows, the install script doesn't run. Instead, after steps 2-5 (Git for
 Windows, Visual Studio Build Tools with the C++ workload, Rust from
 https://rustup.rs, and the clone), run in PowerShell from the cortex_suite

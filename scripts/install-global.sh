@@ -7,9 +7,10 @@
 # What it does:
 #   1. builds both servers (unless --skip-build);
 #   2. writes two launchers to ~/.cortex-suite/bin that serve whichever folder
-#      the assistant was started in: its own memory in <project>/.cortex/,
-#      code found from .cortex/index-sources.json, a Rust project's crates, or
-#      the folder itself. The home folder (or /) is never indexed;
+#      the assistant was started in: its own memory under
+#      ~/.cortex-suite/projects/ (or its .cortex/memory.db, if set up with
+#      setup.sh), code found from .cortex/index-sources.json, a Rust project's
+#      crates, or the folder itself. The home folder (or /) is never indexed;
 #   3. registers them, for all projects, with:
 #        - Claude Code: the default account, every ~/.claude-* folder that holds
 #          an account, and each --claude-config DIR;
@@ -64,14 +65,27 @@ mkdir -p "$BIN_DIR" "$HOME/.cortex-suite/empty"
 cat > "$BIN_DIR/cortex-mcp" <<EOF
 #!/bin/sh
 # cortex for whichever project the assistant started in (written by
-# cortex_suite/scripts/install-global.sh). Memory: <project>/.cortex/memory.db.
+# cortex_suite/scripts/install-global.sh).
 CX="$CORTEX_EXE"
 NAME="\$(basename "\$PWD")"
 case "\$PWD" in
   "\$HOME"|/) exec "\$CX" --db "\$HOME/.cortex-suite/home.db" serve --repo "\$HOME/.cortex-suite/empty" --name home ;;
 esac
-mkdir -p .cortex
-exec "\$CX" --db .cortex/memory.db serve --repo . --name "\$NAME"
+if [ -f .cortex/memory.db ] || [ -f .cortex/index-sources.json ]; then
+  # A project set up with setup.sh (or used before) keeps its own memory.
+  DB=.cortex/memory.db
+else
+  # Memory lives outside the project, one folder per project path, so no
+  # database lands in a repository to be committed by accident.
+  KEY="\$(printf '%s' "\$PWD" | tr -c 'A-Za-z0-9._-' '_')"
+  mkdir -p "\$HOME/.cortex-suite/projects/\$KEY"
+  DB="\$HOME/.cortex-suite/projects/\$KEY/memory.db"
+  # cortex still keeps a small marker in .cortex/: keep that folder out of git.
+  if [ ! -e .cortex ]; then
+    mkdir .cortex && printf '*\\n' > .cortex/.gitignore
+  fi
+fi
+exec "\$CX" --db "\$DB" serve --repo . --name "\$NAME"
 EOF
 cat > "$BIN_DIR/quartz-ctx-mcp" <<EOF
 #!/bin/sh
@@ -127,7 +141,8 @@ case "$(uname -s)" in
 esac
 if [ "$DO_VSCODE" -eq 1 ] && [ -d "$VSCODE_USER" ]; then
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$VSCODE_USER/mcp.json" "$BIN_DIR" <<'PY'
+    # A config it can't read is reported and skipped; the install carries on.
+    python3 - "$VSCODE_USER/mcp.json" "$BIN_DIR" <<'PY' || warn "VS Code: skipped (see above)"
 import json, os, sys
 path, bin_dir = sys.argv[1], sys.argv[2]
 data = {}
@@ -135,7 +150,8 @@ if os.path.exists(path):
     try:
         data = json.load(open(path))
     except Exception:
-        sys.exit(f"[install] WARN: {path} isn't plain JSON (comments?); add cortex and quartz-ctx by hand")
+        print(f"[install] WARN: {path} isn't plain JSON (comments?); add cortex and quartz-ctx to it by hand, with commands {bin_dir}/cortex-mcp and {bin_dir}/quartz-ctx-mcp", file=sys.stderr)
+        sys.exit(1)
 servers = data.setdefault("servers", {})
 servers["cortex"] = {"type": "stdio", "command": f"{bin_dir}/cortex-mcp", "args": []}
 servers["quartz-ctx"] = {"type": "stdio", "command": f"{bin_dir}/quartz-ctx-mcp", "args": []}
@@ -155,6 +171,12 @@ if [ "$DO_CODEX" -eq 1 ] && [ -d "$HOME/.codex" ]; then
     # Replace our block.
     awk '/^# cortex_suite begin/{skip=1} !skip{print} /^# cortex_suite end/{skip=0}' "$CODEX_CFG" > "$CODEX_CFG.tmp" && mv "$CODEX_CFG.tmp" "$CODEX_CFG"
   fi
+fi
+# Servers named cortex or quartz-ctx that the user added themselves: a second
+# table with the same name would break the file, so leave Codex alone.
+if [ "$DO_CODEX" -eq 1 ] && [ -d "$HOME/.codex" ] && grep -Eq '^[[:space:]]*\[mcp_servers\.("?cortex"?|"?quartz-ctx"?)\]' "$CODEX_CFG"; then
+  warn "Codex: $CODEX_CFG already has a cortex or quartz-ctx server; left it as it is"
+elif [ "$DO_CODEX" -eq 1 ] && [ -d "$HOME/.codex" ]; then
   cat >> "$CODEX_CFG" <<EOF
 # cortex_suite begin (written by install-global.sh)
 [mcp_servers.cortex]
@@ -175,5 +197,3 @@ fi
 
 say ""
 say "Done. Restart your editor or assistant to load the servers."
-say "In a git repo, 'cortex ai-credit install' also keeps AI co-author credit out of new commits:"
-say "  $CORTEX_EXE ai-credit install --repo <project>"

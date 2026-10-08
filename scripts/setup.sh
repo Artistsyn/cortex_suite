@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build and wire the cortex + quartz-ctx MCP suite into a workspace (macOS/Linux).
 #
-#   ./setup.sh <workspace-path> [--force] [--skip-build] [--keep-ai-credit]
+#   ./setup.sh <workspace-path> [--force] [--skip-build]
 #
 # Safe to re-run: never overwrites an existing config unless --force.
 set -euo pipefail
@@ -10,13 +10,11 @@ SUITE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKSPACE=""
 FORCE=0
 SKIP_BUILD=0
-KEEP_AI_CREDIT=0
 
 for arg in "$@"; do
   case "$arg" in
     --force)      FORCE=1 ;;
     --skip-build) SKIP_BUILD=1 ;;
-    --keep-ai-credit) KEEP_AI_CREDIT=1 ;;
     -h|--help)    sed -n '2,8p' "$0"; exit 0 ;;
     *)            WORKSPACE="$arg" ;;
   esac
@@ -194,14 +192,6 @@ INSTR_FORCE=""
 "$CORTEX_EXE" instructions --root "$WORKSPACE" --name "$NAME" $INSTR_FORCE \
   | while IFS= read -r line; do say "$line"; done \
   || die "cortex could not update the instruction files (built before 'instructions' existed? re-run without --skip-build)"
-
-# Commits made in the workspace keep AI tools out of the credits: a commit-msg
-# hook drops Co-authored-by trailers naming an assistant and "Generated with"
-# footers. `cortex ai-credit check` lists old commits that still have them.
-if [ "$KEEP_AI_CREDIT" -eq 0 ] && git -C "$WORKSPACE" rev-parse --git-dir >/dev/null 2>&1; then
-  "$CORTEX_EXE" ai-credit install --repo "$WORKSPACE" | while IFS= read -r line; do say "$line"; done \
-    || warn "could not install the ai-credit commit hook"
-fi
 
 if [ "$UPDATING" -eq 1 ]; then
   say ""
