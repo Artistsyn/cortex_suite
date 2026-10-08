@@ -18,7 +18,9 @@ param(
     # Overwrite configs that already exist.
     [switch] $Force,
     # Skip cargo build (binaries already built).
-    [switch] $SkipBuild
+    [switch] $SkipBuild,
+    # Don't install the commit-msg hook that removes AI co-author credit.
+    [switch] $KeepAiCredit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -252,6 +254,14 @@ if ($Force) { $instrArgs += '--force' }
 Invoke-Native { & $CortexExe @instrArgs } | ForEach-Object { Say $_ }
 if ($LASTEXITCODE -ne 0) {
     Die "cortex could not update the instruction files (built before 'instructions' existed? re-run without -SkipBuild)"
+}
+
+# Commits made in the workspace keep AI tools out of the credits: a commit-msg
+# hook drops Co-authored-by trailers naming an assistant and "Generated with"
+# footers. `cortex ai-credit check` lists old commits that still have them.
+if (-not $KeepAiCredit -and (Test-Path (Join-Path $Workspace '.git'))) {
+    Invoke-Native { & $CortexExe ai-credit install --repo $Workspace } | ForEach-Object { Say $_ }
+    if ($LASTEXITCODE -ne 0) { Write-Warning "could not install the ai-credit commit hook" }
 }
 
 if ($Updating) {

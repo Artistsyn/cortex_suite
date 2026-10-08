@@ -1,4 +1,5 @@
 mod adr;
+mod ai_credit;
 mod audit;
 mod cache;
 mod closeout;
@@ -75,6 +76,33 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum AiCreditAction {
+    /// Remove AI credit from a commit message file (in place), or from stdin
+    /// to stdout with `-`.
+    Strip { file: String },
+    /// Add a commit-msg hook that removes AI credit from every new commit.
+    Install {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// List the commits that still credit an AI tool (exits 1 if any).
+    Check {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Remove AI credit from the whole history and re-author an assistant's
+    /// commits to a person (backup branch first; needs a clean tree).
+    Rewrite {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// Who the assistants' commits become: "Name <email>" (default: this
+        /// repo's git user).
+        #[arg(long)]
+        author: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -448,6 +476,13 @@ enum Command {
         /// Project name for a new file's title (default: the root's folder name).
         #[arg(long)]
         name: Option<String>,
+    },
+
+    /// Keep AI tools out of the repository's credits: Co-authored-by trailers
+    /// naming an assistant, "Generated with ..." footers, bot-authored commits.
+    AiCredit {
+        #[command(subcommand)]
+        action: AiCreditAction,
     },
 
     /// Run cortex's hooks as a command, for hosts that cannot call an MCP tool
@@ -1028,6 +1063,17 @@ fn main() -> Result<()> {
             run_instructions(root, name, instructions::Opts { check, force, adopt }, cli.db.clone(), format)
         }
         Command::Hook { event } => run_hook(&db_path, event.as_deref()),
+        Command::AiCredit { action } => match action {
+            AiCreditAction::Strip { file } => ai_credit::run_strip(&file),
+            AiCreditAction::Install { repo } => ai_credit::run_install(&repo),
+            AiCreditAction::Check { repo } => {
+                if !ai_credit::run_check(&repo)? {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            AiCreditAction::Rewrite { repo, author } => ai_credit::run_rewrite(&repo, author.as_deref()),
+        },
         Command::ReloadServers { dry_run } => reload::run(dry_run),
     }
 }
