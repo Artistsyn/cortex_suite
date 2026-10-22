@@ -65,6 +65,8 @@ const UNCACHEABLE: &[&str] = &[
     // was recorded or settled when it was not.
     "note_challenge",
     "resolve_challenge",
+    // Writes the manifest.
+    "index_sources",
     // Reads a growing transcript and writes to the store.
     "capture_markers",
     "restore_after_compact",
@@ -818,6 +820,22 @@ fn tools_list() -> Value {
                         "prompt": { "type": "string", "description": "The user's message." },
                         "source": { "type": "string", "enum": ["hook", "agent"], "description": "agent: you noticed a dispute the hook did not flag. Omitted by the hook." },
                         "limit":  { "type": "boolean", "description": "With source=agent: the user disputed a LIMIT you stated (what can or cannot be done). Returns the wall audit." }
+                    }
+                }
+            },
+            {
+                "name": "index_sources",
+                "description": "Answer cortex's question about code on disk that .cortex/index-sources.json \
+                                does not list. The prompt hook adds a new Rust crate in an already-indexed \
+                                git repo by itself, and asks about the rest (a repo nothing is indexed \
+                                from yet, a non-Rust project): ask the USER, then pass the paths it named \
+                                as add (index them; cortex and quartz-ctx serve them from the next lookup) \
+                                or ignore (never ask again). With neither, reports what is unlisted.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "add":    { "type": "array", "items": { "type": "string" }, "description": "Paths to index: every project under each (a demo/example/test crate only when named exactly)." },
+                        "ignore": { "type": "array", "items": { "type": "string" }, "description": "Path prefixes the user declined." }
                     }
                 }
             },

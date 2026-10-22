@@ -35,6 +35,7 @@ mod scoreboard;
 mod search;
 mod session_store;
 mod skills;
+mod sources;
 mod verify;
 mod walls;
 mod loop_ledger;
@@ -75,6 +76,16 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum SourcesAction {
+    /// Add the automatic crates now, as the prompt hook would.
+    Sweep,
+    /// Index every project under these paths (a sample only when named exactly).
+    Add { paths: Vec<String> },
+    /// Stop asking about everything under these paths.
+    Ignore { paths: Vec<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -147,6 +158,18 @@ enum Command {
         /// Repo root holding .cortex/index-sources.json.
         #[arg(long, default_value = ".")]
         repo: std::path::PathBuf,
+    },
+
+    /// Projects on disk that .cortex/index-sources.json does not list. With no
+    /// action, report them (nothing is written). A Rust crate in a git repo
+    /// that already has an indexed root is added by the prompt hook on its
+    /// own; everything else waits for `add` or `ignore`.
+    Sources {
+        /// Repo root holding .cortex/index-sources.json.
+        #[arg(long, default_value = ".")]
+        repo: std::path::PathBuf,
+        #[command(subcommand)]
+        action: Option<SourcesAction>,
     },
 
     /// List patterns and anti-patterns that name code which changed after they
@@ -964,6 +987,7 @@ fn main() -> Result<()> {
         Command::Walls(cmd)        => run_walls(cmd, &db_path),
         Command::Knowledge(cmd)    => run_knowledge(cmd, &db_path),
         Command::Manifest { repo } => run_manifest(&repo),
+        Command::Sources { repo, action } => run_sources(&repo, action),
         Command::Refresh { repo }  => run_refresh(&repo, &db_path),
         Command::KnowledgeDrift    => {
             let store = Store::open(&db_path)?;
@@ -3056,6 +3080,39 @@ fn run_manifest(repo: &Path) -> Result<()> {
             let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let scope = t.get("scope").and_then(|v| v.as_str()).unwrap_or("");
             println!("{src}	{name}	{scope}");
+        }
+    }
+    Ok(())
+}
+
+/// `cortex sources`: what is on disk and not in the manifest, and the answers.
+fn run_sources(repo: &Path, action: Option<SourcesAction>) -> Result<()> {
+    let root = repo.canonicalize().with_context(|| format!("no such folder: {}", repo.display()))?;
+    match action {
+        None => println!("{}", sources::report(&sources::sweep(&root, false)?)),
+        Some(SourcesAction::Sweep) => {
+            let s = sources::sweep(&root, true)?;
+            println!("{}", sources::report(&s));
+            if !s.added.is_empty() {
+                println!("added {} target(s) to .cortex/index-sources.json", s.added.len());
+            }
+        }
+        Some(SourcesAction::Add { paths }) => {
+            let (added, unmatched) = sources::add(&root, &paths)?;
+            for f in &added {
+                println!("added    {}  ({})", f.source, f.name);
+            }
+            for p in &unmatched {
+                println!("no unindexed project under {p}");
+            }
+            if added.is_empty() && !unmatched.is_empty() {
+                std::process::exit(1);
+            }
+        }
+        Some(SourcesAction::Ignore { paths }) => {
+            for p in sources::ignore(&root, &paths)? {
+                println!("ignoring {p}");
+            }
         }
     }
     Ok(())
