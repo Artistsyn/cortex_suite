@@ -51,7 +51,8 @@ pub fn dispatch(
         // obtained through the normal (permissioned) Bash path. No execution.
         "compact_output"          => tool_compact_output(args, store, session_id, repo_root),
         "edit_guard"              => tool_edit_guard(args, store, session_id),
-        "note_challenge"          => tool_note_challenge(args, store, session_id),
+        "note_challenge"          => tool_note_challenge(args, store, session_id, repo_root),
+        "index_sources"           => tool_index_sources(args, repo_root),
         "capture_markers"         => tool_capture_markers(args, store, repo_root),
         "restore_after_compact"   => tool_restore_after_compact(args, store, repo_root),
         "resolve_pair"            => tool_resolve_pair(args, store),
@@ -88,7 +89,7 @@ pub(crate) fn run_hook_tool(
     match tool {
         "compact_output" => tool_compact_output(args, store, session_id, repo_root),
         "edit_guard" => tool_edit_guard(args, store, session_id),
-        "note_challenge" => tool_note_challenge(args, store, session_id),
+        "note_challenge" => tool_note_challenge(args, store, session_id, repo_root),
         "capture_markers" => tool_capture_markers(args, store, repo_root),
         "restore_after_compact" => tool_restore_after_compact(args, store, repo_root),
         other => Err(format!("not a hook tool: {other}")),
@@ -109,6 +110,7 @@ fn tool_note_challenge(
     args: &Value,
     store: &Store,
     session_id: &str,
+    repo_root: &Path,
 ) -> Result<String, String> {
     let prompt = args["prompt"].as_str().unwrap_or("");
     if prompt.is_empty() {
@@ -154,8 +156,15 @@ fn tool_note_challenge(
     }
 
     // Pairs opened since the last prompt: the author hears while they still
-    // know why they wrote the new entry.
-    let notices = if from_agent { String::new() } else { crate::reconcile::pending_notices(store) };
+    // know why they wrote the new entry. New code on disk rides the same
+    // channel - the prompt hook is the one place every session passes through
+    // and can be heard from (SessionStart's mcp_tool hooks are skipped at launch).
+    let notices = if from_agent {
+        String::new()
+    } else {
+        let parts = [crate::reconcile::pending_notices(store), crate::sources::prompt_notice(store, session_id, repo_root)];
+        parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n")
+    };
     let with_notices = |text: String| -> String {
         match (text.is_empty(), notices.is_empty()) {
             (_, true) => text,
@@ -188,6 +197,45 @@ fn tool_note_challenge(
 /// neither take context nor be allowed to block a turn, so a hook call always
 /// answers with nothing; what happened is in `loop_changes`, the heartbeat, and
 /// `loop.capture_error` when something is wrong. Called directly, it reports.
+/// Record the user's answer about code the manifest does not list: `add` to
+/// index it, `ignore` to stop asking. With neither, report what is unlisted.
+fn tool_index_sources(args: &Value, repo_root: &Path) -> Result<String, String> {
+    let list = |k: &str| -> Vec<String> {
+        args.get(k)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let (add, ignore) = (list("add"), list("ignore"));
+    let mut lines = Vec::new();
+    if !add.is_empty() {
+        let (added, unmatched) = crate::sources::add(repo_root, &add).map_err(|e| format!("{e:#}"))?;
+        for f in &added {
+            lines.push(format!("now indexing {} ({})", f.source, f.name));
+        }
+        for p in &unmatched {
+            lines.push(format!("no unindexed project under {p}"));
+        }
+        if !added.is_empty() {
+            lines.push("cortex and quartz-ctx serve them from the next lookup.".into());
+        }
+    }
+    if !ignore.is_empty() {
+        let new = crate::sources::ignore(repo_root, &ignore).map_err(|e| format!("{e:#}"))?;
+        for p in &new {
+            lines.push(format!("no longer asking about {p}"));
+        }
+        if new.is_empty() {
+            lines.push("already ignored".into());
+        }
+    }
+    if add.is_empty() && ignore.is_empty() {
+        let s = crate::sources::sweep(repo_root, false).map_err(|e| format!("{e:#}"))?;
+        lines.push(crate::sources::report(&s));
+    }
+    Ok(lines.join("\n"))
+}
+
 fn tool_capture_markers(args: &Value, store: &Store, repo_root: &Path) -> Result<String, String> {
     let raw = args["transcript_path"].as_str().unwrap_or("");
     let from_hook = args.get("hook_event_name").and_then(Value::as_str).is_some_and(|e| !e.is_empty());
@@ -4725,6 +4773,7 @@ mod walls_tool_tests {
             &json!({"prompt": "what level of raytracing IS possible on the quest 3?"}),
             &s,
             "sess",
+            Path::new("/nonexistent"),
         )
         .unwrap();
         assert!(out.contains("That disputes a limit"), "{out}");
@@ -4732,7 +4781,7 @@ mod walls_tool_tests {
         assert!(out.contains("only with a new fact"), "{out}");
         assert!(out.contains(&format!("#{id} LIMIT [open · hardware]")), "the matching wall rides along: {out}");
 
-        let plain = tool_note_challenge(&json!({"prompt": "are you sure that hook fires?"}), &s, "sess").unwrap();
+        let plain = tool_note_challenge(&json!({"prompt": "are you sure that hook fires?"}), &s, "sess", Path::new("/nonexistent")).unwrap();
         assert!(plain.contains("Settle it by CHECKING"), "{plain}");
         assert!(!plain.contains("wall audit"), "{plain}");
     }
@@ -5007,6 +5056,7 @@ mod loop_tool_tests {
             &json!({ "prompt": "hmm, I really doubt that part", "source": "agent" }),
             &s,
             "s1",
+            Path::new("/nonexistent"),
         )
         .unwrap();
         assert!(out.contains("the hook's cues missed"), "{out}");
@@ -5021,6 +5071,7 @@ mod loop_tool_tests {
             &json!({ "prompt": "surely we could get that running on the headset", "source": "agent", "limit": true }),
             &s,
             "s1",
+            Path::new("/nonexistent"),
         )
         .unwrap();
         assert!(out.contains("limit dispute"), "{out}");
@@ -5054,9 +5105,9 @@ mod loop_tool_tests {
             .unwrap();
         let newer = s.conn().last_insert_rowid();
         crate::reconcile::open_pair(&s, "anti_patterns", newer, ap, 0.4, false).unwrap();
-        let out = tool_note_challenge(&json!({ "prompt": "ok, carry on with the next step" }), &s, "s").unwrap();
+        let out = tool_note_challenge(&json!({ "prompt": "ok, carry on with the next step" }), &s, "s", Path::new("/nonexistent")).unwrap();
         assert!(out.contains("resolve_pair") && out.contains(&format!("ap:{newer}")), "{out}");
-        let again = tool_note_challenge(&json!({ "prompt": "and the one after that" }), &s, "s").unwrap();
+        let again = tool_note_challenge(&json!({ "prompt": "and the one after that" }), &s, "s", Path::new("/nonexistent")).unwrap();
         assert!(again.is_empty(), "announced once: {again}");
         let served = tool_get_anti_patterns(&json!({ "hint": "zorbulate_widget frobnicate widget_cache" }), &s, "s").unwrap();
         assert!(served.contains("## Not yet reconciled") && served.contains("never reconciled"), "{served}");

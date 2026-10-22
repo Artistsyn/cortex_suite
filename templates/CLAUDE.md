@@ -89,6 +89,9 @@ it is never stale.
   limit each is, its evidence, and the cheapest test that would decide it. Check
   before accepting or declaring a limit; a verdict changes only with a new fact
   (a measurement or a dated source)
+- `index_sources(add | ignore)` — code on disk the manifest does not list. A new
+  Rust crate in an indexed repo is added by itself; for the rest the prompt hook
+  says to ask the user, and this records the answer
 
 **Decision rule:**
 - What the code *is* → **quartz-ctx**

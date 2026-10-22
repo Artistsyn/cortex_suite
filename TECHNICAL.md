@@ -216,7 +216,22 @@ upgrades them by hand.
 |---|---|---|
 | `edit_guard` | after an Edit or Write | one short warning when the edit shares **distinctive** evidence with a recorded trap: a code identifier plus one more rare token, or three rare words. Ordinary English, library identifiers and prose files never count. At most one per file and four per session. |
 | shell observer (Bash and PowerShell) | after every command, **including failed ones** (`PostToolUseFailure`) | nothing, usually; every build/test verdict is recorded. When a failure matches a trap — the one linked to it by `anti-pattern add --resolves`, or one its error message names — the agent gets the trap and its fix. A specific failure seen in three sessions with nothing recorded gets a nudge with the exact command to record it. |
-| `note_challenge` | on each user message | records a disputed claim as an open question, to be settled by checking |
+| `note_challenge` | on each user message | records a disputed claim as an open question, to be settled by checking. The same hook compares the workspace with `.cortex/index-sources.json` (see below) |
+
+**Code the manifest does not list.** On each user message cortex walks the
+workspace (about 36 ms on FlowMake's 736 folders, build output pruned) for
+projects missing from the manifest. A Rust crate inside a git repository that
+already has an indexed root is appended as a target, and the agent is told; both
+servers serve it from the next lookup. A repository nothing is indexed from yet,
+or a non-Rust project, is a question instead: the agent is told once per session
+to ask, then records the answer with the `index_sources` tool (`add` or
+`ignore`). Demo, example, bench, test and xtask crates are skipped, and a
+manifest root that has gone is reported beside any same-named crate found
+elsewhere. Additions are spliced into the file's text, so what its owner wrote
+stays byte for byte. `"auto_index": "ask"` in the manifest makes every addition
+a question, `"off"` stops it, and `"ignore": [...]` holds the declined prefixes.
+`cortex sources` prints the same report from a terminal (`sweep`, `add`,
+`ignore` act on it).
 
 Two facts shaped all of this, and both were learned the hard way. Claude Code
 shows the model **only** `hookSpecificOutput.additionalContext` from these hooks:
