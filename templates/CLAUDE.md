@@ -367,7 +367,7 @@ commands on both.
 | `status` / `doctor` | store summary / pipeline health |
 | `skill-status` | drafts awaiting a human |
 | `fired` | which mechanisms have actually run, and which are silently idle |
-| `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
+| `scoreboard` | observed outcomes, repeat failures, how often agents' new Rust breaks the code rules, what reached agents, and the token bill actually paid |
 | `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note); `--vscode` installs the same for VS Code Copilot |
 | `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, write the Rust code rules from ssnebula, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
 | `-- <args>` | pass anything straight through to the binary |

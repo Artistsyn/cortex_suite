@@ -274,25 +274,36 @@ pub fn observe(store: &Store, session_id: &str, command: &str, passed: bool) -> 
 /// that survived being fixed at least twice.
 pub fn note_failure(store: &Store, session_id: &str, command: &str, output: &str) -> Result<()> {
     let Some(sig) = error_signature(output) else { return Ok(()) };
-    // One count per session per signature: hitting the same compile error four
-    // times while iterating on one fix is one occurrence, not four.
-    store.conn().execute(
-        "INSERT INTO recurring_errors (signature, sample, command, sessions, seen_count,
-                                       first_seen_at, last_seen_at)
-         VALUES (?1, ?2, ?3, json_array(?4), 1, unixepoch(), unixepoch())
-         ON CONFLICT(signature) DO UPDATE SET
-             seen_count   = seen_count + (CASE WHEN instr(sessions, ?4) = 0 THEN 1 ELSE 0 END),
-             sessions     = CASE WHEN instr(sessions, ?4) = 0
-                                 THEN json_insert(sessions, '$[#]', ?4) ELSE sessions END,
-             -- The exemplar REFRESHES. It used to be frozen at whatever the
-             -- first sighting captured, so a bad one could never heal; with a
-             -- signature this specific every member is a fair illustration of
-             -- the group, and the newest is the one a reviewer can still find.
-             sample       = excluded.sample,
-             last_seen_at = unixepoch()",
-        params![sig, error_excerpt(output), command, session_id],
-    )?;
-    Ok(())
+    RecurringErrors::note(store, session_id, &sig, &error_excerpt(output), command)
+}
+
+/// The `recurring_errors` table, written to by name.
+pub struct RecurringErrors;
+
+impl RecurringErrors {
+    /// Count one sighting of a failure already named, such as a code rule an
+    /// edit broke (`ssnebula:<lint>`), on the same once-per-session terms.
+    pub fn note(store: &Store, session_id: &str, sig: &str, sample: &str, command: &str) -> Result<()> {
+        // One count per session per signature: hitting the same compile error four
+        // times while iterating on one fix is one occurrence, not four.
+        store.conn().execute(
+            "INSERT INTO recurring_errors (signature, sample, command, sessions, seen_count,
+                                           first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, json_array(?4), 1, unixepoch(), unixepoch())
+             ON CONFLICT(signature) DO UPDATE SET
+                 seen_count   = seen_count + (CASE WHEN instr(sessions, ?4) = 0 THEN 1 ELSE 0 END),
+                 sessions     = CASE WHEN instr(sessions, ?4) = 0
+                                     THEN json_insert(sessions, '$[#]', ?4) ELSE sessions END,
+                 -- The exemplar REFRESHES. It used to be frozen at whatever the
+                 -- first sighting captured, so a bad one could never heal; with a
+                 -- signature this specific every member is a fair illustration of
+                 -- the group, and the newest is the one a reviewer can still find.
+                 sample       = excluded.sample,
+                 last_seen_at = unixepoch()",
+            params![sig, sample, command, session_id],
+        )?;
+        Ok(())
+    }
 }
 
 /// Failures seen in at least `min` distinct sessions — worth a human deciding

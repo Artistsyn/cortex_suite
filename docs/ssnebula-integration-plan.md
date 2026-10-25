@@ -169,4 +169,14 @@ and check (a) no legacy finding is ever reported, (b) a planted `get_x()` /
   in a repository that is not set up yet; `cortex repo-setup --all DIR` for a
   folder. A repository's own pre-commit hook is kept and the line to add is
   printed. All 27 repositories under FlowMake set up 2026-10-25.
-- Next: step 5 (findings log, scoreboard metric, recurring-lint proposals).
+- **Step 5 done 2026-10-25.** Each edit lint run goes in `edit_lint_checks`
+  (lines written, findings) and each finding in `edit_lint_findings`.
+  `cortex scoreboard` has a RUST CODE RULES section: findings per 100 lines
+  written against the previous window, edits and lines checked, error-level
+  count, the five most-broken rules. Each broken rule is counted once per
+  session in `recurring_errors` as `ssnebula:<lint>`, so one broken in 3+
+  sessions reaches closeout's review queue with the usual `anti-pattern add
+  --resolves` / `recurring-dismiss` choice. Seen live, then the probe rows
+  were deleted. 415 cortex tests pass; findings unchanged at 1,432.
+- Possible next: put the most-broken rules at the top of the generated rules
+  file, so a new session reads the ones agents get wrong first.

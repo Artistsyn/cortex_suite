@@ -36,6 +36,12 @@ impl Finding {
     }
 }
 
+/// One run of the check: what it found and how many lines the edit wrote.
+pub struct Checked {
+    pub findings: Vec<Finding>,
+    pub lines: usize,
+}
+
 pub struct EditLint<'a> {
     root: &'a Path,
     file: PathBuf,
@@ -59,10 +65,31 @@ impl<'a> EditLint<'a> {
     pub fn after_edit(store: &Store, session_id: &str, root: &'a Path, file_path: &str, added: &str) -> Option<String> {
         crate::repo_setup::RepoSetup::after_edit(&root.join(file_path));
         let lint = Self::new(root, file_path)?;
-        let findings = lint.check(added)?;
-        let _ = crate::corrections::beat_named(store, Self::HEARTBEAT, !findings.is_empty());
-        lint.remember_errors(store, session_id, &findings);
-        lint.message(&findings)
+        let checked = lint.check(added)?;
+        let _ = crate::corrections::beat_named(store, Self::HEARTBEAT, !checked.findings.is_empty());
+        lint.remember_errors(store, session_id, &checked.findings);
+        lint.log(store, session_id, &checked);
+        lint.message(&checked.findings)
+    }
+
+    /// The run, for the scoreboard, and each rule broken, counted once per session as a
+    /// recurring failure: a rule agents keep breaking reaches the review queue like an error
+    /// that keeps coming back.
+    fn log(&self, store: &Store, session_id: &str, checked: &Checked) {
+        let file = self.file.to_string_lossy();
+        let logged = store.conn().execute(
+            "INSERT INTO edit_lint_checks (session_id, file, lines, findings) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, file, checked.lines, checked.findings.len()],
+        );
+        let check_id = logged.map(|_| store.conn().last_insert_rowid()).unwrap_or_default();
+        for f in &checked.findings {
+            let _ = store.conn().execute(
+                "INSERT INTO edit_lint_findings (check_id, lint, level) VALUES (?1, ?2, ?3)",
+                params![check_id, f.lint, f.level],
+            );
+            let sample = format!("{}: {}", f.message, f.snippet.trim());
+            let _ = crate::test_signal::RecurringErrors::note(store, session_id, &format!("ssnebula:{}", f.lint), &sample, "ssnebula (edit lint)");
+        }
     }
 
     /// `after_edit` for each file of a call. The lint reads each file as the edit left it, so a
@@ -87,14 +114,15 @@ impl<'a> EditLint<'a> {
 
     /// The findings on the lines the edit wrote, or `None` when ssnebula could not run or the
     /// written lines cannot be told apart.
-    pub fn check(&self, added: &str) -> Option<Vec<Finding>> {
+    pub fn check(&self, added: &str) -> Option<Checked> {
         let text = std::fs::read_to_string(&self.file).ok()?;
         let lines = Self::written_lines(&text, added)?;
+        let count = lines.iter().map(|(first, last)| last + 1 - first).sum();
         let spec = lines.iter().map(|(first, last)| format!("{first}-{last}")).collect::<Vec<_>>().join(",");
         let args = ["check".as_ref(), self.file.as_os_str(), "--lines".as_ref(), spec.as_ref()];
         let mut findings = Self::run_check(self.root, &args, None)?;
         findings.sort_by_key(|f| (!f.is_error(), f.line));
-        Some(findings)
+        Some(Checked { findings, lines: count })
     }
 
     /// `ssnebula check` with `args` (and `input` on standard input), parsed; `None` when no
@@ -161,7 +189,6 @@ impl OpenErrors {
             .collect()
     }
 
-    /// Recorded errors by file, each as (lint, line text).
     fn recorded(store: &Store, session_id: &str) -> BTreeMap<String, Vec<(String, String)>> {
         let since = (chrono::Utc::now() - chrono::Duration::hours(Self::HOOK_WINDOW_HOURS)).to_rfc3339();
         let mut by_file: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
@@ -277,5 +304,19 @@ mod tests {
         other.snippet = "dbg!(y);".into();
         assert!(OpenErrors::kept(&[other], &wanted, "src/a.rs").is_empty(), "a different line is not the one reported");
         assert!(OpenErrors::refusal(&open).starts_with("closeout refused"));
+    }
+
+    #[test]
+    fn each_run_is_logged_and_a_broken_rule_recurs_once_per_session() {
+        let (_d, store) = scratch_store("lint_log");
+        let lint = EditLint { root: Path::new("/w"), file: PathBuf::from("/w/src/a.rs") };
+        let run = || Checked { findings: vec![sample("vague_name", "warn", 2), sample("vague_name", "warn", 3)], lines: 4 };
+        lint.log(&store, "session_a", &run());
+        lint.log(&store, "session_a", &run());
+        lint.log(&store, "session_b", &run());
+        let count = |sql: &str| -> i64 { store.conn().query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM edit_lint_checks"), 3);
+        assert_eq!(count("SELECT COUNT(*) FROM edit_lint_findings"), 6);
+        assert_eq!(count("SELECT seen_count FROM recurring_errors WHERE signature = 'ssnebula:vague_name'"), 2, "sessions, not sightings");
     }
 }

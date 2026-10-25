@@ -428,6 +428,22 @@ reported_at TEXT NOT NULL,
 PRIMARY KEY (session_id, file, lint, snippet)
 );
 
+-- Every edit lint run and what it found, for the scoreboard's trend: findings
+-- per hundred lines agents write, and the rules they break most.
+CREATE TABLE IF NOT EXISTS edit_lint_checks (
+id         INTEGER PRIMARY KEY AUTOINCREMENT,
+session_id TEXT NOT NULL,
+file       TEXT NOT NULL,
+lines      INTEGER NOT NULL,
+findings   INTEGER NOT NULL,
+checked_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+CREATE TABLE IF NOT EXISTS edit_lint_findings (
+check_id INTEGER NOT NULL,
+lint     TEXT NOT NULL,
+level    TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS edit_guard_fires (
                 session_id      TEXT NOT NULL,
                 anti_pattern_id INTEGER NOT NULL,

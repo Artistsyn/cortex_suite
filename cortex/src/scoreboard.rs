@@ -147,6 +147,72 @@ pub struct TokenLedger {
     pub previous: TokenWindow,
 }
 
+/// What the edit lint saw agents write in one window: how often the lines they wrote broke a
+/// Rust code rule, and which rules.
+#[derive(Debug, Default, Serialize)]
+pub struct LintWindow {
+    pub checks: i64,
+    pub lines: i64,
+    pub findings: i64,
+    pub errors: i64,
+    /// The most-broken rules, most first.
+    pub top: Vec<(String, i64)>,
+}
+
+impl LintWindow {
+    const TOP: i64 = 5;
+
+    pub fn measure(store: &Store, start: i64, end: i64) -> Self {
+        let span = rusqlite::params![start, end];
+        let totals = store.conn().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(lines), 0), COALESCE(SUM(findings), 0) FROM edit_lint_checks
+             WHERE checked_at >= ?1 AND checked_at < ?2",
+            span,
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        );
+        let (checks, lines, findings) = totals.unwrap_or((0, 0, 0));
+        let in_window = "FROM edit_lint_findings f JOIN edit_lint_checks c ON c.id = f.check_id
+                         WHERE c.checked_at >= ?1 AND c.checked_at < ?2";
+        let errors = store
+            .conn()
+            .query_row(&format!("SELECT COUNT(*) {in_window} AND f.level = 'deny'"), span, |r| r.get(0))
+            .unwrap_or(0);
+        let top = store
+            .conn()
+            .prepare(&format!("SELECT f.lint, COUNT(*) AS n {in_window} GROUP BY f.lint ORDER BY n DESC, f.lint LIMIT {}", Self::TOP))
+            .and_then(|mut query| query.query_map(span, |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+            .unwrap_or_default();
+        Self { checks, lines, findings, errors, top }
+    }
+
+    fn per_hundred_lines(&self) -> f32 {
+        100.0 * ratio(self.findings, self.lines)
+    }
+
+    /// The scoreboard's section, current window against the previous one; empty when the lint
+    /// has never run.
+    fn format(current: &Self, previous: &Self) -> String {
+        if current.checks == 0 && previous.checks == 0 {
+            return String::new();
+        }
+        let top = current.top.iter().map(|(lint, n)| format!("{lint} {n}")).collect::<Vec<_>>().join(", ");
+        format!(
+            "\n  RUST CODE RULES (ssnebula, on the lines each edit wrote; observed)\n\
+             \x20   Findings per 100 lines written: {:.1}  (prev {:.1})  {}\n\
+             \x20   {} edits checked, {} lines, {} findings ({} error-level)\n\
+             \x20   Broken most: {}\n",
+            current.per_hundred_lines(),
+            previous.per_hundred_lines(),
+            if previous.checks == 0 { "→" } else { trend(current.per_hundred_lines(), previous.per_hundred_lines(), false) },
+            current.checks,
+            current.lines,
+            current.findings,
+            current.errors,
+            if top.is_empty() { "nothing".to_owned() } else { top },
+        )
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Scoreboard {
     pub generated_at: String,
@@ -173,6 +239,8 @@ pub struct Scoreboard {
     pub loop_unaudited: i64,
     /// Capture hook: runs, runs that found markers, last run (unix seconds).
     pub capture_hook: Option<(i64, i64, i64)>,
+    pub lint_current: LintWindow,
+    pub lint_previous: LintWindow,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<TokenLedger>,
 }
@@ -370,6 +438,8 @@ pub fn compute(store: &Store, window_days: u32) -> Result<Scoreboard> {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .ok(),
+        lint_current: LintWindow::measure(store, now - w, now + 1),
+        lint_previous: LintWindow::measure(store, now - 2 * w, now - w),
         tokens: None,
     })
 }
@@ -845,6 +915,7 @@ pub fn format_text(sb: &Scoreboard) -> String {
         None => o.push_str("    ! Capture hook has never run: markers reach the store only at closeout\n"),
     }
 
+    o.push_str(&LintWindow::format(&sb.lint_current, &sb.lint_previous));
     o.push_str(&format!(
         "\n  STORE (live entries only): {} patterns ({} retired), {} anti-patterns ({} retired)\n\
          \x20   Usage signal on {} of live patterns   unsettled challenges: {}\n\
@@ -1142,6 +1213,29 @@ mod tests {
         assert_eq!(shell_kind("(Get-Content a.rs)[10..20]"), Some("sed"));
         assert_eq!(shell_kind("Get-Content a.rs"), None, "a whole file is a cat");
         assert_eq!(shell_kind("Start-Sleep -Seconds 30"), Some("wait"));
+    }
+
+    #[test]
+    fn the_rules_section_counts_findings_per_hundred_lines_written() {
+        let store = test_store("lint_window");
+        let now = Utc::now().timestamp();
+        for (lines, findings, at) in [(100, 2, now - 60), (50, 1, now - 60), (100, 6, now - 20 * 86400)] {
+            store.conn().execute(
+                "INSERT INTO edit_lint_checks (session_id, file, lines, findings, checked_at) VALUES ('s', 'a.rs', ?1, ?2, ?3)",
+                rusqlite::params![lines, findings, at],
+            ).unwrap();
+            let id = store.conn().last_insert_rowid();
+            for n in 0..findings {
+                let (lint, level) = if n == 0 && at > now - 86400 { ("dbg_macro", "deny") } else { ("vague_name", "warn") };
+                store.conn().execute("INSERT INTO edit_lint_findings (check_id, lint, level) VALUES (?1, ?2, ?3)", rusqlite::params![id, lint, level]).unwrap();
+            }
+        }
+        let sb = compute(&store, 14).unwrap();
+        assert_eq!((sb.lint_current.checks, sb.lint_current.lines, sb.lint_current.findings, sb.lint_current.errors), (2, 150, 3, 2));
+        assert_eq!(sb.lint_current.top, vec![("dbg_macro".to_string(), 2), ("vague_name".to_string(), 1)]);
+        let text = format_text(&sb);
+        assert!(text.contains("Findings per 100 lines written: 2.0  (prev 6.0)  ↑ improving"), "{text}");
+        assert!(LintWindow::format(&LintWindow::default(), &LintWindow::default()).is_empty());
     }
 
     #[test]
