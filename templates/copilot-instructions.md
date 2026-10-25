@@ -227,6 +227,9 @@ otherwise changing is not refactored to fit it. `cortex instructions`
 generates that file from ssnebula's lints, so a change goes to `ssnebula.toml`
 or ssnebula, never to the file. After an edit to a Rust file, a `[ssnebula]`
 note lists the rules the lines just written break; fix them before moving on.
+Error-level findings (`dbg!`) are fine while debugging, but closeout refuses
+`build_pass` while one the note reported remains, and a repository with the
+pre-commit hook (`cortex commit-check --install`) refuses a commit adding one.
 <!-- cortex_suite:end -->
 
 ## Style

@@ -149,5 +149,16 @@ and check (a) no legacy finding is ever reported, (b) a planted `get_x()` /
   findings, an Edit beside them reported only its own line, the fix was silent;
   Copilot payload 35 ms. 403 cortex tests pass; cortex findings unchanged at
   1,432.
-- Next: step 4, closeout refuses while error-level findings remain in lines
-  written this session, plus the commit-time check.
+- **Step 4 done 2026-10-25.** The edit lint records each error-level finding
+  it reports (`edit_lint_errors`: session, file, lint, line text). A
+  `closeout_session(build_pass)` re-checks those files and refuses while a
+  recorded finding is still there, matched by lint and line text so moved lines
+  count; it checks its own session plus hook sessions (`vscode:...`) from the
+  last 12 h, since Copilot's hook sessions are not the MCP session. `cortex
+  commit-check` lints the staged text (`ssnebula check --stdin`) on the lines
+  the commit adds and refuses on errors; `--install` writes `.git/hooks/
+  pre-commit`, which does nothing if cortex is missing. Installed in
+  cortex_suite and ssnebula. Seen live: closeout refused with a `dbg!` and
+  passed once it was removed; a staged `dbg!` commit was refused, a clean one
+  passed. 410 cortex tests pass.
+- Next: step 5 (findings log, scoreboard metric, recurring-lint proposals).

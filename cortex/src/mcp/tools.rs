@@ -802,7 +802,7 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str, repo_root: &Pa
         edit_guard_record(store, session_id, hit.id, &hit.file, hit.text.len());
         texts.push(hit.text);
     }
-    if let Some(t) = crate::edit_lint::EditLint::after_edit(store, repo_root, file_path, edit_added(args)) {
+    if let Some(t) = crate::edit_lint::EditLint::after_edit(store, session_id, repo_root, file_path, edit_added(args)) {
         texts.push(t);
     }
     if texts.is_empty() {
@@ -3450,6 +3450,12 @@ fn tool_closeout_session(
     repo_root: &Path,
 ) -> Result<String, String> {
     let outcome_type = args["outcome_type"].as_str().ok_or("missing `outcome_type`")?;
+    if outcome_type == "build_pass" {
+        let open = crate::edit_lint::OpenErrors::find(store, session_id, repo_root);
+        if !open.is_empty() {
+            return Err(crate::edit_lint::OpenErrors::refusal(&open));
+        }
+    }
     let inline_approve = args.get("inline_approve")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);

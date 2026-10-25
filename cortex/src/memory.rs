@@ -417,7 +417,18 @@ impl Store {
                 last_fired INTEGER NOT NULL DEFAULT (unixepoch())
             );
 
-            CREATE TABLE IF NOT EXISTS edit_guard_fires (
+            -- Error-level ssnebula findings the edit lint reported, keyed by the text of their
+-- line so closeout can tell whether each is still in its file wherever it moved.
+CREATE TABLE IF NOT EXISTS edit_lint_errors (
+session_id  TEXT NOT NULL,
+file        TEXT NOT NULL,
+lint        TEXT NOT NULL,
+snippet     TEXT NOT NULL,
+reported_at TEXT NOT NULL,
+PRIMARY KEY (session_id, file, lint, snippet)
+);
+
+CREATE TABLE IF NOT EXISTS edit_guard_fires (
                 session_id      TEXT NOT NULL,
                 anti_pattern_id INTEGER NOT NULL,
                 file            TEXT NOT NULL DEFAULT '',

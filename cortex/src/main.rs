@@ -37,6 +37,7 @@ mod session_store;
 mod skills;
 mod sources;
 mod verify;
+mod commit_check;
 mod edit_lint;
 mod ssnebula;
 mod style_rules;
@@ -444,6 +445,16 @@ enum Command {
         /// List what would be stopped and stop nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Refuse a commit whose added Rust lines break an error-level ssnebula
+    /// rule (the git pre-commit hook runs this); `--install` writes that hook.
+    CommitCheck {
+        /// Write the pre-commit hook into the repository instead of checking.
+        #[arg(long)]
+        install: bool,
+        /// A folder inside the repository (default: current dir).
+        #[arg(long)]
+        repo: Option<PathBuf>,
     },
     /// Add or update the cortex_suite section of CLAUDE.md and
     /// .github/copilot-instructions.md. Only the text between the section's
@@ -1055,6 +1066,7 @@ fn main() -> Result<()> {
             run_instructions(root, name, instructions::Opts { check, force, adopt }, cli.db.clone(), format)
         }
         Command::Hook { event } => run_hook(&db_path, event.as_deref()),
+        Command::CommitCheck { install, repo } => commit_check::CommitCheck::main(repo, install),
         Command::ReloadServers { dry_run } => reload::run(dry_run),
     }
 }
