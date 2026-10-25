@@ -419,9 +419,13 @@ not reported.
 
 Error-level findings (`dbg!`) are fine while debugging but not in finished
 work: `closeout_session(build_pass)` refuses while one the note reported is
-still in its file, and a repository with the pre-commit hook
-(`./.cortex/cortex.sh -- commit-check --install`, run inside it) refuses a
-commit that adds one.
+still in its file, and the pre-commit hook refuses a commit that adds one.
+
+cortex sets up each git repository it works in by itself (when it starts
+serving a folder, and on the first edit in a repository): the hook goes in
+`.git/hooks` and cortex's own files are listed in `.git/info/exclude`, so
+nothing of cortex's is ever committed. `./.cortex/cortex.sh -- repo-setup
+--all <dir>` does every repository below a folder at once.
 <!-- cortex_suite:end -->
 
 ## Editing safety

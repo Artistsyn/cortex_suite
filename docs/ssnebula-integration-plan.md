@@ -161,4 +161,12 @@ and check (a) no legacy finding is ever reported, (b) a planted `get_x()` /
   cortex_suite and ssnebula. Seen live: closeout refused with a `dbg!` and
   passed once it was removed; a staged `dbg!` commit was refused, a clean one
   passed. 410 cortex tests pass.
+- **Repo setup 2026-10-25.** `RepoSetup` puts the pre-commit hook in the hooks
+  folder and cortex's files (`.cortex/`, `.agent-memory/`, `.graphify-output/`,
+  `.claude/settings.local.json`, the two generated rules files,
+  `SSN_report.txt`) in `.git/info/exclude`, never `.gitignore`, so nothing of
+  cortex's is committed. Runs on serve (with the rules files) and after any edit
+  in a repository that is not set up yet; `cortex repo-setup --all DIR` for a
+  folder. A repository's own pre-commit hook is kept and the line to add is
+  printed. All 27 repositories under FlowMake set up 2026-10-25.
 - Next: step 5 (findings log, scoreboard metric, recurring-lint proposals).

@@ -38,6 +38,7 @@ mod skills;
 mod sources;
 mod verify;
 mod commit_check;
+mod repo_setup;
 mod edit_lint;
 mod ssnebula;
 mod style_rules;
@@ -445,6 +446,17 @@ enum Command {
         /// List what would be stopped and stop nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Set up the git repository holding a folder for cortex, keeping it out of
+    /// the repository: the pre-commit hook, and cortex's files listed in
+    /// .git/info/exclude. Runs by itself when cortex serves a folder and after
+    /// an edit in a repository that is not set up yet.
+    RepoSetup {
+        /// Every repository at or below the folder.
+        #[arg(long)]
+        all: bool,
+        /// The folder (default: current dir).
+        dir: Option<PathBuf>,
     },
     /// Refuse a commit whose added Rust lines break an error-level ssnebula
     /// rule (the git pre-commit hook runs this); `--install` writes that hook.
@@ -1067,6 +1079,7 @@ fn main() -> Result<()> {
         }
         Command::Hook { event } => run_hook(&db_path, event.as_deref()),
         Command::CommitCheck { install, repo } => commit_check::CommitCheck::main(repo, install),
+        Command::RepoSetup { all, dir } => repo_setup::RepoSetup::main(dir, all),
         Command::ReloadServers { dry_run } => reload::run(dry_run),
     }
 }
@@ -3263,6 +3276,7 @@ fn run_serve(args: ServeArgs, db_path: &Path) -> Result<()> {
     // Automatic, install-once setup of the lossless compaction hook for Claude
     // Code projects (no-op for Copilot/other hosts and after the first install).
     auto_install_hook_on_serve(&args.repo);
+    repo_setup::RepoSetup::on_serve(&args.repo);
     mcp::serve(store, units, &args.name, args.repo, prefs_summary)
 }
 

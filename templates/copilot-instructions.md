@@ -228,8 +228,10 @@ generates that file from ssnebula's lints, so a change goes to `ssnebula.toml`
 or ssnebula, never to the file. After an edit to a Rust file, a `[ssnebula]`
 note lists the rules the lines just written break; fix them before moving on.
 Error-level findings (`dbg!`) are fine while debugging, but closeout refuses
-`build_pass` while one the note reported remains, and a repository with the
-pre-commit hook (`cortex commit-check --install`) refuses a commit adding one.
+`build_pass` while one the note reported remains, and the pre-commit hook
+refuses a commit adding one. cortex sets up each repository it works in by
+itself, keeping its hook and files out of git (`.git/hooks`,
+`.git/info/exclude`); `cortex repo-setup --all <dir>` does a whole folder.
 <!-- cortex_suite:end -->
 
 ## Style

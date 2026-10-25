@@ -54,9 +54,10 @@ impl<'a> EditLint<'a> {
         (file.extension()? == "rs").then_some(Self { root, file })
     }
 
-    /// The hook's whole job: check the edit, record that the check ran and any error it found,
-    /// and word what it found.
+    /// The hook's whole job: set up the file's repository if it is new to cortex, check the edit,
+    /// record that the check ran and any error it found, and word what it found.
     pub fn after_edit(store: &Store, session_id: &str, root: &'a Path, file_path: &str, added: &str) -> Option<String> {
+        crate::repo_setup::RepoSetup::after_edit(&root.join(file_path));
         let lint = Self::new(root, file_path)?;
         let findings = lint.check(added)?;
         let _ = crate::corrections::beat_named(store, Self::HEARTBEAT, !findings.is_empty());

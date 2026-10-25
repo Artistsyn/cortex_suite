@@ -23,8 +23,6 @@ struct Verdict {
 }
 
 impl CommitCheck {
-    const MARK: &'static str = "# installed by `cortex commit-check --install`";
-
     /// The repository holding `dir` (the current directory when `None`).
     pub fn new(dir: Option<PathBuf>) -> Result<Self> {
         let dir = dir.unwrap_or_else(|| PathBuf::from("."));
@@ -32,13 +30,13 @@ impl CommitCheck {
         Ok(Self { repo: PathBuf::from(top.trim()) })
     }
 
-    /// The `cortex commit-check` command: exits 1 when the commit must not go ahead.
+    /// The `cortex commit-check` command: exits 1 when the commit must not go ahead. `install`
+    /// sets the repository up instead (`cortex repo-setup`).
     pub fn main(dir: Option<PathBuf>, install: bool) -> Result<()> {
-        let check = Self::new(dir)?;
         if install {
-            println!("{}", check.install()?);
-            return Ok(());
+            return crate::repo_setup::RepoSetup::main(dir, false);
         }
+        let check = Self::new(dir)?;
         let verdict = check.verdict()?;
         eprint!("{}", verdict.report());
         if !verdict.errors.is_empty() {
@@ -87,43 +85,6 @@ impl CommitCheck {
         let file = self.repo.join(rel);
         let args = ["check".as_ref(), file.as_os_str(), "--stdin".as_ref(), "--lines".as_ref(), spec.as_ref()];
         EditLint::run_check(&self.repo, &args, Some(&staged))
-    }
-
-    /// Writes the pre-commit hook, unless another one is already there.
-    fn install(&self) -> Result<String> {
-        let hooks = PathBuf::from(self.git(&["rev-parse", "--git-path", "hooks"])?.trim());
-        let path = if hooks.is_absolute() { hooks } else { self.repo.join(hooks) }.join("pre-commit");
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let cortex = std::env::current_exe().context("finding the cortex binary")?;
-        if !existing.is_empty() && !existing.contains(Self::MARK) {
-            bail!("{} already exists and is not cortex's; add this line to it: \"{}\" commit-check || exit 1", path.display(), cortex.display());
-        }
-        std::fs::create_dir_all(path.parent().unwrap_or(&self.repo))?;
-        std::fs::write(&path, Self::script(&cortex)).with_context(|| format!("writing {}", path.display()))?;
-        Self::make_executable(&path)?;
-        Ok(format!("{}: refuses commits whose added Rust lines break an error-level ssnebula rule", path.display()))
-    }
-
-    #[cfg(unix)]
-    fn make_executable(path: &Path) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?)
-    }
-
-    /// Git for Windows runs hooks through its own sh, which needs no mode bit.
-    #[cfg(not(unix))]
-    fn make_executable(_path: &Path) -> Result<()> {
-        Ok(())
-    }
-
-    fn script(cortex: &Path) -> String {
-        format!(
-            "#!/bin/sh\n{}: refuses a commit whose added Rust lines break an\n\
-             # error-level ssnebula rule. `git commit --no-verify` skips it.\n\
-             CORTEX=\"{}\"\n[ -x \"$CORTEX\" ] || exit 0\nexec \"$CORTEX\" commit-check\n",
-            Self::MARK,
-            cortex.display()
-        )
     }
 
     fn git(&self, args: &[&str]) -> Result<String> {
@@ -181,13 +142,6 @@ mod tests {
         let diff = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -3,0 +4,2 @@ fn x\n+one\n+two\n@@ -10 +12 @@\n-old\n+new\n@@ -20,3 +23,0 @@\n-gone\n\
                     diff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1,2 +0,0 @@\n-x\n-y\n";
         assert_eq!(CommitCheck::added_lines(diff), vec![("src/a.rs".to_string(), vec![(4, 5), (12, 12)])]);
-    }
-
-    #[test]
-    fn the_hook_runs_cortex_only_when_it_is_there() {
-        let script = CommitCheck::script(Path::new("/w/cortex"));
-        assert!(script.starts_with("#!/bin/sh\n# installed by `cortex commit-check --install`"));
-        assert!(script.contains("[ -x \"$CORTEX\" ] || exit 0") && script.ends_with("exec \"$CORTEX\" commit-check\n"));
     }
 
     #[test]
