@@ -212,12 +212,21 @@ commands on both.
 | `skill-status` | drafts awaiting a human |
 | `fired` | which mechanisms have actually run, and which are silently idle |
 | `hooks-init --vscode` | install or upgrade cortex's VS Code hooks (`.github/hooks/cortex.json`); nothing refreshes them on its own |
-| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, write the Rust code rules from ssnebula, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
 | `-- <args>` | pass anything straight through to the binary |
 
 `deploy` exists because Windows blocks deleting a running executable. It renames
 the live binary out of the way, which Windows does permit, so a rebuild never
 requires hunting and killing the server first.
+## Rust code rules
+
+New and rewritten Rust follows `.github/instructions/rust-style.instructions.md`
+in full (VS Code applies it to every `*.rs` file), even beside older code that
+does not; there it wins over matching the surrounding style. Code you are not
+otherwise changing is not refactored to fit it. `cortex instructions`
+generates that file from ssnebula's lints, so a change goes to `ssnebula.toml`
+or ssnebula, never to the file. After an edit to a Rust file, a `[ssnebula]`
+note lists the rules the lines just written break; fix them before moving on.
 <!-- cortex_suite:end -->
 
 ## Style

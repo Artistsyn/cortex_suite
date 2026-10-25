@@ -50,7 +50,7 @@ pub fn dispatch(
         // Lossless output compaction: post-processes output the agent already
         // obtained through the normal (permissioned) Bash path. No execution.
         "compact_output"          => tool_compact_output(args, store, session_id, repo_root),
-        "edit_guard"              => tool_edit_guard(args, store, session_id),
+        "edit_guard"              => tool_edit_guard(args, store, session_id, repo_root),
         "note_challenge"          => tool_note_challenge(args, store, session_id, repo_root),
         "index_sources"           => tool_index_sources(args, repo_root),
         "capture_markers"         => tool_capture_markers(args, store, repo_root),
@@ -88,7 +88,7 @@ pub(crate) fn run_hook_tool(
 ) -> Result<String, String> {
     match tool {
         "compact_output" => tool_compact_output(args, store, session_id, repo_root),
-        "edit_guard" => tool_edit_guard(args, store, session_id),
+        "edit_guard" => tool_edit_guard(args, store, session_id, repo_root),
         "note_challenge" => tool_note_challenge(args, store, session_id, repo_root),
         "capture_markers" => tool_capture_markers(args, store, repo_root),
         "restore_after_compact" => tool_restore_after_compact(args, store, repo_root),
@@ -792,7 +792,7 @@ const EDIT_GUARD_MIN_SCORE: usize = 3;
 /// So: at most one trap per edit, never the same trap twice in a session, at
 /// most four in total, and a match threshold higher than ordinary retrieval
 /// uses. Silence is the expected outcome and returns an empty string.
-fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
+fn tool_edit_guard(args: &Value, store: &Store, session_id: &str, repo_root: &Path) -> Result<String, String> {
     let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
     let mut texts: Vec<String> = Vec::new();
     if let Some(t) = dependency_revisits(store, session_id, file_path, edit_added(args)) {
@@ -801,6 +801,9 @@ fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<Stri
     if let Some(hit) = edit_guard_match(args, store, session_id, &[])? {
         edit_guard_record(store, session_id, hit.id, &hit.file, hit.text.len());
         texts.push(hit.text);
+    }
+    if let Some(t) = crate::edit_lint::EditLint::after_edit(store, repo_root, file_path, edit_added(args)) {
+        texts.push(t);
     }
     if texts.is_empty() {
         return Ok(String::new());
@@ -4594,6 +4597,7 @@ mod delta_mode_tests {
             &serde_json::json!({ "file_path": "a.rs", "added": "let x = 1;" }),
             &store,
             "test_guard_small",
+            Path::new("/nonexistent"),
         )
         .unwrap();
         assert!(out.is_empty(), "a one-liner has no context to judge: {out}");
@@ -4607,6 +4611,7 @@ mod delta_mode_tests {
             &serde_json::json!({ "file_path": "a.txt", "added": prose }),
             &store,
             "test_guard_nomatch",
+            Path::new("/nonexistent"),
         )
         .unwrap();
         assert!(out.is_empty(), "unrelated text must be silent: {out}");
@@ -4622,8 +4627,8 @@ mod delta_mode_tests {
             .repeat(3);
         let args = serde_json::json!({ "file_path": "input.js", "added": added });
 
-        let first = tool_edit_guard(&args, &store, &session).unwrap();
-        let second = tool_edit_guard(&args, &store, &session).unwrap();
+        let first = tool_edit_guard(&args, &store, &session, Path::new("/nonexistent")).unwrap();
+        let second = tool_edit_guard(&args, &store, &session, Path::new("/nonexistent")).unwrap();
         // This runs against the LIVE store: clean up before asserting, so a
         // failure does not leave a fire and a "delivered" push behind to be
         // counted on the scoreboard as real.
@@ -4679,6 +4684,7 @@ mod delta_mode_tests {
                 &serde_json::json!({ "file_path": e["file_path"], "added": added, "format": "text" }),
                 &store,
                 &format!("replay_{i}_{}", std::process::id()),
+                Path::new("/nonexistent"),
             ).unwrap();
             let new_id = out.split("recorded trap #").nth(1)
                 .and_then(|s| s.split_whitespace().next())
@@ -4713,6 +4719,7 @@ mod delta_mode_tests {
             &serde_json::json!({ "file_path": "menu.rs", "added": added, "format": "text" }),
             &store,
             "s_text",
+            Path::new("/nonexistent"),
         )
         .unwrap();
         assert!(text.starts_with("[cortex] menu.rs touches a recorded trap"), "{text}");
@@ -4906,15 +4913,15 @@ mod walls_tool_tests {
         let s = store("walls_dep_edit");
         let id = version_bound_wall(&s);
         let args = json!({"file_path": "vr_workspace/space_soup/Cargo.toml", "added": "wgpu = \"31.0.0\""});
-        let out = tool_edit_guard(&args, &s, "sess").unwrap();
+        let out = tool_edit_guard(&args, &s, "sess", Path::new("/nonexistent")).unwrap();
         let v: Value = serde_json::from_str(&out).expect("hook JSON");
         let ctx = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
         assert!(ctx.contains("This edit to Cargo.toml changes `wgpu`"), "{ctx}");
         assert!(ctx.contains(&format!("wall #{id} is bound to it")), "{ctx}");
-        assert_eq!(tool_edit_guard(&args, &s, "sess").unwrap(), "", "once per wall per session");
-        assert_ne!(tool_edit_guard(&args, &s, "other").unwrap(), "", "a new session hears it again");
+        assert_eq!(tool_edit_guard(&args, &s, "sess", Path::new("/nonexistent")).unwrap(), "", "once per wall per session");
+        assert_ne!(tool_edit_guard(&args, &s, "other", Path::new("/nonexistent")).unwrap(), "", "a new session hears it again");
         let src = json!({"file_path": "src/lib.rs", "added": "let wgpu = 31;"});
-        assert_eq!(tool_edit_guard(&src, &s, "third").unwrap(), "", "only manifests count");
+        assert_eq!(tool_edit_guard(&src, &s, "third", Path::new("/nonexistent")).unwrap(), "", "only manifests count");
     }
 
     #[test]
@@ -5018,6 +5025,7 @@ mod loop_tool_tests {
                     }),
                     s,
                     session,
+                    Path::new("/nonexistent"),
                 )
                 .unwrap_or_default(),
             ),

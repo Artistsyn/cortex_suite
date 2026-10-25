@@ -369,7 +369,7 @@ commands on both.
 | `fired` | which mechanisms have actually run, and which are silently idle |
 | `scoreboard` | observed outcomes, repeat failures, what reached agents, and the token bill actually paid |
 | `hooks-init` | install or upgrade the Claude Code hooks (edit guard, build/test observer, challenge note); `--vscode` installs the same for VS Code Copilot |
-| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
+| `instructions` | add or update the cortex_suite section of CLAUDE.md and `.github/copilot-instructions.md`, write the Rust code rules from ssnebula, leaving the rest of each file alone, and list older cortex guidance still kept elsewhere |
 | `-- <args>` | pass anything straight through to the binary |
 
 `fired` answers the one question nothing else asks: *has this ever actually
@@ -399,11 +399,29 @@ reconnects only remote servers, and the typed `/mcp reconnect` is refused in
 app-hosted sessions, so there it takes restarting the app. `reload-servers`
 moves every idle older server onto the current binary in one step. On Windows,
 reconnect from the host.
+
+## Rust code rules
+
+New and rewritten Rust follows the generated Rust code rules in full, even
+beside older code that does not; there they win over matching the surrounding
+style. Code you are not otherwise changing is not refactored to fit them.
+
+The rules load by themselves whenever a Rust file is in play:
+`.claude/rules/rust-style.md` in Claude Code,
+`.github/instructions/rust-style.instructions.md` in VS Code Copilot. If they
+are not in your context, read `.claude/rules/rust-style.md` before writing
+Rust. `cortex instructions` generates both from ssnebula's lints, so a change
+goes to `ssnebula.toml` or ssnebula, never to those files.
+
+After an edit to a Rust file, a `[ssnebula]` note lists the rules the lines
+just written break; fix them before moving on. Older code in the same file is
+not reported.
 <!-- cortex_suite:end -->
 
 ## Editing safety
 
-- Smallest safe patch; match surrounding style.
+- Smallest safe patch; match surrounding style (in Rust, the Rust code rules
+  come first).
 - No unrelated refactors, no scope expansion.
 - Never `git add` / `commit` / `push` unless explicitly asked in this
   conversation.

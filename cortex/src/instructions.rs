@@ -141,7 +141,7 @@ fn canonical(body: &str) -> String {
     lines.join("\n").trim_matches('\n').to_string()
 }
 
-fn stamp_of(body: &str) -> String {
+pub(crate) fn stamp_of(body: &str) -> String {
     Sha256::digest(canonical(body).as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
@@ -453,7 +453,7 @@ fn sync_one(root: &Path, doc: &Doc, project: &str, opts: &Opts) -> Result<Outcom
 
 /// The previous version, under `.cortex/backups/` with a microsecond stamp so
 /// two runs in one second cannot overwrite each other's copy.
-fn backup(root: &Path, path: &Path, raw: &str) -> Result<PathBuf> {
+pub(crate) fn backup(root: &Path, path: &Path, raw: &str) -> Result<PathBuf> {
     let dir = root.join(".cortex").join("backups");
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

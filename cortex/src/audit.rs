@@ -210,6 +210,17 @@ pub const MECHANISMS: &[Mechanism] = &[
         filter: "hook = 'cli_hook'",
         optional: true,
     },
+    // The edit lint runs only on Rust edits in a workspace with ssnebula, so it can be idle for a
+    // reason; a beat says it ran, matched or not.
+    Mechanism {
+        label: "edit lint (ssnebula findings in the lines an edit wrote)",
+        table: "hook_heartbeat",
+        ts_col: "last_fired",
+        expect_days: 14.0,
+        when_idle: "no Rust edits, no ssnebula with a `check` command, or the edit hook is not reaching cortex",
+        filter: "hook = 'edit_lint'",
+        optional: true,
+    },
 ];
 
 #[derive(Debug, PartialEq)]

@@ -37,6 +37,9 @@ mod session_store;
 mod skills;
 mod sources;
 mod verify;
+mod edit_lint;
+mod ssnebula;
+mod style_rules;
 mod walls;
 mod loop_ledger;
 mod capture;
@@ -1074,7 +1077,8 @@ fn run_instructions(
             .unwrap_or_else(|| "this project".to_string())
     });
     let check = opts.check;
-    let outcomes = instructions::sync(&root, &project, &opts)?;
+    let mut outcomes = instructions::sync(&root, &project, &opts)?;
+    outcomes.extend(style_rules::StyleRules::load(&root).sync(&opts)?);
     // An older rule survives wherever a person kept it, and the section cannot
     // reach it, so it is named here for whoever runs the update to fix.
     let user_claude = dirs::home_dir().map(|h| h.join(".claude").join("CLAUDE.md"));

@@ -301,7 +301,7 @@ fn run_at(event_arg: Option<&str>, stdin: &str, db_path: &Path, now: f64) -> Str
                     for (id, file, chars) in offers {
                         crate::mcp::tools::edit_guard_record(&store, &session, id, &file, chars);
                     }
-                    Vec::new()
+                    crate::edit_lint::EditLint::after_edits(&store, repo_root, edits)
                 }
                 // No PreToolUse hook saw it (Claude Code, or a hook file from
                 // before PreToolUse was installed): judge it here.
