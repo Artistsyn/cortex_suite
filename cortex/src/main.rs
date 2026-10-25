@@ -1102,14 +1102,15 @@ fn run_instructions(
             .unwrap_or_else(|| "this project".to_string())
     });
     let check = opts.check;
+    // The store of the workspace being updated, not of wherever this runs.
+    let db = db.unwrap_or_else(|| root.join(".cortex").join("memory.db"));
     let mut outcomes = instructions::sync(&root, &project, &opts)?;
-    outcomes.extend(style_rules::StyleRules::load(&root).sync(&opts)?);
+    let recent = style_rules::StyleRules::recent_from(&db);
+    outcomes.extend(style_rules::StyleRules::load(&root).emphasise(&recent).sync(&opts)?);
     // An older rule survives wherever a person kept it, and the section cannot
     // reach it, so it is named here for whoever runs the update to fix.
     let user_claude = dirs::home_dir().map(|h| h.join(".claude").join("CLAUDE.md"));
     let mut stale = instructions::stale_guidance(&root, user_claude.as_deref());
-    // The store of the workspace being updated, not of wherever this runs.
-    let db = db.unwrap_or_else(|| root.join(".cortex").join("memory.db"));
     let (tidy, store_error) = match instructions::tidy_store(&root, &db, check) {
         Ok((tidy, notes)) => {
             stale.extend(notes);

@@ -50,7 +50,8 @@ impl RepoSetup {
         if std::env::var_os("CORTEX_NO_AUTO_HOOKS").is_some() {
             return;
         }
-        let rules = crate::style_rules::StyleRules::load(root).sync(&crate::instructions::Opts { check: false, force: false, adopt: false });
+        let recent = crate::style_rules::StyleRules::recent_from(&root.join(".cortex/memory.db"));
+        let rules = crate::style_rules::StyleRules::load(root).emphasise(&recent).sync(&crate::instructions::Opts { check: false, force: false, adopt: false });
         let written = rules.iter().flatten().filter(|o| o.changed).map(|o| format!("{}: {}", o.file, o.action));
         for line in Self::after_edit(root).into_iter().chain(written) {
             eprintln!("  setup: {line}");

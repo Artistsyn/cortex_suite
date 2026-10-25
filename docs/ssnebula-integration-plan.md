@@ -178,5 +178,8 @@ and check (a) no legacy finding is ever reported, (b) a planted `get_x()` /
   sessions reaches closeout's review queue with the usual `anti-pattern add
   --resolves` / `recurring-dismiss` choice. Seen live, then the probe rows
   were deleted. 415 cortex tests pass; findings unchanged at 1,432.
-- Possible next: put the most-broken rules at the top of the generated rules
-  file, so a new session reads the ones agents get wrong first.
+- **Most-broken first, 2026-10-25.** The generated rules file opens with
+  "Broken most often in the last 14 days": the five rules the edit check found
+  broken most (from `edit_lint_findings`), each as its own rule line with a
+  count, before the full list. Regenerated when cortex starts serving a folder
+  and by `cortex instructions`; absent while nothing is logged.

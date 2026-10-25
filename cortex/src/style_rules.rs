@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::instructions::{self, Opts, Outcome};
+use crate::memory::Store;
+use crate::scoreboard::LintWindow;
 use crate::ssnebula::Ssnebula;
 
 /// One host's copy: where it goes and the frontmatter that scopes it to Rust files.
@@ -36,12 +38,55 @@ impl StyleRules {
     const POLICY: &'static str = "Every line of Rust you write or rewrite in this workspace follows \
         these rules, even beside older code that does not: here the rules win over matching the \
         surrounding style. Do not refactor code you are not otherwise changing just to satisfy them.";
+    /// How far back "broken most often" looks.
+    const RECENT_DAYS: i64 = 14;
 
     /// The rules under the workspace's `ssnebula.toml`, or ssnebula's defaults without one.
     pub fn load(root: &Path) -> Self {
         let args = [root.as_os_str(), "rules".as_ref()];
         let guide = Ssnebula::output(root, &args, |text| text.starts_with("# Rust code rules"));
         Self { root: root.to_path_buf(), body: guide.map(|text| Self::policy_under_title(&text)) }
+    }
+
+    /// The rules the edit check found broken most in the last `RECENT_DAYS`, most first, from
+    /// the store at `db`; none when there is no store yet.
+    pub fn recent_from(db: &Path) -> Vec<(String, i64)> {
+        if !db.is_file() {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now().timestamp();
+        let since = now - Self::RECENT_DAYS * 86_400;
+        Store::open(db).map(|store| LintWindow::measure(&store, since, now + 1).top).unwrap_or_default()
+    }
+
+    /// Puts the rules broken most lately ahead of the full list, each as its own rule line with
+    /// how often, so a session reads them before the rest.
+    pub fn emphasise(mut self, recent: &[(String, i64)]) -> Self {
+        let section = self.body.as_deref().and_then(|body| Self::most_broken(body, recent));
+        if let (Some(body), Some(section)) = (self.body.as_mut(), section) {
+            let at = body.find("\n## ").unwrap_or(body.len());
+            body.insert_str(at, &format!("\n{section}\n"));
+        }
+        self
+    }
+
+    fn most_broken(body: &str, recent: &[(String, i64)]) -> Option<String> {
+        let rules: Vec<String> = recent
+            .iter()
+            .filter_map(|(lint, times)| {
+                let rule = body.lines().find(|line| line.starts_with(&format!("**`{lint}`**")))?;
+                Some(format!("- {rule} Broken {times} time{} lately.", if *times == 1 { "" } else { "s" }))
+            })
+            .collect();
+        (!rules.is_empty()).then(|| {
+            format!(
+                "## Broken most often in the last {} days\n\nThe edit check found these rules broken most in this \
+                 workspace lately, so they come first. Each is also in its place below, with its limits and \
+                 word lists.\n\n{}",
+                Self::RECENT_DAYS,
+                rules.join("\n")
+            )
+        })
     }
 
     /// ssnebula's guide with this workspace's rule on older code under its title.
@@ -211,5 +256,24 @@ mod tests {
         let o = rules(d.path(), None, &plain());
         assert!(o.iter().all(|o| o.state == "unavailable" && !o.changed && !o.attention), "{o:?}");
         assert_eq!(read(d.path(), ".claude/rules/rust-style.md"), before);
+    }
+
+    #[test]
+    fn the_rules_broken_most_lately_come_before_the_full_list() {
+        let guide = "# Rust code rules (SSNebula)\n\nSSNebula 0.1.0 checks these rules.\n\n## Structure\n\n**`long_function`** (warning). Keep it short.\n- Limit: 60 lines\n\n**`vague_name`** (warning). Name it well.\n";
+        let rules = StyleRules { root: PathBuf::from("/w"), body: Some(StyleRules::policy_under_title(guide)) };
+        let recent = [("vague_name".to_string(), 7), ("gone_lint".to_string(), 3), ("long_function".to_string(), 1)];
+        let body = rules.emphasise(&recent).body.unwrap();
+        let first = body.find("## Broken most often in the last 14 days").unwrap();
+        assert!(body.find("SSNebula 0.1.0 checks").unwrap() < first && first < body.find("## Structure").unwrap(), "{body}");
+        assert!(body.contains("- **`vague_name`** (warning). Name it well. Broken 7 times lately.\n- **`long_function`** (warning). Keep it short. Broken 1 time lately."), "{body}");
+        assert!(!body.contains("gone_lint"), "a rule no longer in the guide is left out");
+        let plain = StyleRules { root: PathBuf::from("/w"), body: Some(StyleRules::policy_under_title(guide)) };
+        assert_eq!(plain.emphasise(&[]).body.unwrap(), StyleRules::policy_under_title(guide));
+    }
+
+    #[test]
+    fn without_a_store_nothing_is_emphasised() {
+        assert!(StyleRules::recent_from(Path::new("/nonexistent/memory.db")).is_empty());
     }
 }
