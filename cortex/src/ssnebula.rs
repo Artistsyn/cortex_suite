@@ -12,7 +12,7 @@ impl Ssnebula {
     /// Where ssnebula may be, most specific first: `CORTEX_SSNEBULA`, a checkout beside the
     /// projects of `root` or of any folder above it (so a repository inside the workspace finds
     /// the workspace's copy), then `PATH`.
-    fn candidates(root: &Path) -> Vec<PathBuf> {
+    pub fn candidates(root: &Path) -> Vec<PathBuf> {
         let mut found: Vec<PathBuf> = std::env::var_os("CORTEX_SSNEBULA").map(PathBuf::from).into_iter().collect();
         let builds = root.ancestors().flat_map(|dir| ["release", "debug"].map(|profile| dir.join("ssnebula/target").join(profile).join("ssnebula")));
         found.extend(builds.filter(|binary| binary.is_file()));

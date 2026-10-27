@@ -17,7 +17,6 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::memory::Store;
-use crate::verify;
 
 // ── Meta report ───────────────────────────────────────────────────────────────
 
@@ -500,7 +499,6 @@ pub fn apply_meta_proposal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::Store;
 
     /// A store of its own, removed when the test ends -- see test_support.
     fn test_store(name: &str) -> crate::test_support::TempStore {

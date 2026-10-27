@@ -5,7 +5,6 @@
 /// it becomes a skill candidate in the skill_candidates table.
 ///
 /// Also handles skill draft generation and health metrics.
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -752,8 +751,6 @@ mod tests {
     }
 
     // ── Gap proposal detection ───────────────────────────────────────────────
-
-    use crate::memory::Store;
 
     /// A throwaway store on disk, NOT the live one.
     ///

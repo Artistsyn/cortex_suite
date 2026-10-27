@@ -1,6 +1,6 @@
 //! The commit-time half of the gate on unfinished work: a commit whose added Rust lines break an
 //! error-level ssnebula rule is refused, the rule closeout holds an agent to. It reads the staged
-//! text, not the working copy, and only the lines the commit adds. Warnings are counted, never
+//! text, not the working copy, and only the lines the commit adds. Warnings are listed, never
 //! refused; `git commit --no-verify` skips the check.
 
 use std::path::{Path, PathBuf};
@@ -14,12 +14,14 @@ pub struct CommitCheck {
     repo: PathBuf,
 }
 
-/// What the staged Rust files hold, as the check saw it.
+/// What the staged Rust files hold, as the check saw it. `tried` names the ssnebula builds asked,
+/// for the report when none could check a file.
 #[derive(Default)]
 struct Verdict {
     errors: Vec<String>,
-    warnings: usize,
+    warnings: Vec<String>,
     unchecked: Vec<String>,
+    tried: Vec<PathBuf>,
 }
 
 impl CommitCheck {
@@ -53,6 +55,9 @@ impl CommitCheck {
                 Some(found) => verdict.add(&rel, &found),
                 None => verdict.unchecked.push(rel),
             }
+        }
+        if !verdict.unchecked.is_empty() {
+            verdict.tried = crate::ssnebula::Ssnebula::candidates(&self.repo);
         }
         Ok(verdict)
     }
@@ -101,12 +106,15 @@ impl CommitCheck {
 }
 
 impl Verdict {
+    /// Warnings listed in the report before the rest are only counted.
+    const WARNINGS_LISTED: usize = 20;
+
     fn add(&mut self, rel: &str, found: &[Finding]) {
         for finding in found {
             if finding.is_error() {
                 self.errors.push(finding.located(rel));
             } else {
-                self.warnings += 1;
+                self.warnings.push(finding.located(rel));
             }
         }
     }
@@ -119,11 +127,17 @@ impl Verdict {
             lines.extend(self.errors.iter().map(|e| format!("  {e}")));
             lines.push("fix them and stage the fix; `git commit --no-verify` skips this check".to_owned());
         }
-        if self.warnings > 0 {
-            lines.push(format!("ssnebula: {} warning(s) in the lines being committed; `ssnebula check FILE --lines ...` lists them", self.warnings));
+        if !self.warnings.is_empty() {
+            lines.push(format!("ssnebula: {} warning(s) in the lines being committed (warnings never refuse a commit):", self.warnings.len()));
+            lines.extend(self.warnings.iter().take(Self::WARNINGS_LISTED).map(|w| format!("  {w}")));
+            if self.warnings.len() > Self::WARNINGS_LISTED {
+                lines.push(format!("  and {} more", self.warnings.len() - Self::WARNINGS_LISTED));
+            }
         }
         if !self.unchecked.is_empty() {
-            lines.push(format!("ssnebula could not check {} (not found, or too old for `check --stdin`)", self.unchecked.join(", ")));
+            let tried = self.tried.iter().map(|b| b.display().to_string()).collect::<Vec<_>>().join(", ");
+            lines.push(format!("ssnebula could not check {}: no build tried ran `check --stdin` ({tried})", self.unchecked.join(", ")));
+            lines.push("build an ssnebula checkout that has it (`cargo build --release` in an `ssnebula/` folder above this repository), or set CORTEX_SSNEBULA to such a build".to_owned());
         }
         let mut text = lines.join("\n");
         if !text.is_empty() {
@@ -147,7 +161,24 @@ mod tests {
     #[test]
     fn a_clean_commit_says_nothing() {
         assert_eq!(Verdict::default().report(), "");
-        let refused = Verdict { errors: vec!["src/a.rs:3 `dbg_macro`: x".into()], warnings: 2, unchecked: vec![] }.report();
+        let warned = vec!["src/a.rs:4 `vague_name`: binding `d` is a single letter".into(); 2];
+        let refused = Verdict { errors: vec!["src/a.rs:3 `dbg_macro`: x".into()], warnings: warned, ..Verdict::default() }.report();
         assert!(refused.starts_with("commit refused") && refused.contains("2 warning(s)"), "{refused}");
+    }
+
+    #[test]
+    fn warnings_are_listed_where_they_are_and_the_long_tail_counted() {
+        let warnings = (1..=25).map(|n| format!("src/a.rs:{n} `vague_name`: binding `d` is a single letter")).collect();
+        let report = Verdict { warnings, ..Verdict::default() }.report();
+        assert!(report.contains("  src/a.rs:20 `vague_name`") && !report.contains("src/a.rs:21 "), "{report}");
+        assert!(report.contains("and 5 more") && !report.contains("ssnebula check FILE"), "{report}");
+    }
+
+    #[test]
+    fn an_unchecked_file_names_the_builds_tried() {
+        let tried = vec![PathBuf::from("/w/ssnebula/target/release/ssnebula"), PathBuf::from("ssnebula")];
+        let report = Verdict { unchecked: vec!["src/a.rs".into()], tried, ..Verdict::default() }.report();
+        assert!(report.contains("could not check src/a.rs") && report.contains("/w/ssnebula/target/release/ssnebula, ssnebula"), "{report}");
+        assert!(report.contains("CORTEX_SSNEBULA"), "{report}");
     }
 }
