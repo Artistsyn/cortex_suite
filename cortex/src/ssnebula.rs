@@ -1,5 +1,6 @@
-//! The ssnebula command, found and run. It is run rather than linked because its repository is
-//! private, and a dependency on it would stop cortex building for anyone without access.
+//! The Ephemeris command (ssnebula before its rename, 2026-11-02), found and run. It is run
+//! rather than linked because its repository is private, and a dependency on it would stop
+//! cortex building for anyone without access.
 
 use std::ffi::OsStr;
 use std::io::Write;
@@ -9,14 +10,23 @@ use std::process::{Command, Stdio};
 pub struct Ssnebula;
 
 impl Ssnebula {
-    /// Where ssnebula may be, most specific first: `CORTEX_SSNEBULA`, a checkout beside the
-    /// projects of `root` or of any folder above it (so a repository inside the workspace finds
-    /// the workspace's copy), then `PATH`.
+    /// The checkout folders and binary names it goes by, newest first: a checkout made before
+    /// the rename keeps its folder, and an old build its name.
+    const FOLDERS: [&'static str; 2] = ["ephemeris", "ssnebula"];
+    const BINARIES: [&'static str; 2] = ["ephemeris", "ssnebula"];
+
+    /// Where it may be, most specific first: `CORTEX_EPHEMERIS` (or `CORTEX_SSNEBULA`), a
+    /// checkout beside the projects of `root` or of any folder above it (so a repository inside
+    /// the workspace finds the workspace's copy), then `PATH`.
     pub fn candidates(root: &Path) -> Vec<PathBuf> {
-        let mut found: Vec<PathBuf> = std::env::var_os("CORTEX_SSNEBULA").map(PathBuf::from).into_iter().collect();
-        let builds = root.ancestors().flat_map(|dir| ["release", "debug"].map(|profile| dir.join("ssnebula/target").join(profile).join("ssnebula")));
+        let mut found: Vec<PathBuf> = ["CORTEX_EPHEMERIS", "CORTEX_SSNEBULA"].into_iter().filter_map(std::env::var_os).map(PathBuf::from).collect();
+        let builds = root.ancestors().flat_map(|dir| {
+            Self::FOLDERS.into_iter().flat_map(move |folder| {
+                ["release", "debug"].into_iter().flat_map(move |profile| Self::BINARIES.map(|name| dir.join(folder).join("target").join(profile).join(name)))
+            })
+        });
         found.extend(builds.filter(|binary| binary.is_file()));
-        found.push(PathBuf::from("ssnebula"));
+        found.extend(Self::BINARIES.map(PathBuf::from));
         found
     }
 
@@ -67,5 +77,18 @@ mod tests {
         std::fs::write(&binary, "").unwrap();
         let repo = d.join("some_repo/crate");
         assert!(Ssnebula::candidates(&repo).contains(&binary));
+    }
+
+    #[test]
+    fn the_renamed_build_comes_before_the_old_one() {
+        let d = crate::test_support::TempDir::new("ephemeris_above").unwrap();
+        let (renamed, old) = (d.join("ssnebula/target/release/ephemeris"), d.join("ssnebula/target/release/ssnebula"));
+        std::fs::create_dir_all(renamed.parent().unwrap()).unwrap();
+        std::fs::write(&renamed, "").unwrap();
+        std::fs::write(&old, "").unwrap();
+        let found = Ssnebula::candidates(&d.join("repo"));
+        let at = |path: &Path| found.iter().position(|p| p == path);
+        assert!(at(&renamed) < at(&old) && at(&old).is_some(), "{found:?}");
+        assert!(found.ends_with(&[PathBuf::from("ephemeris"), PathBuf::from("ssnebula")]));
     }
 }

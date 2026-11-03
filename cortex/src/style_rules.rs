@@ -33,15 +33,15 @@ impl StyleRules {
         Target { rel: ".github/instructions/rust-style.instructions.md", front: "---\napplyTo: \"**/*.rs\"\n---" },
     ];
     const MARKER: &'static str = "<!-- cortex_suite:generated stamp=";
-    const NOTE: &'static str = "written by `cortex instructions` from SSNebula's lints; \
-        change ssnebula.toml or SSNebula, not this file, which an update rewrites -->";
+    const NOTE: &'static str = "written by `cortex instructions` from Ephemeris's lints; \
+        change ephemeris.toml (or ssnebula.toml) or Ephemeris, not this file, which an update rewrites -->";
     const POLICY: &'static str = "Every line of Rust you write or rewrite in this workspace follows \
         these rules, even beside older code that does not: here the rules win over matching the \
         surrounding style. Do not refactor code you are not otherwise changing just to satisfy them.";
     /// How far back "broken most often" looks.
     const RECENT_DAYS: i64 = 14;
 
-    /// The rules under the workspace's `ssnebula.toml`, or ssnebula's defaults without one.
+    /// The rules under the workspace's `ephemeris.toml` (or `ssnebula.toml`), or the defaults.
     pub fn load(root: &Path) -> Self {
         let args = [root.as_os_str(), "rules".as_ref()];
         let guide = Ssnebula::output(root, &args, |text| text.starts_with("# Rust code rules"));
@@ -160,14 +160,14 @@ impl StyleRules {
         Ok(outcome)
     }
 
-    /// Without ssnebula nothing is written and nothing waits on a person: the workspace has no
+    /// Without Ephemeris nothing is written and nothing waits on a person: the workspace has no
     /// generated rules, and any copy already there is left as it is.
     fn unavailable(target: &Target) -> Outcome {
         Outcome {
             file: target.rel,
             state: "unavailable",
-            action: "left as it is: no SSNebula with a `rules` command was found (build ssnebula/ in the \
-                     workspace, put it on PATH, or set CORTEX_SSNEBULA)"
+            action: "left as it is: no Ephemeris with a `rules` command was found (build ephemeris/ or \
+                     ssnebula/ in the workspace, put it on PATH, or set CORTEX_EPHEMERIS)"
                 .into(),
             changed: false,
             attention: false,
