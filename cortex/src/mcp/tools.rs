@@ -2461,36 +2461,24 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
         // newest first left 3.
         let mut rest: Vec<usize> = (0..aps.len()).filter(|i| !taken.contains(i)).collect();
         rest.sort_by(|a, b| aps[*b].added_at.cmp(&aps[*a].added_at).then(b.cmp(a)));
-        let mut overflow: Vec<usize> = Vec::new();
+        let mut unlisted = 0usize;
         if !rest.is_empty() {
             body.push_str("Every other trap, newest first, by what goes wrong:\n");
             for &i in &rest {
                 let line = format!("- {}\n", opening_clause(&aps[i].description, REST_CLAUSE_CHARS).0);
                 if body.len() + line.len() > LISTING_BUDGET {
-                    overflow.push(i);
+                    unlisted += 1;
                 } else {
                     body.push_str(&line);
                 }
             }
         }
-        if !overflow.is_empty() {
-            // Nothing is dropped silently: the tail is named by id under its
-            // first tag, one call from its full text.
-            let mut groups: std::collections::BTreeMap<&str, Vec<i64>> = std::collections::BTreeMap::new();
-            for &i in &overflow {
-                let tag = aps[i].tags.first().map(String::as_str).unwrap_or("untagged");
-                if let Some(id) = aps[i].id {
-                    groups.entry(tag).or_default().push(id);
-                }
-            }
-            let index: Vec<String> = groups
-                .iter()
-                .map(|(t, ids)| format!("{t} {}", ids.iter().map(|id| format!("#{id}")).collect::<Vec<_>>().join(" ")))
-                .collect();
+        if unlisted > 0 {
+            // Counted, not indexed by id under its first tag: replayed over 482
+            // hinted calls, that index was 6-10KB of bare ids without a word of
+            // what goes wrong, and one expand_memory call in 2.5 months used it.
             body.push_str(&format!(
-                "\n{} more, by first tag — expand_memory(id, kind=\"anti_pattern\") shows one whole: {}\n",
-                overflow.len(),
-                index.join("; ")
+                "\n{unlisted} more traps are not listed here; detail=\"full\" lists every one.\n"
             ));
         }
         body.push_str(
@@ -2532,8 +2520,9 @@ const ACTIVE_SHOWN: usize = 25;
 const RELATED_SHOWN: usize = 30;
 /// The rest are cut to this many bytes of their opening clause.
 const REST_CLAUSE_CHARS: usize = 70;
-/// Characters a ranked listing may reach before its tail is indexed by id: well
-/// under the ~50KB at which Claude Code stops showing a tool answer inline.
+/// Characters a ranked listing may reach before the rest of its tail is named
+/// by id (patterns) or counted (anti-patterns): well under the ~50KB at which
+/// Claude Code stops showing a tool answer inline.
 const LISTING_BUDGET: usize = 30_000;
 
 /// Edit-guard firings per anti-pattern over the last `days`.
@@ -4250,9 +4239,10 @@ mod tests {
         assert!(section < entry && entry < out.find("Every other trap").unwrap_or(usize::MAX), "{out}");
     }
 
-    /// Past the budget, the tail is indexed by id rather than dropped.
+    /// Past the budget, the tail is counted in one line, not indexed by id:
+    /// every entry is either listed by its opening or in the count.
     #[test]
-    fn a_listing_over_budget_indexes_its_tail_by_id() {
+    fn a_listing_over_budget_counts_its_tail_instead_of_indexing_it() {
         let store = ap_store("ap_budget");
         for i in 0..700 {
             crate::crystallizer::add_anti_pattern(&store,
@@ -4260,16 +4250,38 @@ mod tests {
                 &format!("w{i}"), "c", vec!["filler".into()]).unwrap();
         }
         let out = tool_get_anti_patterns(&json!({"hint": "pool gravity momentum"}), &store, "s1").unwrap();
-        assert!(out.len() < super::LISTING_BUDGET + 6_000, "bounded: {} chars", out.len());
-        assert!(out.contains("more, by first tag"), "the tail is indexed");
-        for ap in store.all_anti_patterns().unwrap() {
-            let id = ap.id.unwrap();
-            let opening: String = ap.description.chars().take(24).collect();
-            assert!(out.contains(&opening) || out.contains(&format!("#{id} ")) || out.contains(&format!("#{id}\n")) || out.contains(&format!("#{id};")),
-                "entry {id} is neither listed nor indexed");
+        assert!(out.len() < super::LISTING_BUDGET + 1_000, "bounded: {} chars", out.len());
+        assert!(!out.contains("by first tag") && !out.contains("filler #"), "no id index: {out}");
+        let all = store.all_anti_patterns().unwrap();
+        let (listed, unlisted): (Vec<_>, Vec<_>) = all
+            .iter()
+            .partition(|ap| out.contains(&ap.description.chars().take(24).collect::<String>()));
+        assert!(!unlisted.is_empty(), "the test store must overflow the budget");
+        let count_line = format!("\n{} more traps are not listed here", all.len() - listed.len());
+        assert!(out.contains(&count_line), "every unlisted entry is counted ({count_line}): {out}");
+        for ap in &unlisted {
+            assert!(!out.contains(&format!("#{}", ap.id.unwrap())), "an unlisted id is printed: {out}");
         }
-        let one = super::tool_expand_memory(&json!({"id": store.all_anti_patterns().unwrap().last().unwrap().id.unwrap(), "kind": "anti_pattern"}), &store).unwrap();
+        let one = super::tool_expand_memory(&json!({"id": all.last().unwrap().id.unwrap(), "kind": "anti_pattern"}), &store).unwrap();
         assert!(one.contains("✗ wrong:   w699"), "{one}");
+    }
+
+    /// A trap past the budget is still logged as retrieved, exactly as one
+    /// that is printed: survival scoring must not depend on the byte budget.
+    #[test]
+    fn a_counted_trap_is_still_logged_as_retrieved() {
+        let store = ap_store("ap_budget_log");
+        for i in 0..700 {
+            crate::crystallizer::add_anti_pattern(&store,
+                &format!("Filler trap {i:03} whose description runs long enough to need cutting at a clause"),
+                "w", "c", vec!["filler".into()]).unwrap();
+        }
+        let out = tool_get_anti_patterns(&json!({"hint": "pool gravity momentum"}), &store, "s_log").unwrap();
+        assert!(out.contains("more traps are not listed here"), "the test store must overflow: {out}");
+        let logged: i64 = store.conn().query_row(
+            "SELECT COUNT(DISTINCT entry_id) FROM session_retrieval_log WHERE session_id = 's_log' AND entry_table = 'anti_patterns'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(usize::try_from(logged).unwrap(), store.all_anti_patterns().unwrap().len());
     }
 
     /// Shortening an unrelated trap must never hide it.

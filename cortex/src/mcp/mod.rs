@@ -605,18 +605,18 @@ fn tools_list() -> Value {
             {
                 "name": "get_anti_patterns",
                 "description": "Get all known anti-patterns — things Copilot must NOT do. \
-                                Always check this before generating code. Every anti-pattern \
-                                is always listed; `detail` controls whether the remedy text \
-                                comes with it. Pass `hint` describing the task to get the \
-                                full wrong/correct text for the ones that apply.",
+                                Always check this before generating code. Pass `hint` describing \
+                                the task to get the full wrong/correct text for the ones that \
+                                apply; the rest are listed by what goes wrong up to a size \
+                                budget, and any past it are counted. detail=\"full\" lists all.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "detail": {
                             "type": "string",
                             "enum": ["index", "full"],
-                            "description": "index (default): every anti-pattern's description, \
-                                            plus full remedy text for any matching `hint`. \
+                            "description": "index (default): full remedy text for any matching \
+                                            `hint`, one line for the rest within a size budget. \
                                             full: complete wrong/correct text for all of them."
                         },
                         "hint": {
@@ -907,7 +907,7 @@ fn tools_list() -> Value {
                 "name": "expand_memory",
                 "description": "Return one pattern's full body, uses and tags by id (ids come from \
                                 list_memory_handles), or one anti-pattern's wrong/correct text \
-                                with kind=\"anti_pattern\" (ids from get_anti_patterns).",
+                                with kind=\"anti_pattern\" (ids from edit-guard warnings).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
